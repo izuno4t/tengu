@@ -10,7 +10,7 @@ use crate::llm::{
     AnthropicBackend, GoogleBackend, LlmBackend, LlmClient, LlmProvider, OllamaBackend, OpenAiBackend,
 };
 use crate::session::{Session, SessionStore};
-use crate::tools::{ToolExecutor, ToolInput, ToolResult};
+use crate::tools::{ToolExecutor, ToolInput, ToolPolicy, ToolResult};
 use crate::tui::App;
 
 #[derive(Parser, Debug)]
@@ -356,13 +356,15 @@ impl Cli {
     }
 
     async fn execute_tool_command(&self, command: &ToolCommands) -> Result<()> {
-        let executor = ToolExecutor::new();
+        let config = load_config().unwrap_or_default();
+        let policy = ToolPolicy::from_config(&config);
+        let executor = ToolExecutor::with_policy(policy);
         let result = match command {
             ToolCommands::Read { path } => executor.execute(ToolInput::Read { path: path.clone() })?,
             ToolCommands::Write { path, content } => {
                 let preview = executor.preview_write(path.clone(), content.clone())?;
                 println!("{}", format_tool_result(&preview));
-                if let Some(applied) = apply_preview_write(&preview)? {
+                if let Some(applied) = apply_preview_write(&executor, &preview)? {
                     println!("{}", format_tool_result(&applied));
                 }
                 return Ok(());
@@ -394,8 +396,10 @@ impl Cli {
         let message = format!("Headless mode with prompt: {:?}", self.prompt);
         self.print_output("headless", &message, self.prompt.as_deref());
         if let Some(prompt) = self.prompt.as_deref() {
-            let (client, model_name) = self.resolve_llm()?;
-            let runner = AgentRunner::new(client, model_name);
+            let config = load_config().unwrap_or_default();
+            let (client, model_name) = self.resolve_llm_with_config(&config)?;
+            let policy = ToolPolicy::from_config(&config);
+            let runner = AgentRunner::new(client, model_name, policy);
             let output = runner.handle_prompt(prompt).await?;
             self.print_output("llm", &output.response.content, Some(prompt));
             self.print_tool_result(&output);
@@ -408,8 +412,10 @@ impl Cli {
         self.log_system_prompt_sources(&sources, system_prompt.as_deref());
         self.print_output("interactive", "👺 Tengu - Interactive mode", None);
         self.print_output("interactive", "Type 'exit' to quit", None);
-        let (client, model_name) = self.resolve_llm()?;
-        self.run_repl(client, model_name).await?;
+        let config = load_config().unwrap_or_default();
+        let (client, model_name) = self.resolve_llm_with_config(&config)?;
+        let policy = ToolPolicy::from_config(&config);
+        self.run_repl(client, model_name, policy).await?;
         Ok(())
     }
 
@@ -506,20 +512,26 @@ impl Cli {
         }
     }
 
-    async fn run_repl(&self, client: LlmClient, model_name: String) -> Result<()> {
+    async fn run_repl(
+        &self,
+        client: LlmClient,
+        model_name: String,
+        tool_policy: ToolPolicy,
+    ) -> Result<()> {
         let mut line = String::new();
 
         if io::stdin().is_terminal() {
             let stdin = io::stdin();
             let mut handle = stdin.lock();
-            return run_repl_loop(&mut handle, &mut line, client, model_name).await;
+            return run_repl_loop(&mut handle, &mut line, client, model_name, tool_policy).await;
         }
 
         #[cfg(unix)]
         {
             if let Ok(tty) = fs::File::open("/dev/tty") {
                 let mut reader = io::BufReader::new(tty);
-                return run_repl_loop(&mut reader, &mut line, client, model_name).await;
+                return run_repl_loop(&mut reader, &mut line, client, model_name, tool_policy)
+                    .await;
             }
         }
 
@@ -529,6 +541,10 @@ impl Cli {
 
     fn resolve_llm(&self) -> Result<(LlmClient, String)> {
         let config = load_config().unwrap_or_default();
+        self.resolve_llm_with_config(&config)
+    }
+
+    fn resolve_llm_with_config(&self, config: &Config) -> Result<(LlmClient, String)> {
         let provider_name = self
             .model
             .as_deref()
@@ -588,8 +604,10 @@ async fn run_repl_loop<R: BufRead>(
     line: &mut String,
     client: LlmClient,
     model_name: String,
+    tool_policy: ToolPolicy,
 ) -> Result<()> {
-    let runner = AgentRunner::new(client, model_name);
+    let runner = AgentRunner::new(client, model_name, tool_policy.clone());
+    let executor = ToolExecutor::with_policy(tool_policy);
     loop {
         print!("> ");
         io::stdout().flush()?;
@@ -612,7 +630,7 @@ async fn run_repl_loop<R: BufRead>(
         println!("{}", output.response.content);
         if let Some(result) = output.tool_result.as_ref() {
             println!("{}", format_tool_result(result));
-            if let Some(applied) = apply_preview_write(result)? {
+            if let Some(applied) = apply_preview_write(&executor, result)? {
                 println!("{}", format_tool_result(&applied));
             }
         }
@@ -627,7 +645,7 @@ impl Cli {
             return;
         };
         self.print_output("tool", &format_tool_result(result), None);
-        match apply_preview_write(result) {
+        match apply_preview_write_with_config(result) {
             Ok(Some(applied)) => {
                 self.print_output("tool", &format_tool_result(&applied), None);
             }
@@ -653,16 +671,22 @@ fn format_tool_result(result: &ToolResult) -> String {
     }
 }
 
-fn apply_preview_write(result: &ToolResult) -> Result<Option<ToolResult>> {
+fn apply_preview_write(executor: &ToolExecutor, result: &ToolResult) -> Result<Option<ToolResult>> {
     let ToolResult::PreviewWrite { path, content, .. } = result else {
         return Ok(None);
     };
-    let executor = ToolExecutor::new();
     let applied = executor.execute(ToolInput::Write {
         path: path.clone(),
         content: content.clone(),
     })?;
     Ok(Some(applied))
+}
+
+fn apply_preview_write_with_config(result: &ToolResult) -> Result<Option<ToolResult>> {
+    let config = load_config().unwrap_or_default();
+    let policy = ToolPolicy::from_config(&config);
+    let executor = ToolExecutor::with_policy(policy);
+    apply_preview_write(&executor, result)
 }
 
 fn read_required_file(path: &PathBuf) -> Result<String> {

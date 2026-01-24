@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::llm::{LlmClient, LlmResponse};
-use crate::tools::{ToolExecutor, ToolInput, ToolResult};
+use crate::tools::{ToolExecutor, ToolInput, ToolPolicy, ToolResult};
 
 pub struct Agent {
     pub name: String,
@@ -27,6 +27,7 @@ impl Agent {
 pub struct AgentRunner {
     client: LlmClient,
     model_name: String,
+    tool_policy: ToolPolicy,
 }
 
 pub struct AgentOutput {
@@ -44,8 +45,12 @@ enum ToolCall {
 }
 
 impl AgentRunner {
-    pub fn new(client: LlmClient, model_name: String) -> Self {
-        Self { client, model_name }
+    pub fn new(client: LlmClient, model_name: String, tool_policy: ToolPolicy) -> Self {
+        Self {
+            client,
+            model_name,
+            tool_policy,
+        }
     }
 
     pub async fn handle_prompt(&self, input: &str) -> Result<AgentOutput> {
@@ -110,7 +115,7 @@ impl AgentRunner {
     }
 
     fn execute_tool_call(&self, call: ToolCall) -> Result<ToolResult> {
-        let executor = ToolExecutor::new();
+        let executor = ToolExecutor::with_policy(self.tool_policy.clone());
         match call {
             ToolCall::Read { path } => {
                 executor.execute(ToolInput::Read { path: PathBuf::from(path) })

@@ -10,6 +10,8 @@ pub struct Config {
     pub model: ModelConfig,
     #[serde(default)]
     pub permissions: Option<PermissionsConfig>,
+    #[serde(default)]
+    pub sandbox: Option<SandboxConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -24,11 +26,18 @@ pub struct ModelConfig {
     pub backend_url: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PermissionsConfig {
     pub approval_policy: Option<String>,
     pub allowed_tools: Option<Vec<String>>,
     pub deny: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct SandboxConfig {
+    pub mode: Option<String>,
+    pub allowed_paths: Option<Vec<String>>,
+    pub blocked_paths: Option<Vec<String>>,
 }
 
 impl Default for Config {
@@ -36,6 +45,7 @@ impl Default for Config {
         Self {
             model: ModelConfig::default(),
             permissions: None,
+            sandbox: None,
         }
     }
 }
@@ -75,6 +85,21 @@ impl Config {
             }
             if let Some(deny) = &mut permissions.deny {
                 for item in deny.iter_mut() {
+                    *item = expand_env_vars_in_string(item);
+                }
+            }
+        }
+        if let Some(sandbox) = &mut self.sandbox {
+            if let Some(mode) = &sandbox.mode {
+                sandbox.mode = Some(expand_env_vars_in_string(mode));
+            }
+            if let Some(allowed_paths) = &mut sandbox.allowed_paths {
+                for item in allowed_paths.iter_mut() {
+                    *item = expand_env_vars_in_string(item);
+                }
+            }
+            if let Some(blocked_paths) = &mut sandbox.blocked_paths {
+                for item in blocked_paths.iter_mut() {
                     *item = expand_env_vars_in_string(item);
                 }
             }
