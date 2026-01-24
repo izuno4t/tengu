@@ -1,4 +1,0 @@
-[model]
-backend = "ollama"
-name = "dsasai/llama3-elyza-jp-8b"
-backend_url = "http://localhost:11434"
