@@ -358,13 +358,15 @@ impl Cli {
     async fn execute_tool_command(&self, command: &ToolCommands) -> Result<()> {
         let executor = ToolExecutor::new();
         let result = match command {
-            ToolCommands::Read { path } => {
-                executor.execute(ToolInput::Read { path: path.clone() })?
+            ToolCommands::Read { path } => executor.execute(ToolInput::Read { path: path.clone() })?,
+            ToolCommands::Write { path, content } => {
+                let preview = executor.preview_write(path.clone(), content.clone())?;
+                println!("{}", format_tool_result(&preview));
+                if let Some(applied) = apply_preview_write(&preview)? {
+                    println!("{}", format_tool_result(&applied));
+                }
+                return Ok(());
             }
-            ToolCommands::Write { path, content } => executor.execute(ToolInput::Write {
-                path: path.clone(),
-                content: content.clone(),
-            })?,
             ToolCommands::Grep { pattern, paths } => executor.execute(ToolInput::Grep {
                 pattern: pattern.clone(),
                 paths: paths.clone(),
@@ -375,22 +377,7 @@ impl Cli {
             })?,
         };
 
-        match result {
-            ToolResult::Text(text) => println!("{}", text),
-            ToolResult::Lines(lines) => {
-                for line in lines {
-                    println!("{}", line);
-                }
-            }
-            ToolResult::Paths(paths) => {
-                for path in paths {
-                    println!("{}", path.display());
-                }
-            }
-            ToolResult::Status(code) => {
-                println!("status: {}", code);
-            }
-        }
+        println!("{}", format_tool_result(&result));
 
         Ok(())
     }
@@ -623,8 +610,11 @@ async fn run_repl_loop<R: BufRead>(
 
         let output = runner.handle_prompt(input).await?;
         println!("{}", output.response.content);
-        if let Some(text) = format_tool_result(&output) {
-            println!("{}", text);
+        if let Some(result) = output.tool_result.as_ref() {
+            println!("{}", format_tool_result(result));
+            if let Some(applied) = apply_preview_write(result)? {
+                println!("{}", format_tool_result(&applied));
+            }
         }
     }
 
@@ -633,15 +623,24 @@ async fn run_repl_loop<R: BufRead>(
 
 impl Cli {
     fn print_tool_result(&self, output: &AgentOutput) {
-        if let Some(text) = format_tool_result(output) {
-            self.print_output("tool", &text, None);
+        let Some(result) = output.tool_result.as_ref() else {
+            return;
+        };
+        self.print_output("tool", &format_tool_result(result), None);
+        match apply_preview_write(result) {
+            Ok(Some(applied)) => {
+                self.print_output("tool", &format_tool_result(&applied), None);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("failed to apply write: {}", err);
+            }
         }
     }
 }
 
-fn format_tool_result(output: &AgentOutput) -> Option<String> {
-    let result = output.tool_result.as_ref()?;
-    let text = match result {
+fn format_tool_result(result: &ToolResult) -> String {
+    match result {
         ToolResult::Text(text) => text.clone(),
         ToolResult::Lines(lines) => lines.join("\n"),
         ToolResult::Paths(paths) => paths
@@ -650,8 +649,20 @@ fn format_tool_result(output: &AgentOutput) -> Option<String> {
             .collect::<Vec<_>>()
             .join("\n"),
         ToolResult::Status(code) => format!("status: {}", code),
+        ToolResult::PreviewWrite { diff, .. } => diff.clone(),
+    }
+}
+
+fn apply_preview_write(result: &ToolResult) -> Result<Option<ToolResult>> {
+    let ToolResult::PreviewWrite { path, content, .. } = result else {
+        return Ok(None);
     };
-    Some(text)
+    let executor = ToolExecutor::new();
+    let applied = executor.execute(ToolInput::Write {
+        path: path.clone(),
+        content: content.clone(),
+    })?;
+    Ok(Some(applied))
 }
 
 fn read_required_file(path: &PathBuf) -> Result<String> {

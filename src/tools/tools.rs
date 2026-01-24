@@ -30,6 +30,11 @@ pub enum ToolResult {
     Lines(Vec<String>),
     Paths(Vec<PathBuf>),
     Status(i32),
+    PreviewWrite {
+        path: PathBuf,
+        diff: String,
+        content: String,
+    },
 }
 
 pub struct ToolExecutor;
@@ -37,6 +42,16 @@ pub struct ToolExecutor;
 impl ToolExecutor {
     pub fn new() -> Self {
         Self
+    }
+
+    pub fn preview_write(&self, path: PathBuf, content: String) -> Result<ToolResult> {
+        let before = if path.exists() {
+            fs::read_to_string(&path)?
+        } else {
+            String::new()
+        };
+        let diff = build_diff(&path, &before, &content);
+        Ok(ToolResult::PreviewWrite { path, diff, content })
     }
 
     pub fn execute(&self, input: ToolInput) -> Result<ToolResult> {
@@ -133,6 +148,46 @@ fn collect_glob_matches(root: &Path, pattern: &str, out: &mut Vec<PathBuf>) -> R
 fn matches_glob(pattern: &str, path: &Path) -> bool {
     let target = path.to_string_lossy();
     wildcard_match(pattern, &target)
+}
+
+fn build_diff(path: &Path, before: &str, after: &str) -> String {
+    let mut out = String::new();
+    out.push_str("--- ");
+    out.push_str(&path.to_string_lossy());
+    out.push('\n');
+    out.push_str("+++ ");
+    out.push_str(&path.to_string_lossy());
+    out.push('\n');
+    out.push_str("@@\n");
+
+    let before_lines: Vec<&str> = before.lines().collect();
+    let after_lines: Vec<&str> = after.lines().collect();
+    let max_len = before_lines.len().max(after_lines.len());
+
+    for idx in 0..max_len {
+        let before_line = before_lines.get(idx).copied().unwrap_or("");
+        let after_line = after_lines.get(idx).copied().unwrap_or("");
+        if before_line == after_line {
+            if !before_line.is_empty() || !after_line.is_empty() {
+                out.push(' ');
+                out.push_str(before_line);
+                out.push('\n');
+            }
+            continue;
+        }
+        if !before_line.is_empty() {
+            out.push('-');
+            out.push_str(before_line);
+            out.push('\n');
+        }
+        if !after_line.is_empty() {
+            out.push('+');
+            out.push_str(after_line);
+            out.push('\n');
+        }
+    }
+
+    out
 }
 
 fn wildcard_match(pattern: &str, text: &str) -> bool {
