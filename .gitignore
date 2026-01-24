@@ -1,3 +1,7 @@
-/target
+target
 **/*.rs.bk
 .tengu/
+.DS_Store
+.idea/
+.vscode/
+*.log
