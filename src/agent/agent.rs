@@ -2,7 +2,7 @@
 // エージェント実行ループ（最小）
 
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::llm::{LlmClient, LlmResponse};
@@ -34,7 +34,7 @@ pub struct AgentOutput {
     pub tool_result: Option<ToolResult>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "tool", rename_all = "lowercase")]
 enum ToolCall {
     Read { path: String },
@@ -50,23 +50,56 @@ impl AgentRunner {
 
     pub async fn handle_prompt(&self, input: &str) -> Result<AgentOutput> {
         let plan = self.generate_plan(input).await?;
-        let selection = self.select_tool(input, &plan).await?;
-        let (tool_result, final_response) = if let Some(call) = selection {
-            let result = self.execute_tool_call(call)?;
-            let follow_prompt = build_followup_prompt(input, &plan, &format_tool_result(&result));
-            let response = self
-                .client
-                .generate(&self.model_name, &follow_prompt)
+        let mut last_error: Option<String> = None;
+        let mut last_call: Option<ToolCall> = None;
+        let mut tool_result: Option<ToolResult> = None;
+        let mut final_response: Option<LlmResponse> = None;
+
+        for attempt in 0..=MAX_TOOL_RETRIES {
+            let selection = self
+                .select_tool(input, &plan, last_error.as_deref(), last_call.as_ref())
                 .await?;
-            (Some(result), response)
-        } else {
-            let execute_prompt = build_execute_prompt(input, &plan);
-            let response = self
-                .client
-                .generate(&self.model_name, &execute_prompt)
-                .await?;
-            (None, response)
-        };
+            let Some(call) = selection else {
+                let execute_prompt = build_execute_prompt(input, &plan);
+                let response = self
+                    .client
+                    .generate(&self.model_name, &execute_prompt)
+                    .await?;
+                final_response = Some(response);
+                break;
+            };
+
+            match self.execute_tool_call(call.clone()) {
+                Ok(result) => {
+                    let follow_prompt =
+                        build_followup_prompt(input, &plan, &format_tool_result(&result));
+                    let response = self
+                        .client
+                        .generate(&self.model_name, &follow_prompt)
+                        .await?;
+                    tool_result = Some(result);
+                    final_response = Some(response);
+                    break;
+                }
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                    last_call = Some(call);
+                    if attempt >= MAX_TOOL_RETRIES {
+                        let fallback_prompt =
+                            build_failed_followup_prompt(input, &plan, last_error.as_deref());
+                        let response = self
+                            .client
+                            .generate(&self.model_name, &fallback_prompt)
+                            .await?;
+                        final_response = Some(response);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let final_response =
+            final_response.ok_or_else(|| anyhow::anyhow!("final response is missing"))?;
         let response = LlmResponse {
             content: format!("計画:\n{}\n\n{}", plan.trim(), final_response.content.trim()),
         };
@@ -104,12 +137,20 @@ impl AgentRunner {
         Ok(response.content)
     }
 
-    async fn select_tool(&self, input: &str, plan: &str) -> Result<Option<ToolCall>> {
-        let prompt = build_tool_select_prompt(input, plan);
+    async fn select_tool(
+        &self,
+        input: &str,
+        plan: &str,
+        last_error: Option<&str>,
+        last_call: Option<&ToolCall>,
+    ) -> Result<Option<ToolCall>> {
+        let prompt = build_tool_select_prompt(input, plan, last_error, last_call);
         let response = self.client.generate(&self.model_name, &prompt).await?;
         Ok(parse_tool_call_loose(&response.content))
     }
 }
+
+const MAX_TOOL_RETRIES: usize = 2;
 
 fn build_plan_prompt(input: &str) -> String {
     format!(
@@ -125,12 +166,30 @@ fn build_execute_prompt(input: &str, plan: &str) -> String {
     )
 }
 
-fn build_tool_select_prompt(input: &str, plan: &str) -> String {
+fn build_tool_select_prompt(
+    input: &str,
+    plan: &str,
+    last_error: Option<&str>,
+    last_call: Option<&ToolCall>,
+) -> String {
+    let mut context = String::new();
+    if let Some(error) = last_error {
+        context.push_str("\n前回の失敗理由:\n");
+        context.push_str(error);
+        context.push('\n');
+    }
+    if let Some(call) = last_call {
+        if let Ok(json) = serde_json::to_string(call) {
+            context.push_str("前回のツール呼び出し:\n");
+            context.push_str(&json);
+            context.push('\n');
+        }
+    }
     format!(
         "次の計画を進めるために必要なツールがあれば、JSONのみで出力してください。\n\
-ツールが不要なら {{\"tool\":\"none\"}} とだけ出力してください。\n\n\
+ツールが不要なら {{\"tool\":\"none\"}} とだけ出力してください。{}\n\n\
 計画:\n{}\n\n指示:\n{}",
-        plan, input
+        context, plan, input
     )
 }
 
@@ -141,6 +200,17 @@ fn build_followup_prompt(input: &str, plan: &str, tool_result: &str) -> String {
     )
 }
 
+fn build_failed_followup_prompt(input: &str, plan: &str, error: Option<&str>) -> String {
+    let mut prompt = format!(
+        "ツール実行に失敗したため、失敗理由を踏まえて最終回答を簡潔に出力してください。\n\n指示:\n{}\n\n計画:\n{}",
+        input, plan
+    );
+    if let Some(error) = error {
+        prompt.push_str("\n\n失敗理由:\n");
+        prompt.push_str(error);
+    }
+    prompt
+}
 fn format_tool_result(result: &ToolResult) -> String {
     match result {
         ToolResult::Text(text) => text.clone(),
