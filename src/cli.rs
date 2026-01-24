@@ -12,6 +12,7 @@ use crate::llm::{
 use crate::session::{Session, SessionStore};
 use crate::tools::{ToolExecutor, ToolInput, ToolPolicy, ToolResult};
 use crate::tui::App;
+use crate::mcp::{list_tools_http, list_tools_stdio, McpServerConfig, McpStore};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -147,6 +148,12 @@ pub enum McpCommands {
         /// サーバー名
         name: String,
     },
+
+    /// MCPサーバーのツール一覧
+    Tools {
+        /// サーバー名
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -274,17 +281,85 @@ impl Cli {
     }
 
     async fn execute_mcp_command(&self, command: &McpCommands) -> Result<()> {
+        let path = McpStore::default_path();
+        let mut config = McpStore::load(&path)?;
         match command {
             McpCommands::Add { name, command } => {
-                println!("Add MCP server: {} with command: {:?}", name, command);
+                if command.is_empty() {
+                    return Err(anyhow!("mcp add requires a command"));
+                }
+                let mut iter = command.iter();
+                let cmd = iter.next().cloned().unwrap_or_default();
+                let args: Vec<String> = iter.cloned().collect();
+                let entry = McpServerConfig {
+                    command: Some(cmd),
+                    args: if args.is_empty() { None } else { Some(args) },
+                    env: None,
+                    url: None,
+                    bearer_token_env_var: None,
+                    http_headers: None,
+                    timeout_sec: None,
+                };
+                config.mcp_servers.insert(name.clone(), entry);
+                McpStore::save(&path, &config)?;
+                println!("mcp server added: {}", name);
                 Ok(())
             }
             McpCommands::List => {
-                println!("List MCP servers");
+                if config.mcp_servers.is_empty() {
+                    println!("no mcp servers");
+                    return Ok(());
+                }
+                for (name, server) in config.mcp_servers.iter() {
+                    let summary = if let Some(url) = &server.url {
+                        format!("http {}", url)
+                    } else if let Some(cmd) = &server.command {
+                        let args = server
+                            .args
+                            .as_ref()
+                            .map(|a| a.join(" "))
+                            .unwrap_or_default();
+                        if args.is_empty() {
+                            format!("stdio {}", cmd)
+                        } else {
+                            format!("stdio {} {}", cmd, args)
+                        }
+                    } else {
+                        "unknown".to_string()
+                    };
+                    println!("{} {}", name, summary.trim());
+                }
                 Ok(())
             }
             McpCommands::Remove { name } => {
-                println!("Remove MCP server: {}", name);
+                if config.mcp_servers.remove(name).is_some() {
+                    McpStore::save(&path, &config)?;
+                    println!("mcp server removed: {}", name);
+                } else {
+                    println!("mcp server not found: {}", name);
+                }
+                Ok(())
+            }
+            McpCommands::Tools { name } => {
+                let Some(server) = config.mcp_servers.get(name) else {
+                    println!("mcp server not found: {}", name);
+                    return Ok(());
+                };
+                if server.url.is_some() {
+                    let tools = list_tools_http(server).await?;
+                    for tool in tools {
+                        println!("@{}/{}", name, tool.name);
+                    }
+                    return Ok(());
+                }
+                let tools = tokio::task::spawn_blocking({
+                    let server = server.clone();
+                    move || list_tools_stdio(&server)
+                })
+                .await??;
+                for tool in tools {
+                    println!("@{}/{}", name, tool.name);
+                }
                 Ok(())
             }
         }
@@ -537,11 +612,6 @@ impl Cli {
 
         eprintln!("interactive mode requires a TTY; stdin is not a terminal");
         Ok(())
-    }
-
-    fn resolve_llm(&self) -> Result<(LlmClient, String)> {
-        let config = load_config().unwrap_or_default();
-        self.resolve_llm_with_config(&config)
     }
 
     fn resolve_llm_with_config(&self, config: &Config) -> Result<(LlmClient, String)> {

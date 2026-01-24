@@ -8,12 +8,14 @@ use std::path::PathBuf;
 use crate::llm::{LlmClient, LlmResponse};
 use crate::tools::{ToolExecutor, ToolInput, ToolPolicy, ToolResult};
 
+#[allow(dead_code)]
 pub struct Agent {
     pub name: String,
     pub description: String,
     pub prompt: String,
 }
 
+#[allow(dead_code)]
 impl Agent {
     pub fn new(name: String) -> Self {
         Self {

@@ -34,6 +34,7 @@ impl LlmClient {
         Self { backend }
     }
 
+    #[allow(dead_code)]
     pub fn provider(&self) -> LlmProvider {
         self.backend.provider()
     }
@@ -45,6 +46,7 @@ impl LlmClient {
 
 #[async_trait::async_trait]
 pub trait LlmBackend {
+    #[allow(dead_code)]
     fn provider(&self) -> LlmProvider;
     async fn generate(&self, model: &str, prompt: &str) -> Result<LlmResponse>;
 }

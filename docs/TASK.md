@@ -42,7 +42,13 @@
 | ID | Status | Summary | DependsOn |
 |----|--------|---------|-----------|
 | TASK-013 | ✅ | パーミッションとサンドボックスの確認を完了する | TASK-003,TASK-005,TASK-006 |
-| TASK-014 | ⏳ | MCP統合の確認を完了する | TASK-003,TASK-005,TASK-006 |
+| TASK-014 | ✅ | MCP統合の確認を完了する | TASK-003,TASK-005,TASK-006 |
+| TASK-032 | ✅ | MCPプロトコル仕様メモを作成する | - |
+| TASK-033 | ✅ | MCP設定ファイルmcp.tomlの読み書きを実装する | TASK-032 |
+| TASK-034 | ✅ | MCPサーバー管理コマンドの永続化を実装する | TASK-033 |
+| TASK-035 | ✅ | STDIO MCP接続とツール検出を実装する | TASK-033 |
+| TASK-036 | ✅ | HTTP/SSE MCP接続とツール検出を実装する | TASK-033 |
+| TASK-037 | ✅ | MCPツール統合をCLIとTUIに反映する | TASK-034,TASK-035,TASK-036 |
 | TASK-015 | ⏳ | フック機構の確認を完了する | TASK-005,TASK-006 |
 | TASK-016 | ⏳ | スラッシュコマンドの確認を完了する | TASK-006 |
 | TASK-017 | ⏳ | Git統合の確認を完了する | TASK-005,TASK-006 |
@@ -104,3 +110,28 @@
 ### TASK-031
 
 - Note: 失敗理由をLLMに渡し再試行できるようにする
+
+### TASK-014
+
+- Note: TASK-032〜TASK-037 の完了で確認完了とする
+
+### TASK-032
+
+- Note: STDIO と HTTP/SSE の仕様を調査して要点をまとめる
+- Note: ツール名は名前空間で区別する
+
+### TASK-033
+
+- Note: 設定保存先は .tengu/mcp.toml を使用する
+
+### TASK-035
+
+- Note: ツール参照は @server/tool 形式で扱う
+
+### TASK-036
+
+- Note: ツール参照は @server/tool 形式で扱う
+
+### TASK-037
+
+- Note: CLI と TUI の双方で MCP 一覧/選択を扱う

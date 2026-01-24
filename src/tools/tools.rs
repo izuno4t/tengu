@@ -8,6 +8,7 @@ use std::process::Command;
 
 use crate::config::{Config, PermissionsConfig, SandboxConfig};
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     Read,
@@ -21,6 +22,7 @@ pub enum Tool {
 pub enum ToolInput {
     Read { path: PathBuf },
     Write { path: PathBuf, content: String },
+    #[allow(dead_code)]
     Shell { command: String, args: Vec<String> },
     Grep { pattern: String, paths: Vec<PathBuf> },
     Glob { pattern: String, root: Option<PathBuf> },
