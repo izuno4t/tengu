@@ -14,4 +14,8 @@ impl LlmBackend for OpenAiBackend {
     async fn generate(&self, _model: &str, _prompt: &str) -> Result<LlmResponse> {
         Err(anyhow!("openai backend not implemented"))
     }
+
+    async fn generate_stream(&self, _model: &str, _prompt: &str) -> Result<crate::llm::LlmStream> {
+        Err(anyhow!("openai backend streaming not implemented"))
+    }
 }

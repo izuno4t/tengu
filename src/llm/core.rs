@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use futures_util::stream::BoxStream;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmProvider {
@@ -25,6 +26,8 @@ pub struct LlmResponse {
     pub content: String,
 }
 
+pub type LlmStream = BoxStream<'static, Result<String>>;
+
 pub struct LlmClient {
     backend: Box<dyn LlmBackend + Send + Sync>,
 }
@@ -42,6 +45,10 @@ impl LlmClient {
     pub async fn generate(&self, model: &str, prompt: &str) -> Result<LlmResponse> {
         self.backend.generate(model, prompt).await
     }
+
+    pub async fn generate_stream(&self, model: &str, prompt: &str) -> Result<LlmStream> {
+        self.backend.generate_stream(model, prompt).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -49,4 +56,5 @@ pub trait LlmBackend {
     #[allow(dead_code)]
     fn provider(&self) -> LlmProvider;
     async fn generate(&self, model: &str, prompt: &str) -> Result<LlmResponse>;
+    async fn generate_stream(&self, model: &str, prompt: &str) -> Result<LlmStream>;
 }

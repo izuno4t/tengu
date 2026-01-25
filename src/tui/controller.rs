@@ -5,17 +5,17 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::cursor::position;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size, ScrollUp};
 use crossterm::execute;
-use ratatui::prelude::*;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size, ScrollUp};
+use futures_util::StreamExt;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
-use crate::agent::{AgentOutput, AgentRunner};
+use crate::agent::AgentRunner;
 use crate::config::Config;
 use crate::mcp::McpStore;
 use crate::tui::render;
-use crate::tui::state::AppState;
+use crate::tui::state::{AppState, TuiEvent};
 
 pub struct App {
     state: AppState,
@@ -31,8 +31,8 @@ impl App {
         banner: String,
         status_model: String,
         status_build: String,
-        result_rx: mpsc::Receiver<anyhow::Result<AgentOutput>>,
-        result_tx: mpsc::Sender<anyhow::Result<AgentOutput>>,
+        result_rx: mpsc::Receiver<anyhow::Result<TuiEvent>>,
+        result_tx: mpsc::Sender<anyhow::Result<TuiEvent>>,
     ) -> Self {
         let state = AppState::new(banner, status_model, status_build, result_rx, result_tx);
         Self {
@@ -49,22 +49,18 @@ impl App {
         stdout.flush()?;
         enable_raw_mode()?;
         self.state.origin_y = position().map(|(_, y)| y).unwrap_or(0);
-        let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-
-        let result = self.run_loop(&mut terminal);
+        let result = self.run_loop(&mut stdout);
 
         disable_raw_mode()?;
-        terminal.show_cursor()?;
+        execute!(stdout, crossterm::cursor::Show)?;
 
         result
     }
 
-    fn run_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    fn run_loop(&mut self, stdout: &mut Stdout) -> Result<()> {
         while !self.state.should_quit {
-            self.ensure_layout_space(terminal.backend_mut())?;
-            terminal.draw(|frame| {
-                render::draw(frame, &mut self.state);
-            })?;
+            self.ensure_layout_space(stdout)?;
+            render::draw(stdout, &mut self.state)?;
 
             self.state.tick = self.state.tick.wrapping_add(1);
             self.drain_results();
@@ -115,7 +111,7 @@ impl App {
         Ok(())
     }
 
-    fn ensure_layout_space(&mut self, backend: &mut CrosstermBackend<Stdout>) -> Result<()> {
+    fn ensure_layout_space(&mut self, stdout: &mut Stdout) -> Result<()> {
         let (_term_width, term_height) = size()?;
         let required = self.required_height();
         let needed = self
@@ -124,14 +120,14 @@ impl App {
             .saturating_add(required)
             .saturating_sub(term_height);
         if needed > 0 {
-            execute!(backend, ScrollUp(needed))?;
+            execute!(stdout, ScrollUp(needed))?;
             self.state.origin_y = self.state.origin_y.saturating_sub(needed);
         }
         Ok(())
     }
 
     fn required_height(&self) -> u16 {
-        let input_height = 2u16;
+        let input_height = self.state.input_row_count().saturating_add(1);
         let divider_height = 1u16;
         let spacer_height = 1u16;
         let status_height = 1u16;
@@ -186,7 +182,13 @@ impl App {
     }
 
     fn push_history(&mut self, input: &str) {
-        if self.state.history.last().map(|last| last == input).unwrap_or(false) {
+        if self
+            .state
+            .history
+            .last()
+            .map(|last| last == input)
+            .unwrap_or(false)
+        {
             self.state.history_index = None;
             self.state.draft_input.clear();
             return;
@@ -237,12 +239,41 @@ impl App {
             return;
         };
         self.state.set_running("waiting LLM");
+        self.state.log_lines.push_back(String::new());
         let runner = Arc::clone(&self.runner);
         let input_clone = input.clone();
         let result_tx = self.state.result_tx.clone();
         let handle = self.handle.spawn(async move {
-            let result = runner.handle_prompt(&input_clone).await;
-            let _ = result_tx.send(result);
+            let stream_result = runner.handle_prompt_stream(&input_clone).await;
+            match stream_result {
+                Ok(mut stream) => {
+                    while let Some(chunk) = stream.next().await {
+                        match chunk {
+                            Ok(text) => {
+                                if result_tx.send(Ok(TuiEvent::Chunk(text))).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(err) => {
+                                let _ = result_tx.send(Err(err));
+                                return;
+                            }
+                        }
+                    }
+                    let _ = result_tx.send(Ok(TuiEvent::Done));
+                }
+                Err(_) => {
+                    match runner.handle_prompt(&input_clone).await {
+                        Ok(output) => {
+                            let _ = result_tx.send(Ok(TuiEvent::Chunk(output.response.content)));
+                            let _ = result_tx.send(Ok(TuiEvent::Done));
+                        }
+                        Err(err) => {
+                            let _ = result_tx.send(Err(err));
+                        }
+                    }
+                }
+            }
         });
         self.current_task = Some(handle);
     }
@@ -250,26 +281,22 @@ impl App {
     fn drain_results(&mut self) {
         while let Ok(result) = self.state.result_rx.try_recv() {
             match result {
-                Ok(output) => {
-                    self.state
-                        .append_message(&collapse_result(&output.response.content));
-                }
+                Ok(event) => match event {
+                    TuiEvent::Chunk(text) => {
+                        self.state.append_stream_chunk(&text);
+                    }
+                    TuiEvent::Done => {
+                        self.state.set_idle();
+                        self.current_task = None;
+                    }
+                },
                 Err(err) => {
                     self.state.append_message(&format!("error: {}", err));
+                    self.state.set_idle();
+                    self.current_task = None;
                 }
             }
-            self.state.set_idle();
-            self.current_task = None;
         }
-    }
-}
-
-fn collapse_result(content: &str) -> String {
-    let marker = "\n\n";
-    if let Some((plan, _rest)) = content.split_once(marker) {
-        format!("{plan}\n\n結果:（折りたたみ）")
-    } else {
-        format!("{content}\n\n結果:（折りたたみ）")
     }
 }
 
@@ -296,16 +323,8 @@ fn handle_slash_command(input: &str) -> Option<String> {
         "/status" => show_status().ok(),
         "/model" => show_model().ok(),
         "/approvals" => show_approvals().ok(),
-        "/new"
-        | "/clear"
-        | "/resume"
-        | "/fork"
-        | "/save"
-        | "/load"
-        | "/diff"
-        | "/commit"
-        | "/pr"
-        | "/editor" => Some(format!("{} is not implemented in TUI yet.", command)),
+        "/new" | "/clear" | "/resume" | "/fork" | "/save" | "/load" | "/diff" | "/commit"
+        | "/pr" | "/editor" => Some(format!("{} is not implemented in TUI yet.", command)),
         _ => {
             let filtered = build_slash_help_filtered(command);
             if filtered.is_empty() {
@@ -504,9 +523,17 @@ fn show_approvals() -> anyhow::Result<String> {
 fn load_config() -> Option<Config> {
     let mut candidates = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(std::path::PathBuf::from(home).join(".tengu").join("config.toml"));
+        candidates.push(
+            std::path::PathBuf::from(home)
+                .join(".tengu")
+                .join("config.toml"),
+        );
     }
-    candidates.push(std::path::PathBuf::from(".").join(".tengu").join("config.toml"));
+    candidates.push(
+        std::path::PathBuf::from(".")
+            .join(".tengu")
+            .join("config.toml"),
+    );
 
     let mut config = None;
     for path in candidates {

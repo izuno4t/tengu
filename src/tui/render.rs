@@ -1,66 +1,48 @@
-use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use std::io::{self, Stdout, Write};
+
+use crossterm::terminal::size;
 use unicode_width::UnicodeWidthStr;
 
+use crate::tui::ansi;
 use crate::tui::state::AppState;
 
-pub fn draw(frame: &mut Frame, state: &mut AppState) {
-    let mut area = frame.size();
-    if state.origin_y < area.height {
-        area.y = state.origin_y;
-        area.height = area.height.saturating_sub(state.origin_y);
-    }
-    frame.render_widget(Clear, area);
+pub fn draw(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
+    let (term_width, _term_height) = size()?;
+    let width = term_width as usize;
 
     let spacer_height = 1u16;
     let divider_height = 1u16;
-    let input_height = 2u16;
+    let input_rows = state.input_row_count();
+    let input_height = input_rows.saturating_add(1);
     let status_height = 1u16;
     let app_status_height = 1u16;
-    let min_fixed = spacer_height
-        .saturating_add(divider_height)
-        .saturating_add(input_height)
-        .saturating_add(status_height)
-        .saturating_add(app_status_height);
-    let available_help = area.height.saturating_sub(min_fixed);
     let help_height = if state.suggestions.is_empty() {
         0
     } else {
-        let lines = state.suggestions.lines().count() as u16;
-        lines.min(available_help)
+        state.suggestions.lines().count() as u16
     };
-    let available_log = area
-        .height
-        .saturating_sub(spacer_height)
-        .saturating_sub(divider_height)
-        .saturating_sub(input_height)
-        .saturating_sub(status_height)
-        .saturating_sub(help_height)
-        .saturating_sub(app_status_height);
-    let log_lines = state.log_lines.len() as u16;
-    let desired_log = log_lines.max(3);
-    let log_height = available_log.min(desired_log);
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Length(log_height),
-                Constraint::Length(spacer_height),
-                Constraint::Length(status_height),
-                Constraint::Length(divider_height),
-                Constraint::Length(input_height),
-                Constraint::Length(help_height),
-                Constraint::Length(app_status_height),
-            ]
-            .as_ref(),
-        )
-        .split(area);
+    let log_height = (state.log_lines.len() as u16).max(3);
 
-    if layout[0].height > 0 && layout[0].width > 0 {
-        let output_text =
-            Paragraph::new(state.visible_log(layout[0].height)).wrap(Wrap { trim: false });
-        frame.render_widget(output_text, layout[0]);
+    let total_height = log_height
+        .saturating_add(spacer_height)
+        .saturating_add(status_height)
+        .saturating_add(divider_height)
+        .saturating_add(input_height)
+        .saturating_add(help_height)
+        .saturating_add(app_status_height);
+
+    let mut lines: Vec<String> = Vec::with_capacity(total_height as usize);
+    let log_block = state.visible_log(log_height);
+    if !log_block.is_empty() {
+        for line in log_block.lines() {
+            lines.push(fit_width(line, width));
+        }
     }
+    while lines.len() < log_height as usize {
+        lines.push(String::new());
+    }
+
+    lines.push(String::new());
 
     let spinner_frames = ["👺   ", " 👺  ", "  👺 ", "   👺"];
     let spinner = if state.status_state == "running" {
@@ -69,68 +51,128 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
         ""
     };
     let status_line = format!("• status: {} {}", state.status_detail, spinner);
-    let status_text = status_line;
-    if layout[2].height > 0 && layout[2].width > 0 {
-        let status = Paragraph::new(status_text)
-            .style(Style::default().fg(Color::Yellow))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(status, layout[2]);
+    lines.push(colorize_line(&status_line, width, ansi::set_fg(crossterm::style::Color::Yellow)));
+
+    lines.push(colorize_line(
+        &"─".repeat(width),
+        width,
+        ansi::set_fg(crossterm::style::Color::Grey),
+    ));
+
+    let input_lines: Vec<&str> = state.input.split('\n').collect();
+    for (idx, line) in input_lines.iter().enumerate() {
+        let prefix = if idx == 0 { "> " } else { "  " };
+        let input_line = format!("{}{}", prefix, line);
+        lines.push(fit_width(&input_line, width));
+    }
+    while lines.len() < (log_height + spacer_height + status_height + divider_height + input_rows) as usize {
+        lines.push(String::new());
+    }
+    lines.push(colorize_line(
+        &"─".repeat(width),
+        width,
+        ansi::set_fg(crossterm::style::Color::Grey),
+    ));
+
+    if help_height > 0 {
+        for line in state.suggestions.lines() {
+            lines.push(fit_width(line, width));
+        }
     }
 
-    if layout[3].height > 0 && layout[3].width > 0 {
-        let divider_top = Paragraph::new("─".repeat(layout[3].width as usize))
-            .style(Style::default().fg(Color::Gray));
-        frame.render_widget(divider_top, layout[3]);
+    let app_left = format!("model: {} • build {}", state.status_model, state.status_build);
+    let app_right = if state.suggestions.is_empty() {
+        "Ctrl+C to quit • ? for shortcuts"
+    } else {
+        ""
+    };
+    let app_status = align_right(&app_left, app_right, width);
+    lines.push(colorize_line(
+        &app_status,
+        width,
+        ansi::set_fg(crossterm::style::Color::Grey),
+    ));
+
+    let origin = state.origin_y;
+    for (idx, line) in lines.iter().enumerate() {
+        let row = origin.saturating_add(idx as u16);
+        let row_ansi = row.saturating_add(1);
+        write!(
+            stdout,
+            "{}{}{}",
+            ansi::move_to(row_ansi, 1),
+            ansi::clear_line(),
+            line
+        )?;
     }
 
-    let input_block = Block::default().borders(Borders::BOTTOM);
+    let input_row = origin
+        .saturating_add(log_height)
+        .saturating_add(spacer_height)
+        .saturating_add(status_height)
+        .saturating_add(divider_height)
+        .saturating_add(input_rows.saturating_sub(1));
+    let last_line = input_lines.last().copied().unwrap_or("");
+    let cursor_offset = UnicodeWidthStr::width(last_line) as u16;
+    let cursor_col = 2u16.saturating_add(cursor_offset);
+    let cursor_row_ansi = input_row.saturating_add(1);
+    let cursor_col_ansi = cursor_col.saturating_add(1);
 
-    frame.render_widget(&input_block, layout[4]);
-    let input_area = input_block.inner(layout[4]);
-    if input_area.height > 0 && input_area.width > 0 {
-        let input_line = Rect {
-            x: input_area.x,
-            y: input_area.y,
-            width: input_area.width,
-            height: 1,
-        };
-        let input_text = Paragraph::new(format!("> {}", state.input)).wrap(Wrap { trim: false });
-        frame.render_widget(input_text, input_line);
+    state.inline.cursor_row = input_row;
+    state.inline.cursor_col = cursor_col;
+    state.inline.footer_row = Some(origin.saturating_add(total_height.saturating_sub(1)));
+    state.inline.input_rows = input_rows;
+    state.inline.status_rows = status_height;
+    state.inline.dirty = false;
+
+    write!(
+        stdout,
+        "{}{}",
+        ansi::move_to(cursor_row_ansi, cursor_col_ansi),
+        ansi::show_cursor()
+    )?;
+    stdout.flush()?;
+
+    Ok(())
+}
+
+fn fit_width(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
     }
-
-    if help_height > 0 && layout[5].height > 0 && layout[5].width > 0 {
-        let help_text = Paragraph::new(state.suggestions.as_str()).wrap(Wrap { trim: false });
-        frame.render_widget(help_text, layout[5]);
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
     }
-
-    if layout[6].height > 0 && layout[6].width > 0 {
-        let app_status_text =
-            format!("model: {} • build {}", state.status_model, state.status_build);
-        let app_status = Paragraph::new(app_status_text)
-            .style(Style::default().fg(Color::Gray))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(app_status, layout[6]);
-
-        let help_text = if state.suggestions.is_empty() {
-            "Ctrl+C to quit • ? for shortcuts"
-        } else {
-            ""
-        };
-        let help = Paragraph::new(help_text)
-            .alignment(Alignment::Right)
-            .style(Style::default().fg(Color::Gray))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(help, layout[6]);
+    let mut current = 0usize;
+    let mut out = String::new();
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthStr::width(ch.to_string().as_str());
+        if current + ch_width > width {
+            break;
+        }
+        out.push(ch);
+        current += ch_width;
     }
+    out
+}
 
-    if input_area.height > 0 && input_area.width > 0 {
-        let cursor_offset = UnicodeWidthStr::width(state.input.as_str()) as u16;
-        let cursor_x = input_area
-            .x
-            .saturating_add(2)
-            .saturating_add(cursor_offset)
-            .min(input_area.x.saturating_add(input_area.width.saturating_sub(1)));
-        let cursor_y = input_area.y.min(area.y.saturating_add(area.height.saturating_sub(1)));
-        frame.set_cursor(cursor_x, cursor_y);
+fn colorize_line(text: &str, width: usize, prefix: String) -> String {
+    let mut out = String::new();
+    out.push_str(&prefix);
+    out.push_str(&fit_width(text, width));
+    out.push_str(&ansi::reset());
+    out
+}
+
+fn align_right(left: &str, right: &str, width: usize) -> String {
+    if right.is_empty() {
+        return fit_width(left, width);
     }
+    let left_w = UnicodeWidthStr::width(left);
+    let right_w = UnicodeWidthStr::width(right);
+    if left_w + 1 + right_w > width {
+        return fit_width(left, width);
+    }
+    let pad = width.saturating_sub(left_w + right_w);
+    format!("{}{}{}", left, " ".repeat(pad), right)
 }

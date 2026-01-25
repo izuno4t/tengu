@@ -1,143 +1,150 @@
-# コントリビューションガイド
+# Contributing Guide
 
-Tenguへのコントリビューションを歓迎します！ 👺
+Other languages: [日本語版](CONTRIBUTING.ja.md)
 
-## 開発環境のセットアップ
+Thank you for considering contributing to Tengu! 👺
 
-### 必要なもの
+## Development Environment Setup
 
-- Rust 1.75以上
+### Requirements
+
+- Rust 1.75 or later
 - Cargo
 
-### セットアップ
+### Setup
 
 ```bash
-# リポジトリをクローン
+# Clone the repository
 git clone https://github.com/yourusername/tengu.git
 cd tengu
 
-# ビルド
+# Build
 cargo build
 
-# テスト実行
+# Run tests
 cargo test
 
-# 実行
+# Run
 cargo run
 ```
 
-## コーディング規約
+## Coding Standards
 
 ### Rust
 
-- Rust 2021 edition使用
-- `cargo clippy` のすべての推奨に従う
-- `cargo fmt` でフォーマット
-- パブリック関数には必ずドキュメントコメントを追加
+- Use Rust 2021 edition
+- Follow all `cargo clippy` recommendations
+- Format with `cargo fmt`
+- Add doc comments for all public functions
 
-### コミットメッセージ
+### Commit Messages
 
-Conventional Commits形式を推奨：
+Conventional Commits format is recommended:
 
-```
-feat: 新機能追加
-fix: バグ修正
-docs: ドキュメント更新
-refactor: リファクタリング
-test: テスト追加・修正
-chore: その他の変更
-```
-
-例：
-```
-feat: MCPサーバー自動検出機能を追加
-fix: セッション保存時のクラッシュを修正
-docs: README.mdにインストール手順を追加
+```text
+feat: add new feature
+fix: bug fix
+docs: documentation update
+refactor: refactor code
+test: add or update tests
+chore: other changes
 ```
 
-## プルリクエストのプロセス
+Examples:
 
-1. **Issue作成**
-   - 新機能や大きな変更の場合、まずIssueを作成して議論
+```text
+feat: add MCP server auto-discovery
+fix: fix crash when saving session
+docs: add installation steps to README.md
+```
 
-2. **ブランチ作成**
+## Pull Request Process
+
+1. **Create an Issue**
+   - For new features or major changes, open an Issue first to discuss
+
+2. **Create a Branch**
+
    ```bash
    git checkout -b feature/awesome-feature
    ```
 
-3. **開発**
-   - テストを書く
-   - ドキュメントを更新
-   - `cargo clippy` でチェック
-   - `cargo fmt` でフォーマット
+3. **Development**
+   - Write tests
+   - Update documentation
+   - Check with `cargo clippy`
+   - Format with `cargo fmt`
 
-4. **コミット**
+4. **Commit**
+
    ```bash
    git commit -m "feat: Add awesome feature"
    ```
 
-5. **プッシュ**
+5. **Push**
+
    ```bash
    git push origin feature/awesome-feature
    ```
 
-6. **プルリクエスト作成**
-   - 変更内容を明確に記述
-   - 関連するIssueをリンク
+6. **Open a Pull Request**
+   - Clearly describe the changes
+   - Link related Issues
 
-## テスト
+## Tests
 
-### ユニットテスト
+### Unit Tests
 
 ```bash
 cargo test
 ```
 
-### 特定のテストのみ実行
+### Run a Specific Test
 
 ```bash
 cargo test test_name
 ```
 
-### カバレッジ
+### Coverage
 
 ```bash
 cargo tarpaulin --out Html
 ```
 
-## ドキュメント
+## Documentation
 
-### APIドキュメント生成
+### Generate API Docs
 
 ```bash
 cargo doc --open
 ```
 
-### README更新
+### README Updates
 
-新機能を追加した場合、README.mdも更新してください。
+If you add new features, please update README.md as well.
 
-## リリースプロセス
+## Release Process
 
-1. バージョンを`Cargo.toml`で更新
-2. CHANGELOGを更新
-3. タグを作成
+1. Update the version in `Cargo.toml`
+2. Update the CHANGELOG
+3. Create a tag
+
    ```bash
    git tag -a v0.2.0 -m "Release v0.2.0"
    git push origin v0.2.0
    ```
 
-## 質問・サポート
+## Questions & Support
 
-- GitHub Issues: バグ報告・機能要望
-- GitHub Discussions: 質問・議論
+- GitHub Issues: bug reports and feature requests
+- GitHub Discussions: questions and discussions
 
-## 行動規範
+## Code of Conduct
 
-- 建設的なフィードバックを心がける
-- 他のコントリビューターを尊重する
-- オープンで歓迎的なコミュニティを維持
+- Aim for constructive feedback
+- Respect other contributors
+- Maintain an open and welcoming community
 
-## ライセンス
+## License
 
-コントリビューションはMITライセンスの下で提供されます。
+Contributions are provided under the MIT License.

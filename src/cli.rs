@@ -1,17 +1,18 @@
+use crate::agent::{AgentOutput, AgentRunner};
+use crate::config::Config;
+use crate::llm::{
+    AnthropicBackend, GoogleBackend, LlmBackend, LlmClient, LlmProvider, OllamaBackend,
+    OpenAiBackend,
+};
+use crate::mcp::{list_tools_http, list_tools_stdio, McpServerConfig, McpStore};
+use crate::session::{Session, SessionStore};
+use crate::tools::{ToolExecutor, ToolInput, ToolPolicy, ToolResult};
+use crate::tui::App;
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
-use crate::agent::{AgentOutput, AgentRunner};
-use crate::config::Config;
-use crate::llm::{
-    AnthropicBackend, GoogleBackend, LlmBackend, LlmClient, LlmProvider, OllamaBackend, OpenAiBackend,
-};
-use crate::session::{Session, SessionStore};
-use crate::tools::{ToolExecutor, ToolInput, ToolPolicy, ToolResult};
-use crate::tui::App;
-use crate::mcp::{list_tools_http, list_tools_stdio, McpServerConfig, McpStore};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -434,7 +435,9 @@ impl Cli {
         let policy = ToolPolicy::from_config(&config);
         let executor = ToolExecutor::with_policy(policy);
         let result = match command {
-            ToolCommands::Read { path } => executor.execute(ToolInput::Read { path: path.clone() })?,
+            ToolCommands::Read { path } => {
+                executor.execute(ToolInput::Read { path: path.clone() })?
+            }
             ToolCommands::Write { path, content } => {
                 let preview = executor.preview_write(path.clone(), content.clone())?;
                 println!("{}", format_tool_result(&preview));
@@ -466,7 +469,9 @@ impl Cli {
         let status_model = model_name.clone();
         let runner = std::sync::Arc::new(AgentRunner::new(client, model_name, policy));
         let handle = tokio::runtime::Handle::current();
-        let status_build = option_env!("BUILD_TIMESTAMP").unwrap_or("unknown").to_string();
+        let status_build = option_env!("BUILD_TIMESTAMP")
+            .unwrap_or("unknown")
+            .to_string();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let mut app = App::new(
             runner,

@@ -1,9 +1,9 @@
-mod store;
-mod stdio;
-mod types;
 mod http;
+mod stdio;
+mod store;
+mod types;
 
-pub use store::*;
-pub use stdio::*;
-pub use types::*;
 pub use http::*;
+pub use stdio::*;
+pub use store::*;
+pub use types::*;

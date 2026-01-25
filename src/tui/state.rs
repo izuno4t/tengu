@@ -1,7 +1,12 @@
 use std::collections::VecDeque;
 use std::sync::mpsc;
 
-use crate::agent::AgentOutput;
+use crate::tui::InlineRenderState;
+
+pub enum TuiEvent {
+    Chunk(String),
+    Done,
+}
 
 pub struct AppState {
     pub should_quit: bool,
@@ -9,14 +14,15 @@ pub struct AppState {
     pub input: String,
     pub suggestions: String,
     pub origin_y: u16,
+    pub inline: InlineRenderState,
     pub status_model: String,
     pub status_build: String,
     pub status_state: String,
     pub status_detail: String,
     pub tick: u64,
     pub queue: VecDeque<String>,
-    pub result_rx: mpsc::Receiver<anyhow::Result<AgentOutput>>,
-    pub result_tx: mpsc::Sender<anyhow::Result<AgentOutput>>,
+    pub result_rx: mpsc::Receiver<anyhow::Result<TuiEvent>>,
+    pub result_tx: mpsc::Sender<anyhow::Result<TuiEvent>>,
     pub history: Vec<String>,
     pub history_index: Option<usize>,
     pub draft_input: String,
@@ -27,8 +33,8 @@ impl AppState {
         banner: String,
         status_model: String,
         status_build: String,
-        result_rx: mpsc::Receiver<anyhow::Result<AgentOutput>>,
-        result_tx: mpsc::Sender<anyhow::Result<AgentOutput>>,
+        result_rx: mpsc::Receiver<anyhow::Result<TuiEvent>>,
+        result_tx: mpsc::Sender<anyhow::Result<TuiEvent>>,
     ) -> Self {
         let mut log_lines = VecDeque::new();
         for line in banner.lines() {
@@ -40,6 +46,7 @@ impl AppState {
             input: String::new(),
             suggestions: String::new(),
             origin_y: 0,
+            inline: InlineRenderState::default(),
             status_model,
             status_build,
             status_state: "idle".to_string(),
@@ -58,6 +65,24 @@ impl AppState {
         for line in text.lines() {
             self.log_lines.push_back(line.to_string());
         }
+    }
+
+    pub fn append_stream_chunk(&mut self, text: &str) {
+        let mut iter = text.split('\n');
+        if let Some(first) = iter.next() {
+            match self.log_lines.back_mut() {
+                Some(last) => last.push_str(first),
+                None => self.log_lines.push_back(first.to_string()),
+            }
+        }
+        for rest in iter {
+            self.log_lines.push_back(rest.to_string());
+        }
+    }
+
+    pub fn input_row_count(&self) -> u16 {
+        let count = self.input.split('\n').count();
+        count.max(1) as u16
     }
 
     pub fn visible_log(&self, height: u16) -> String {

@@ -2,10 +2,11 @@
 // エージェント実行ループ（最小）
 
 use anyhow::Result;
+use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::llm::{LlmClient, LlmResponse};
+use crate::llm::{LlmClient, LlmResponse, LlmStream};
 use crate::tools::{ToolExecutor, ToolInput, ToolPolicy, ToolResult};
 
 #[allow(dead_code)]
@@ -40,10 +41,21 @@ pub struct AgentOutput {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "tool", rename_all = "lowercase")]
 enum ToolCall {
-    Read { path: String },
-    Write { path: String, content: String },
-    Grep { pattern: String, paths: Vec<String> },
-    Glob { pattern: String, root: Option<String> },
+    Read {
+        path: String,
+    },
+    Write {
+        path: String,
+        content: String,
+    },
+    Grep {
+        pattern: String,
+        paths: Vec<String>,
+    },
+    Glob {
+        pattern: String,
+        root: Option<String>,
+    },
 }
 
 impl AgentRunner {
@@ -56,72 +68,38 @@ impl AgentRunner {
     }
 
     pub async fn handle_prompt(&self, input: &str) -> Result<AgentOutput> {
-        let plan = self.generate_plan(input).await?;
-        let mut last_error: Option<String> = None;
-        let mut last_call: Option<ToolCall> = None;
-        let mut tool_result: Option<ToolResult> = None;
-        let mut final_response: Option<LlmResponse> = None;
-
-        for attempt in 0..=MAX_TOOL_RETRIES {
-            let selection = self
-                .select_tool(input, &plan, last_error.as_deref(), last_call.as_ref())
-                .await?;
-            let Some(call) = selection else {
-                let execute_prompt = build_execute_prompt(input, &plan);
-                let response = self
-                    .client
-                    .generate(&self.model_name, &execute_prompt)
-                    .await?;
-                final_response = Some(response);
-                break;
-            };
-
-            match self.execute_tool_call(call.clone()) {
-                Ok(result) => {
-                    let follow_prompt =
-                        build_followup_prompt(input, &plan, &format_tool_result(&result));
-                    let response = self
-                        .client
-                        .generate(&self.model_name, &follow_prompt)
-                        .await?;
-                    tool_result = Some(result);
-                    final_response = Some(response);
-                    break;
-                }
-                Err(err) => {
-                    last_error = Some(err.to_string());
-                    last_call = Some(call);
-                    if attempt >= MAX_TOOL_RETRIES {
-                        let fallback_prompt =
-                            build_failed_followup_prompt(input, &plan, last_error.as_deref());
-                        let response = self
-                            .client
-                            .generate(&self.model_name, &fallback_prompt)
-                            .await?;
-                        final_response = Some(response);
-                        break;
-                    }
-                }
-            }
-        }
-
-        let final_response =
-            final_response.ok_or_else(|| anyhow::anyhow!("final response is missing"))?;
+        let (plan, final_prompt, tool_result) = self.resolve_final_prompt(input).await?;
+        let final_response = self
+            .client
+            .generate(&self.model_name, &final_prompt)
+            .await?;
         let response = LlmResponse {
-            content: format!("計画:\n{}\n\n{}", plan.trim(), final_response.content.trim()),
+            content: format!(
+                "計画:\n{}\n\n{}",
+                plan.trim(),
+                final_response.content.trim()
+            ),
         };
-        Ok(AgentOutput {
-            response,
-            tool_result,
-        })
+        Ok(AgentOutput { response, tool_result })
+    }
+
+    pub async fn handle_prompt_stream(&self, input: &str) -> Result<LlmStream> {
+        let (plan, final_prompt, _tool_result) = self.resolve_final_prompt(input).await?;
+        let stream = self
+            .client
+            .generate_stream(&self.model_name, &final_prompt)
+            .await?;
+        let prefix = format!("計画:\n{}\n\n", plan.trim());
+        let prefix_stream = stream::once(async move { Ok(prefix) });
+        Ok(Box::pin(prefix_stream.chain(stream)) as BoxStream<'static, Result<String>>)
     }
 
     fn execute_tool_call(&self, call: ToolCall) -> Result<ToolResult> {
         let executor = ToolExecutor::with_policy(self.tool_policy.clone());
         match call {
-            ToolCall::Read { path } => {
-                executor.execute(ToolInput::Read { path: PathBuf::from(path) })
-            }
+            ToolCall::Read { path } => executor.execute(ToolInput::Read {
+                path: PathBuf::from(path),
+            }),
             ToolCall::Write { path, content } => {
                 executor.preview_write(PathBuf::from(path), content)
             }
@@ -142,6 +120,46 @@ impl AgentRunner {
         let prompt = build_plan_prompt(input);
         let response = self.client.generate(&self.model_name, &prompt).await?;
         Ok(response.content)
+    }
+
+    async fn resolve_final_prompt(
+        &self,
+        input: &str,
+    ) -> Result<(String, String, Option<ToolResult>)> {
+        let plan = self.generate_plan(input).await?;
+        let mut last_error: Option<String> = None;
+        let mut last_call: Option<ToolCall> = None;
+        let mut tool_result: Option<ToolResult> = None;
+
+        for attempt in 0..=MAX_TOOL_RETRIES {
+            let selection = self
+                .select_tool(input, &plan, last_error.as_deref(), last_call.as_ref())
+                .await?;
+            let Some(call) = selection else {
+                let execute_prompt = build_execute_prompt(input, &plan);
+                return Ok((plan, execute_prompt, tool_result));
+            };
+
+            match self.execute_tool_call(call.clone()) {
+                Ok(result) => {
+                    let follow_prompt =
+                        build_followup_prompt(input, &plan, &format_tool_result(&result));
+                    tool_result = Some(result);
+                    return Ok((plan, follow_prompt, tool_result));
+                }
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                    last_call = Some(call);
+                    if attempt >= MAX_TOOL_RETRIES {
+                        let fallback_prompt =
+                            build_failed_followup_prompt(input, &plan, last_error.as_deref());
+                        return Ok((plan, fallback_prompt, tool_result));
+                    }
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("final prompt is missing"))
     }
 
     async fn select_tool(

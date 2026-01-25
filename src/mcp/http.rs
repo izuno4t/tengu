@@ -49,8 +49,8 @@ pub async fn list_tools_http(server: &McpServerConfig) -> Result<Vec<McpTool>> {
             }
         })),
     };
-    let (init_result, session_id) = send_request(&client, url, &headers, &init_request, next_id)
-        .await?;
+    let (init_result, session_id) =
+        send_request(&client, url, &headers, &init_request, next_id).await?;
     let _ = init_result;
     if let Some(session_id) = session_id {
         headers.insert(
@@ -111,7 +111,10 @@ fn build_headers(server: &McpServerConfig) -> Result<HeaderMap> {
     if let Some(env_var) = &server.bearer_token_env_var {
         if let Ok(token) = std::env::var(env_var) {
             let value = format!("Bearer {}", token);
-            headers.insert(reqwest::header::AUTHORIZATION, HeaderValue::from_str(&value)?);
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                HeaderValue::from_str(&value)?,
+            );
         }
     }
     if let Some(extra) = &server.http_headers {
@@ -130,7 +133,12 @@ async fn send_notification(
     headers: &HeaderMap,
     notification: &JsonRpcNotification<'_>,
 ) -> Result<()> {
-    let resp = client.post(url).headers(headers.clone()).json(notification).send().await?;
+    let resp = client
+        .post(url)
+        .headers(headers.clone())
+        .json(notification)
+        .send()
+        .await?;
     if !resp.status().is_success() {
         return Err(anyhow!("mcp notification failed: {}", resp.status()));
     }
@@ -144,7 +152,12 @@ async fn send_request(
     request: &JsonRpcRequest<'_>,
     id: u64,
 ) -> Result<(Value, Option<String>)> {
-    let resp = client.post(url).headers(headers.clone()).json(request).send().await?;
+    let resp = client
+        .post(url)
+        .headers(headers.clone())
+        .json(request)
+        .send()
+        .await?;
     let session_id = extract_session_id(&resp);
     let value = parse_response(resp, id).await?;
     Ok((value, session_id))

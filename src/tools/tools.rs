@@ -20,12 +20,26 @@ pub enum Tool {
 
 #[derive(Debug, Clone)]
 pub enum ToolInput {
-    Read { path: PathBuf },
-    Write { path: PathBuf, content: String },
+    Read {
+        path: PathBuf,
+    },
+    Write {
+        path: PathBuf,
+        content: String,
+    },
     #[allow(dead_code)]
-    Shell { command: String, args: Vec<String> },
-    Grep { pattern: String, paths: Vec<PathBuf> },
-    Glob { pattern: String, root: Option<PathBuf> },
+    Shell {
+        command: String,
+        args: Vec<String>,
+    },
+    Grep {
+        pattern: String,
+        paths: Vec<PathBuf>,
+    },
+    Glob {
+        pattern: String,
+        root: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug)]
@@ -114,10 +128,7 @@ impl ToolPolicy {
                 .iter()
                 .any(|rule| rule_matches_tool(rule, input, Some(&self.workspace_root)))
             {
-                return Err(anyhow!(
-                    "tool not allowed: {}",
-                    tool_name(input)
-                ));
+                return Err(anyhow!("tool not allowed: {}", tool_name(input)));
             }
         }
 
@@ -147,9 +158,7 @@ impl ToolPolicy {
 
         if matches!(mode.as_str(), "workspace-write") {
             if matches!(input, ToolInput::Shell { .. }) {
-                return Err(anyhow!(
-                    "sandbox denies shell in workspace-write mode"
-                ));
+                return Err(anyhow!("sandbox denies shell in workspace-write mode"));
             }
             if matches!(input, ToolInput::Write { .. }) {
                 let paths = tool_paths(input);
@@ -229,7 +238,11 @@ impl ToolExecutor {
             String::new()
         };
         let diff = build_diff(&path, &before, &content);
-        Ok(ToolResult::PreviewWrite { path, diff, content })
+        Ok(ToolResult::PreviewWrite {
+            path,
+            diff,
+            content,
+        })
     }
 
     pub fn execute(&self, input: ToolInput) -> Result<ToolResult> {
@@ -251,7 +264,9 @@ impl ToolExecutor {
             ToolInput::Shell { command, args } => {
                 let output = Command::new(&command).args(args).output()?;
                 if output.status.success() {
-                    Ok(ToolResult::Text(String::from_utf8_lossy(&output.stdout).to_string()))
+                    Ok(ToolResult::Text(
+                        String::from_utf8_lossy(&output.stdout).to_string(),
+                    ))
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     Err(anyhow!("command failed: {} ({})", command, stderr.trim()))
@@ -343,8 +358,7 @@ fn rule_matches_tool(rule: &str, input: &ToolInput, root: Option<&Path>) -> bool
     let tool = tool_name(input);
     let name_lower = name.to_ascii_lowercase();
     let tool_lower = tool.to_ascii_lowercase();
-    let matches_name = name_lower == tool_lower
-        || (name_lower == "bash" && tool_lower == "shell");
+    let matches_name = name_lower == tool_lower || (name_lower == "bash" && tool_lower == "shell");
     if !matches_name {
         return false;
     }
@@ -360,7 +374,9 @@ fn rule_matches_tool(rule: &str, input: &ToolInput, root: Option<&Path>) -> bool
 fn tool_match_targets(input: &ToolInput, root: Option<&Path>) -> Vec<String> {
     match input {
         ToolInput::Read { path } | ToolInput::Write { path, .. } => {
-            let abs = root.map(|r| resolve_path(r, path)).unwrap_or_else(|| path.clone());
+            let abs = root
+                .map(|r| resolve_path(r, path))
+                .unwrap_or_else(|| path.clone());
             vec![
                 path.to_string_lossy().to_string(),
                 abs.to_string_lossy().to_string(),
