@@ -2,15 +2,38 @@ use std::collections::VecDeque;
 use std::sync::mpsc;
 
 use crate::tui::InlineRenderState;
+use crate::tools::{ToolApprovalDecision, ToolApprovalRequest};
+use tokio::sync::oneshot;
 
 pub enum TuiEvent {
     Chunk(String),
     Done,
+    ApprovalRequest {
+        request: ToolApprovalRequest,
+        respond_to: oneshot::Sender<ToolApprovalDecision>,
+    },
+}
+
+pub struct ApprovalPending {
+    pub respond_to: oneshot::Sender<ToolApprovalDecision>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogRole {
+    User,
+    Assistant,
+    System,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogLine {
+    pub role: LogRole,
+    pub text: String,
 }
 
 pub struct AppState {
     pub should_quit: bool,
-    pub log_lines: VecDeque<String>,
+    pub log_lines: VecDeque<LogLine>,
     pub input: String,
     pub suggestions: String,
     pub origin_y: u16,
@@ -26,6 +49,7 @@ pub struct AppState {
     pub history: Vec<String>,
     pub history_index: Option<usize>,
     pub draft_input: String,
+    pub approval_pending: Option<ApprovalPending>,
 }
 
 impl AppState {
@@ -38,7 +62,10 @@ impl AppState {
     ) -> Self {
         let mut log_lines = VecDeque::new();
         for line in banner.lines() {
-            log_lines.push_back(line.to_string());
+            log_lines.push_back(LogLine {
+                role: LogRole::System,
+                text: line.to_string(),
+            });
         }
         Self {
             should_quit: false,
@@ -58,25 +85,34 @@ impl AppState {
             history: Vec::new(),
             history_index: None,
             draft_input: String::new(),
+            approval_pending: None,
         }
     }
 
     pub fn append_message(&mut self, text: &str) {
-        for line in text.lines() {
-            self.log_lines.push_back(line.to_string());
-        }
+        self.append_message_with_role(text, LogRole::Assistant);
+    }
+
+    pub fn append_user_message(&mut self, text: &str) {
+        self.append_message_with_role(text, LogRole::User);
     }
 
     pub fn append_stream_chunk(&mut self, text: &str) {
         let mut iter = text.split('\n');
         if let Some(first) = iter.next() {
             match self.log_lines.back_mut() {
-                Some(last) => last.push_str(first),
-                None => self.log_lines.push_back(first.to_string()),
+                Some(last) if last.role == LogRole::Assistant => last.text.push_str(first),
+                _ => self.log_lines.push_back(LogLine {
+                    role: LogRole::Assistant,
+                    text: first.to_string(),
+                }),
             }
         }
         for rest in iter {
-            self.log_lines.push_back(rest.to_string());
+            self.log_lines.push_back(LogLine {
+                role: LogRole::Assistant,
+                text: rest.to_string(),
+            });
         }
     }
 
@@ -85,18 +121,13 @@ impl AppState {
         count.max(1) as u16
     }
 
-    pub fn visible_log(&self, height: u16) -> String {
+    pub fn visible_log_lines(&self, height: u16) -> Vec<LogLine> {
         if height == 0 {
-            return String::new();
+            return Vec::new();
         }
         let max = height as usize;
         if self.log_lines.len() <= max {
-            return self
-                .log_lines
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n");
+            return self.log_lines.iter().cloned().collect::<Vec<_>>();
         }
         let start = self.log_lines.len().saturating_sub(max);
         self.log_lines
@@ -104,7 +135,6 @@ impl AppState {
             .skip(start)
             .cloned()
             .collect::<Vec<_>>()
-            .join("\n")
     }
 
     pub fn set_running(&mut self, detail: &str) {
@@ -115,5 +145,14 @@ impl AppState {
     pub fn set_idle(&mut self) {
         self.status_state = "idle".to_string();
         self.status_detail = "idle".to_string();
+    }
+
+    fn append_message_with_role(&mut self, text: &str, role: LogRole) {
+        for line in text.lines() {
+            self.log_lines.push_back(LogLine {
+                role,
+                text: line.to_string(),
+            });
+        }
     }
 }

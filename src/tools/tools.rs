@@ -5,6 +5,7 @@ use anyhow::{anyhow, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 use crate::config::{Config, PermissionsConfig, SandboxConfig};
 
@@ -60,6 +61,7 @@ pub struct ToolPolicy {
     permissions: Option<PermissionsConfig>,
     sandbox: Option<SandboxConfig>,
     workspace_root: PathBuf,
+    approval_override: Arc<Mutex<ApprovalOverride>>,
 }
 
 impl Default for ToolPolicy {
@@ -69,6 +71,7 @@ impl Default for ToolPolicy {
             permissions: None,
             sandbox: None,
             workspace_root,
+            approval_override: Arc::new(Mutex::new(ApprovalOverride::None)),
         }
     }
 }
@@ -80,6 +83,13 @@ impl ToolPolicy {
             permissions: config.permissions.clone(),
             sandbox: config.sandbox.clone(),
             workspace_root,
+            approval_override: Arc::new(Mutex::new(ApprovalOverride::None)),
+        }
+    }
+
+    pub fn set_approval_override(&self, override_state: ApprovalOverride) {
+        if let Ok(mut guard) = self.approval_override.lock() {
+            *guard = override_state;
         }
     }
 
@@ -98,10 +108,29 @@ impl ToolPolicy {
             let policy = policy.trim().to_ascii_lowercase();
             match policy.as_str() {
                 "always" => {
-                    return Err(anyhow!(
-                        "permission approval required for tool: {}",
-                        tool_name(input)
-                    ));
+                    if let Ok(mut guard) = self.approval_override.lock() {
+                        match &*guard {
+                            ApprovalOverride::AllowAll => {}
+                            ApprovalOverride::DenyAll => {
+                                return Err(anyhow!(
+                                    "permission denied by approval override for tool: {}",
+                                    tool_name(input)
+                                ));
+                            }
+                            ApprovalOverride::AllowOnce(tool) => {
+                                if *tool == tool_kind(input) {
+                                    *guard = ApprovalOverride::None;
+                                } else {
+                                    return Err(ToolApprovalRequired::new(input).into());
+                                }
+                            }
+                            ApprovalOverride::None => {
+                                return Err(ToolApprovalRequired::new(input).into());
+                            }
+                        }
+                    } else {
+                        return Err(ToolApprovalRequired::new(input).into());
+                    }
                 }
                 "read-only" => {
                     if matches!(input, ToolInput::Write { .. } | ToolInput::Shell { .. }) {
@@ -305,6 +334,16 @@ fn tool_name(input: &ToolInput) -> &'static str {
     }
 }
 
+fn tool_kind(input: &ToolInput) -> Tool {
+    match input {
+        ToolInput::Read { .. } => Tool::Read,
+        ToolInput::Write { .. } => Tool::Write,
+        ToolInput::Shell { .. } => Tool::Shell,
+        ToolInput::Grep { .. } => Tool::Grep,
+        ToolInput::Glob { .. } => Tool::Glob,
+    }
+}
+
 fn tool_paths(input: &ToolInput) -> Vec<PathBuf> {
     match input {
         ToolInput::Read { path } => vec![path.clone()],
@@ -313,6 +352,51 @@ fn tool_paths(input: &ToolInput) -> Vec<PathBuf> {
         ToolInput::Glob { root, .. } => root.clone().map(|p| vec![p]).unwrap_or_default(),
         ToolInput::Shell { .. } => Vec::new(),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolApprovalDecision {
+    AllowOnce,
+    DenyOnce,
+    AllowAll,
+    DenyAll,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolApprovalRequest {
+    pub tool: Tool,
+    pub paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolApprovalRequired {
+    pub tool: Tool,
+    pub paths: Vec<PathBuf>,
+}
+
+impl ToolApprovalRequired {
+    fn new(input: &ToolInput) -> Self {
+        Self {
+            tool: tool_kind(input),
+            paths: tool_paths(input),
+        }
+    }
+}
+
+impl std::fmt::Display for ToolApprovalRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "permission approval required for tool: {:?}", self.tool)
+    }
+}
+
+impl std::error::Error for ToolApprovalRequired {}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ApprovalOverride {
+    None,
+    AllowOnce(Tool),
+    AllowAll,
+    DenyAll,
 }
 
 fn resolve_path(root: &Path, path: &Path) -> PathBuf {

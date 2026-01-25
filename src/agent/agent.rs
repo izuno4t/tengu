@@ -2,12 +2,17 @@
 // エージェント実行ループ（最小）
 
 use anyhow::Result;
+use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use crate::llm::{LlmClient, LlmResponse, LlmStream};
-use crate::tools::{ToolExecutor, ToolInput, ToolPolicy, ToolResult};
+use crate::tools::{
+    ApprovalOverride, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequired, ToolExecutor,
+    ToolInput, ToolPolicy, ToolResult,
+};
 
 #[allow(dead_code)]
 pub struct Agent {
@@ -31,6 +36,7 @@ pub struct AgentRunner {
     client: LlmClient,
     model_name: String,
     tool_policy: ToolPolicy,
+    approval_handler: Mutex<Option<ApprovalHandler>>,
 }
 
 pub struct AgentOutput {
@@ -64,6 +70,13 @@ impl AgentRunner {
             client,
             model_name,
             tool_policy,
+            approval_handler: Mutex::new(None),
+        }
+    }
+
+    pub fn set_approval_handler(&self, handler: ApprovalHandler) {
+        if let Ok(mut guard) = self.approval_handler.lock() {
+            *guard = Some(handler);
         }
     }
 
@@ -148,6 +161,45 @@ impl AgentRunner {
                     return Ok((plan, follow_prompt, tool_result));
                 }
                 Err(err) => {
+                    if let Some(required) = err.downcast_ref::<ToolApprovalRequired>() {
+                        let request = ToolApprovalRequest {
+                            tool: required.tool,
+                            paths: required.paths.clone(),
+                        };
+                        match self.request_approval(request).await {
+                            Ok(decision) => match decision {
+                                ToolApprovalDecision::AllowOnce => {
+                                    self.tool_policy
+                                        .set_approval_override(ApprovalOverride::AllowOnce(
+                                            required.tool,
+                                        ));
+                                    continue;
+                                }
+                                ToolApprovalDecision::AllowAll => {
+                                    self.tool_policy
+                                        .set_approval_override(ApprovalOverride::AllowAll);
+                                    continue;
+                                }
+                                ToolApprovalDecision::DenyOnce => {
+                                    return Err(anyhow::anyhow!(
+                                        "permission denied by user for tool: {:?}",
+                                        required.tool
+                                    ));
+                                }
+                                ToolApprovalDecision::DenyAll => {
+                                    self.tool_policy
+                                        .set_approval_override(ApprovalOverride::DenyAll);
+                                    return Err(anyhow::anyhow!(
+                                        "permission denied by user for tool: {:?}",
+                                        required.tool
+                                    ));
+                                }
+                            },
+                            Err(_) => {
+                                return Err(err);
+                            }
+                        }
+                    }
                     last_error = Some(err.to_string());
                     last_call = Some(call);
                     if attempt >= MAX_TOOL_RETRIES {
@@ -162,6 +214,22 @@ impl AgentRunner {
         Err(anyhow::anyhow!("final prompt is missing"))
     }
 
+    async fn request_approval(
+        &self,
+        request: ToolApprovalRequest,
+    ) -> Result<ToolApprovalDecision> {
+        let handler = self
+            .approval_handler
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(handler) = handler {
+            Ok(handler(request).await)
+        } else {
+            Err(anyhow::anyhow!("approval handler not configured"))
+        }
+    }
+
     async fn select_tool(
         &self,
         input: &str,
@@ -174,6 +242,9 @@ impl AgentRunner {
         Ok(parse_tool_call_loose(&response.content))
     }
 }
+
+type ApprovalHandler =
+    Arc<dyn Fn(ToolApprovalRequest) -> BoxFuture<'static, ToolApprovalDecision> + Send + Sync>;
 
 const MAX_TOOL_RETRIES: usize = 2;
 

@@ -10,12 +10,14 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size, ScrollUp};
 use futures_util::StreamExt;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
+use tokio::sync::oneshot;
 
 use crate::agent::AgentRunner;
 use crate::config::Config;
 use crate::mcp::McpStore;
 use crate::tui::render;
-use crate::tui::state::{AppState, TuiEvent};
+use crate::tui::state::{AppState, ApprovalPending, TuiEvent};
+use crate::tools::{Tool, ToolApprovalDecision, ToolApprovalRequest};
 
 pub struct App {
     state: AppState,
@@ -35,6 +37,17 @@ impl App {
         result_tx: mpsc::Sender<anyhow::Result<TuiEvent>>,
     ) -> Self {
         let state = AppState::new(banner, status_model, status_build, result_rx, result_tx);
+        let approval_sender = state.result_tx.clone();
+        runner.set_approval_handler(Arc::new(move |request: ToolApprovalRequest| {
+            let (tx, rx) = oneshot::channel();
+            let _ = approval_sender.send(Ok(TuiEvent::ApprovalRequest {
+                request,
+                respond_to: tx,
+            }));
+            Box::pin(async move {
+                rx.await.unwrap_or(ToolApprovalDecision::DenyOnce)
+            })
+        }));
         Self {
             state,
             runner,
@@ -74,10 +87,16 @@ impl App {
                             if let Some(handle) = self.current_task.take() {
                                 handle.abort();
                             }
+                            self.cancel_pending_approval();
                             self.state.set_idle();
                             self.state.append_message("interrupted");
                         } else {
                             self.state.should_quit = true;
+                        }
+                    }
+                    if self.state.approval_pending.is_some() {
+                        if self.handle_approval_key(&key.code) {
+                            continue;
                         }
                     }
                     match key.code {
@@ -126,21 +145,23 @@ impl App {
         Ok(())
     }
 
-    fn required_height(&self) -> u16 {
+    fn required_height(&mut self) -> u16 {
         let input_height = self.state.input_row_count().saturating_add(1);
         let divider_height = 1u16;
         let spacer_height = 1u16;
-        let status_height = 1u16;
         let app_status_height = 1u16;
         let help_height = if self.state.suggestions.is_empty() {
             0
         } else {
             self.state.suggestions.lines().count() as u16
         };
-        let desired_log = (self.state.log_lines.len() as u16).max(3);
+        let mut desired_log = (self.state.log_lines.len() as u16).max(3);
+        if desired_log >= 5 {
+            self.state.inline.min_log_rows = 5;
+        }
+        desired_log = desired_log.max(self.state.inline.min_log_rows);
         desired_log
             .saturating_add(spacer_height)
-            .saturating_add(status_height)
             .saturating_add(divider_height)
             .saturating_add(input_height)
             .saturating_add(help_height)
@@ -176,7 +197,12 @@ impl App {
             return;
         }
 
-        self.state.append_message(&format!("> {}", input));
+        if self.state.status_state == "running" {
+            self.state.queue.push_back(input);
+            return;
+        }
+
+        self.state.append_user_message(&format!("> {}", input));
         self.state.queue.push_back(input);
         self.maybe_start_next();
     }
@@ -239,7 +265,10 @@ impl App {
             return;
         };
         self.state.set_running("waiting LLM");
-        self.state.log_lines.push_back(String::new());
+        self.state.log_lines.push_back(crate::tui::state::LogLine {
+            role: crate::tui::state::LogRole::Assistant,
+            text: String::new(),
+        });
         let runner = Arc::clone(&self.runner);
         let input_clone = input.clone();
         let result_tx = self.state.result_tx.clone();
@@ -289,6 +318,13 @@ impl App {
                         self.state.set_idle();
                         self.current_task = None;
                     }
+                    TuiEvent::ApprovalRequest { request, respond_to } => {
+                        let prompt = format_approval_prompt(&request);
+                        self.state.append_message(&prompt);
+                        self.state.status_state = "running".to_string();
+                        self.state.status_detail = "approval required".to_string();
+                        self.state.approval_pending = Some(ApprovalPending { respond_to });
+                    }
                 },
                 Err(err) => {
                     self.state.append_message(&format!("error: {}", err));
@@ -296,6 +332,30 @@ impl App {
                     self.current_task = None;
                 }
             }
+        }
+    }
+
+    fn handle_approval_key(&mut self, key: &KeyCode) -> bool {
+        let decision = match key {
+            KeyCode::Char('y') => Some(ToolApprovalDecision::AllowOnce),
+            KeyCode::Char('n') => Some(ToolApprovalDecision::DenyOnce),
+            KeyCode::Char('a') => Some(ToolApprovalDecision::AllowAll),
+            KeyCode::Char('d') => Some(ToolApprovalDecision::DenyAll),
+            _ => None,
+        };
+        if let Some(decision) = decision {
+            if let Some(pending) = self.state.approval_pending.take() {
+                let _ = pending.respond_to.send(decision);
+            }
+            self.state.status_detail = "waiting LLM".to_string();
+            return true;
+        }
+        true
+    }
+
+    fn cancel_pending_approval(&mut self) {
+        if let Some(pending) = self.state.approval_pending.take() {
+            let _ = pending.respond_to.send(ToolApprovalDecision::DenyOnce);
         }
     }
 }
@@ -334,6 +394,27 @@ fn handle_slash_command(input: &str) -> Option<String> {
             }
         }
     }
+}
+
+fn format_approval_prompt(request: &ToolApprovalRequest) -> String {
+    let tool_name = match request.tool {
+        Tool::Read => "Read",
+        Tool::Write => "Write",
+        Tool::Shell => "Shell",
+        Tool::Grep => "Grep",
+        Tool::Glob => "Glob",
+    };
+    let target = if request.paths.is_empty() {
+        "target".to_string()
+    } else if request.paths.len() == 1 {
+        request.paths[0].display().to_string()
+    } else {
+        format!("{} (+{} more)", request.paths[0].display(), request.paths.len() - 1)
+    };
+    format!(
+        "Allow {} to {}?\n[y] Yes  [n] No  [a] Always allow  [d] Don't ask again",
+        tool_name, target
+    )
 }
 
 #[derive(Clone, Copy)]

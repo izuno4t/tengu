@@ -112,6 +112,23 @@ approval_policy = "on-request"
 allowed_tools = ["Read", "Write", "Bash(git *)"]
 ```
 
+### TUI Theme (~/.tengu/theme.toml)
+
+TUI colors can be overridden by placing a theme file at `~/.tengu/theme.toml`.
+Only keys you set are overridden; others fall back to `src/tui/theme.toml`.
+
+```toml
+user = "green"
+assistant = "white"
+system = "white"
+status = "yellow"
+queue = "dark_grey"
+heading = "cyan"
+inline_code = "cyan"
+divider = "grey"
+footer = "grey"
+```
+
 ### Project Context (./AGENT.md)
 
 ```markdown

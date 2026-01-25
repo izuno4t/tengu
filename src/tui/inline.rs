@@ -5,6 +5,7 @@ pub struct InlineRenderState {
     pub footer_row: Option<u16>,
     pub input_rows: u16,
     pub status_rows: u16,
+    pub min_log_rows: u16,
     pub dirty: bool,
 }
 
@@ -16,6 +17,7 @@ impl Default for InlineRenderState {
             footer_row: None,
             input_rows: 0,
             status_rows: 0,
+            min_log_rows: 3,
             dirty: true,
         }
     }
