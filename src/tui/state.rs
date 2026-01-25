@@ -14,6 +14,24 @@ pub enum TuiEvent {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConversationTurn {
+    pub role: ConversationRole,
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingInput {
+    pub text: String,
+    pub logged: bool,
+}
+
 pub struct ApprovalPending {
     pub respond_to: oneshot::Sender<ToolApprovalDecision>,
 }
@@ -43,13 +61,15 @@ pub struct AppState {
     pub status_state: String,
     pub status_detail: String,
     pub tick: u64,
-    pub queue: VecDeque<String>,
+    pub queue: VecDeque<PendingInput>,
     pub result_rx: mpsc::Receiver<anyhow::Result<TuiEvent>>,
     pub result_tx: mpsc::Sender<anyhow::Result<TuiEvent>>,
     pub history: Vec<String>,
     pub history_index: Option<usize>,
     pub draft_input: String,
     pub approval_pending: Option<ApprovalPending>,
+    pub conversation: Vec<ConversationTurn>,
+    pub current_assistant: String,
 }
 
 impl AppState {
@@ -86,6 +106,8 @@ impl AppState {
             history_index: None,
             draft_input: String::new(),
             approval_pending: None,
+            conversation: Vec::new(),
+            current_assistant: String::new(),
         }
     }
 
@@ -114,6 +136,45 @@ impl AppState {
                 text: rest.to_string(),
             });
         }
+    }
+
+    pub fn append_assistant_chunk(&mut self, text: &str) {
+        self.current_assistant.push_str(text);
+    }
+
+    pub fn start_assistant_response(&mut self) {
+        self.current_assistant.clear();
+    }
+
+    pub fn finalize_assistant_response(&mut self) {
+        if !self.current_assistant.trim().is_empty() {
+            self.conversation.push(ConversationTurn {
+                role: ConversationRole::Assistant,
+                content: self.current_assistant.trim().to_string(),
+            });
+        }
+        self.current_assistant.clear();
+        self.append_blank_line();
+    }
+
+    pub fn push_user_conversation(&mut self, text: &str) {
+        self.conversation.push(ConversationTurn {
+            role: ConversationRole::User,
+            content: text.to_string(),
+        });
+    }
+
+    pub fn build_context(&self, max_turns: usize) -> String {
+        let start = self.conversation.len().saturating_sub(max_turns);
+        let mut parts = Vec::new();
+        for turn in self.conversation.iter().skip(start) {
+            let role = match turn.role {
+                ConversationRole::User => "ユーザー",
+                ConversationRole::Assistant => "アシスタント",
+            };
+            parts.push(format!("{}: {}", role, turn.content));
+        }
+        parts.join("\n")
     }
 
     pub fn input_row_count(&self) -> u16 {
@@ -154,5 +215,12 @@ impl AppState {
                 text: line.to_string(),
             });
         }
+    }
+
+    pub fn append_blank_line(&mut self) {
+        self.log_lines.push_back(LogLine {
+            role: LogRole::System,
+            text: String::new(),
+        });
     }
 }

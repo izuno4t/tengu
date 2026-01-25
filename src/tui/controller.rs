@@ -61,6 +61,8 @@ impl App {
         writeln!(stdout)?;
         stdout.flush()?;
         enable_raw_mode()?;
+        writeln!(stdout)?;
+        stdout.flush()?;
         self.state.origin_y = position().map(|(_, y)| y).unwrap_or(0);
         let result = self.run_loop(&mut stdout);
 
@@ -198,12 +200,18 @@ impl App {
         }
 
         if self.state.status_state == "running" {
-            self.state.queue.push_back(input);
+            self.state.queue.push_back(crate::tui::state::PendingInput {
+                text: input,
+                logged: false,
+            });
             return;
         }
 
         self.state.append_user_message(&format!("> {}", input));
-        self.state.queue.push_back(input);
+        self.state.queue.push_back(crate::tui::state::PendingInput {
+            text: input,
+            logged: true,
+        });
         self.maybe_start_next();
     }
 
@@ -261,19 +269,28 @@ impl App {
         if self.state.status_state == "running" {
             return;
         }
-        let Some(input) = self.state.queue.pop_front() else {
+        let Some(pending) = self.state.queue.pop_front() else {
             return;
         };
+        if !pending.logged {
+            self.state.append_user_message(&format!("> {}", pending.text));
+        }
+        self.state.append_blank_line();
         self.state.set_running("waiting LLM");
         self.state.log_lines.push_back(crate::tui::state::LogLine {
             role: crate::tui::state::LogRole::Assistant,
             text: String::new(),
         });
+        self.state.start_assistant_response();
         let runner = Arc::clone(&self.runner);
-        let input_clone = input.clone();
+        let input_clone = pending.text.clone();
+        let context = self.state.build_context(10);
+        self.state.push_user_conversation(&pending.text);
         let result_tx = self.state.result_tx.clone();
         let handle = self.handle.spawn(async move {
-            let stream_result = runner.handle_prompt_stream(&input_clone).await;
+            let stream_result = runner
+                .handle_prompt_stream_with_context(&input_clone, &context)
+                .await;
             match stream_result {
                 Ok(mut stream) => {
                     while let Some(chunk) = stream.next().await {
@@ -292,7 +309,7 @@ impl App {
                     let _ = result_tx.send(Ok(TuiEvent::Done));
                 }
                 Err(_) => {
-                    match runner.handle_prompt(&input_clone).await {
+                    match runner.handle_prompt_with_context(&input_clone, &context).await {
                         Ok(output) => {
                             let _ = result_tx.send(Ok(TuiEvent::Chunk(output.response.content)));
                             let _ = result_tx.send(Ok(TuiEvent::Done));
@@ -313,8 +330,10 @@ impl App {
                 Ok(event) => match event {
                     TuiEvent::Chunk(text) => {
                         self.state.append_stream_chunk(&text);
+                        self.state.append_assistant_chunk(&text);
                     }
                     TuiEvent::Done => {
+                        self.state.finalize_assistant_response();
                         self.state.set_idle();
                         self.current_task = None;
                     }

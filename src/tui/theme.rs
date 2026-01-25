@@ -10,6 +10,7 @@ struct ThemeConfig {
     assistant: String,
     system: String,
     status: String,
+    status_pulse: String,
     queue: String,
     heading: String,
     inline_code: String,
@@ -27,6 +28,7 @@ struct ThemeConfigOpt {
     assistant: Option<String>,
     system: Option<String>,
     status: Option<String>,
+    status_pulse: Option<String>,
     queue: Option<String>,
     heading: Option<String>,
     inline_code: Option<String>,
@@ -44,6 +46,7 @@ pub struct Theme {
     pub assistant: Color,
     pub system: Color,
     pub status: Color,
+    pub status_pulse: Color,
     pub queue: Color,
     pub heading: Color,
     pub inline_code: Color,
@@ -67,6 +70,7 @@ pub static THEME: Lazy<Theme> = Lazy::new(|| {
         assistant: resolve_color(&config.assistant, &map),
         system: resolve_color(&config.system, &map),
         status: resolve_color(&config.status, &map),
+        status_pulse: resolve_color(&config.status_pulse, &map),
         queue: resolve_color(&config.queue, &map),
         heading: resolve_color(&config.heading, &map),
         inline_code: resolve_color(&config.inline_code, &map),
@@ -85,6 +89,7 @@ fn default_theme() -> ThemeConfig {
         assistant: "white".to_string(),
         system: "white".to_string(),
         status: "yellow".to_string(),
+        status_pulse: "white".to_string(),
         queue: "dark_grey".to_string(),
         heading: "cyan".to_string(),
         inline_code: "cyan".to_string(),
@@ -116,6 +121,9 @@ fn apply_override(config: &mut ThemeConfig, override_config: ThemeConfigOpt) {
     }
     if let Some(value) = override_config.status {
         config.status = value;
+    }
+    if let Some(value) = override_config.status_pulse {
+        config.status_pulse = value;
     }
     if let Some(value) = override_config.queue {
         config.queue = value;

@@ -53,8 +53,7 @@ pub fn draw(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
 
     let mut lines: Vec<String> = Vec::with_capacity(total_height as usize);
     lines.extend(build_log_lines(state, log_height, width));
-
-    lines.push(String::new());
+    lines.extend(build_status_lines(state, width));
 
     lines.push(colorize_line(
         &"─".repeat(width),
@@ -164,33 +163,30 @@ fn align_right(left: &str, right: &str, width: usize) -> String {
     if right.is_empty() {
         return fit_width(left, width);
     }
-    let left_w = UnicodeWidthStr::width(left);
-    let right_w = UnicodeWidthStr::width(right);
-    if left_w + 1 + right_w > width {
-        return fit_width(left, width);
+    let right_w = visible_width(right);
+    if right_w >= width {
+        return fit_width(right, width);
     }
+    let left_max = width.saturating_sub(right_w + 1);
+    let left_trim = fit_width(left, left_max);
+    let left_w = visible_width(&left_trim);
     let pad = width.saturating_sub(left_w + right_w);
-    format!("{}{}{}", left, " ".repeat(pad), right)
+    format!("{}{}{}", left_trim, " ".repeat(pad), right)
 }
 
 fn build_log_lines(state: &AppState, height: u16, width: usize) -> Vec<String> {
     if height == 0 {
         return Vec::new();
     }
-    let min_log = state.inline.min_log_rows.max(3).min(height);
-    let status_lines = build_status_lines(state, width);
     let queue_lines = build_queue_lines(state, width);
-    let mut remaining = height.saturating_sub(min_log);
-    let status_take = if remaining > 0 {
-        remaining = remaining.saturating_sub(1);
-        1
+    let min_log = state.inline.min_log_rows.max(3).min(height);
+    let queue_take = if height > min_log {
+        let available = height.saturating_sub(min_log);
+        available.min(queue_lines.len() as u16)
     } else {
         0
     };
-    let queue_take = remaining.min(queue_lines.len() as u16);
-    let log_height = height
-        .saturating_sub(status_take)
-        .saturating_sub(queue_take);
+    let log_height = height.saturating_sub(queue_take);
     let mut lines = Vec::with_capacity(height as usize);
 
     if log_height > 0 {
@@ -207,7 +203,6 @@ fn build_log_lines(state: &AppState, height: u16, width: usize) -> Vec<String> {
         }
     }
 
-    lines.extend(status_lines.into_iter().take(status_take as usize));
     lines.extend(queue_lines.into_iter().take(queue_take as usize));
     lines
 }
@@ -220,7 +215,7 @@ fn build_queue_lines(state: &AppState, width: usize) -> Vec<String> {
     let header = format!("queued: {}", state.queue.len());
     lines.push(colorize_line(&header, width, ansi::set_fg(THEME.queue)));
     for item in state.queue.iter() {
-        let entry = format!("  {}", item);
+        let entry = format!("  {}", item.text);
         lines.push(colorize_line(&entry, width, ansi::set_fg(THEME.queue)));
     }
     lines
@@ -231,9 +226,28 @@ fn build_status_lines(state: &AppState, width: usize) -> Vec<String> {
     let spinner = if state.status_state == "running" {
         spinner_frames[(state.tick / 6) as usize % spinner_frames.len()]
     } else {
-        ""
+        "    "
     };
-    let status_line = format!("• status: {} {}", state.status_detail, spinner);
+    let (bullet, bullet_color) = if state.status_state == "running" {
+        let frames = ["●", "◐", "◓", "◑", "◒"];
+        let bullet = frames[(state.tick / 4) as usize % frames.len()];
+        let color = if (state.tick / 4) % 2 == 0 {
+            THEME.status_pulse
+        } else {
+            THEME.status
+        };
+        (bullet, color)
+    } else {
+        ("•", THEME.status)
+    };
+    let status_line = format!(
+        "{}{}{} status: {} {}",
+        ansi::set_fg(bullet_color),
+        bullet,
+        ansi::reset(),
+        state.status_detail,
+        spinner
+    );
     vec![colorize_line(&status_line, width, ansi::set_fg(THEME.status))]
 }
 
@@ -252,6 +266,14 @@ fn render_log_lines(lines: &[crate::tui::state::LogLine], width: usize) -> Vec<S
                 output.extend(wrap_ansi_line(&styled, width));
             }
             LogRole::Assistant | LogRole::System => {
+                if line.text.is_empty() {
+                    if !buffer.is_empty() {
+                        output.extend(render_markdown_lines(&buffer, width));
+                        buffer.clear();
+                    }
+                    output.push(String::new());
+                    continue;
+                }
                 if !buffer.is_empty() {
                     buffer.push('\n');
                 }
@@ -266,6 +288,26 @@ fn render_log_lines(lines: &[crate::tui::state::LogLine], width: usize) -> Vec<S
     }
 
     output
+}
+
+fn visible_width(text: &str) -> usize {
+    let mut width = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if let Some('[') = chars.peek().copied() {
+                chars.next();
+                while let Some(next) = chars.next() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        width += UnicodeWidthChar::width(ch).unwrap_or(0);
+    }
+    width
 }
 
 fn collapse_thought_blocks(text: &str) -> String {
