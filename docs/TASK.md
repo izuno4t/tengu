@@ -49,10 +49,7 @@
 | TASK-035 | ✅ | STDIO MCP接続とツール検出を実装する | TASK-033 |
 | TASK-036 | ✅ | HTTP/SSE MCP接続とツール検出を実装する | TASK-033 |
 | TASK-037 | ✅ | MCPツール統合をCLIとTUIに反映する | TASK-034,TASK-035,TASK-036 |
-| TASK-015 | ⏳ | フック機構の確認を完了する | TASK-005,TASK-006 |
-| TASK-016 | ⏳ | スラッシュコマンドの確認を完了する | TASK-006 |
-| TASK-017 | ⏳ | Git統合の確認を完了する | TASK-005,TASK-006 |
-| TASK-018 | ⏳ | 認証管理と監査ログの確認を完了する | TASK-003,TASK-013 |
+| TASK-016 | ✅ | スラッシュコマンドの確認を完了する | TASK-006 |
 
 ### Phase 4: 品質・ドキュメント
 
@@ -62,12 +59,15 @@
 | TASK-020 | ⏳ | 必須ドキュメント一式を作成する | TASK-003,TASK-004,TASK-005 |
 | TASK-021 | ⏳ | パフォーマンス計測と閾値検証を完了する | TASK-010,TASK-011 |
 
-### Phase 5: リリース後拡張TODO
+### Phase 5: Backlog（リリース前TODO）
 
 | ID | Status | Summary | DependsOn |
 |----|--------|---------|-----------|
 | TASK-022 | ⏳ | 複数LLM実接続の拡張TODOを整理する | TASK-007 |
 | TASK-023 | ⏳ | 高度機能群の拡張TODOを整理する | TASK-014 |
+| TASK-015 | ⏳ | フック機構の確認を完了する | TASK-005,TASK-006 |
+| TASK-017 | ⏳ | Git統合の確認を完了する | TASK-005,TASK-006 |
+| TASK-018 | ⏳ | 認証管理と監査ログの確認を完了する | TASK-003,TASK-013 |
 
 ## Task Details (only when clarification needed)
 

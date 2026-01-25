@@ -45,6 +45,7 @@ Example: add new tool logic under `src/tools/` and wire it in `src/cli.rs`.
 - Do not ask for confirmation when only one practical option exists.
 - Do not re-ask about already agreed choices; proceed.
 - Apply routine updates (e.g., task status) without asking.
+- Review updates before responding.
 
 ## Commit & Pull Request Guidelines
 
