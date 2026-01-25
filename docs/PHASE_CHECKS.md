@@ -5,7 +5,7 @@
 ### Commands
 
 ```bash
-# Interactive mode
+# TUI mode
 cargo run
 
 # One-shot mode
@@ -13,12 +13,12 @@ cargo run -- -p "hello"
 ```
 
 ### Expected
-- Interactive: prints interactive startup message.
+- TUI: interactive UI is shown.
 - One-shot: prints headless mode message with prompt.
 
 ### Status
 - Executed:
-  - `cargo run` prints interactive startup message.
+  - `cargo run` launches TUI.
   - `cargo run -- -p "hello"` prints headless prompt output.
 - Notes: build emits unused warnings (expected for scaffolding).
 
@@ -77,34 +77,34 @@ cargo run -- -p "hello" --model ollama
 ### Status
 - Executed: response returned from local Ollama (`こんにちは！`).
 
-## TASK-025: 対話REPLでLLM問い合わせ
+## TASK-025: 対話TUIでLLM問い合わせ
 
 ### Commands
 
 ```bash
 cargo run
-# prompt: "hello"
-# prompt: "exit"
+# input: "hello"
+# Ctrl+C to quit
 ```
 
 ### Expected
-- REPLの入力がOllamaに送信され、応答が表示される。
+- TUI入力がOllamaに送信され、応答が表示される。
 
 ### Status
-- Executed: user confirmed REPL queries return responses.
+- Executed: user confirmed TUI queries return responses.
 
 ## TASK-010: TUI基本操作の確認
 
 ### Commands
 
 ```bash
-cargo run -- tui
-# Press q to quit
+cargo run
+# Ctrl+C to quit
 ```
 
 ### Expected
-- Alternate screen UI is shown.
-- Pressing q exits cleanly.
+- TUI is shown.
+- Ctrl+C exits cleanly.
 
 ### Status
 - Executed: TUI launched and exited with q.

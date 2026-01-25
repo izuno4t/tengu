@@ -38,7 +38,7 @@ export OPENAI_API_KEY="sk-..."
 ### Basic Usage
 
 ```bash
-# Interactive mode
+# Interactive TUI mode
 tengu
 
 # One-shot execution

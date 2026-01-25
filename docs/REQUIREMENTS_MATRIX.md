@@ -2,7 +2,7 @@
 
 | Requirement | Section | Priority | MappedTasks | Notes |
 |---|---|---|---|---|
-| Core CLI modes and formats | 1. Core Functional Requirements | Must | TASK-008,TASK-009,TASK-010 | Interactive REPL, headless mode, output formats |
+| Core CLI modes and formats | 1. Core Functional Requirements | Must | TASK-008,TASK-009,TASK-010 | Interactive TUI, headless mode, output formats |
 | Session persistence and commands | 1.2 Session Management | Must | TASK-007 | Resume, list, save/load, fork |
 | Provider abstraction and model switching | 2. LLM Model Management | Must | TASK-004 | OpenAI/Anthropic/Google/Local, per-session switch |
 | Model parameter configuration | 2.3 Model Parameters | Must | TASK-003,TASK-004 | max_tokens, temperature, reasoning_effort |

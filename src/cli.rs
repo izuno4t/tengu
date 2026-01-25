@@ -2,7 +2,6 @@ use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use crate::agent::{AgentOutput, AgentRunner};
 use crate::config::Config;
@@ -241,7 +240,7 @@ impl Cli {
         } else if self.prompt.is_some() {
             self.execute_headless().await
         } else {
-            self.execute_interactive().await
+            self.execute_tui().await
         }
     }
 
@@ -460,7 +459,24 @@ impl Cli {
     }
 
     async fn execute_tui(&self) -> Result<()> {
-        let mut app = App::new();
+        let banner = "👺 Tengu - Interactive mode".to_string();
+        let config = load_config().unwrap_or_default();
+        let (client, model_name) = self.resolve_llm_with_config(&config)?;
+        let policy = ToolPolicy::from_config(&config);
+        let status_model = model_name.clone();
+        let runner = std::sync::Arc::new(AgentRunner::new(client, model_name, policy));
+        let handle = tokio::runtime::Handle::current();
+        let status_build = option_env!("BUILD_TIMESTAMP").unwrap_or("unknown").to_string();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let mut app = App::new(
+            runner,
+            handle,
+            banner,
+            status_model,
+            status_build,
+            result_rx,
+            result_tx,
+        );
         app.run()?;
         Ok(())
     }
@@ -479,18 +495,6 @@ impl Cli {
             self.print_output("llm", &output.response.content, Some(prompt));
             self.print_tool_result(&output);
         }
-        Ok(())
-    }
-
-    async fn execute_interactive(&self) -> Result<()> {
-        let (system_prompt, sources) = self.resolve_system_prompt()?;
-        self.log_system_prompt_sources(&sources, system_prompt.as_deref());
-        self.print_output("interactive", "👺 Tengu - Interactive mode", None);
-        self.print_output("interactive", "Type 'exit' to quit", None);
-        let config = load_config().unwrap_or_default();
-        let (client, model_name) = self.resolve_llm_with_config(&config)?;
-        let policy = ToolPolicy::from_config(&config);
-        self.run_repl(client, model_name, policy).await?;
         Ok(())
     }
 
@@ -587,33 +591,6 @@ impl Cli {
         }
     }
 
-    async fn run_repl(
-        &self,
-        client: LlmClient,
-        model_name: String,
-        tool_policy: ToolPolicy,
-    ) -> Result<()> {
-        let mut line = String::new();
-
-        if io::stdin().is_terminal() {
-            let stdin = io::stdin();
-            let mut handle = stdin.lock();
-            return run_repl_loop(&mut handle, &mut line, client, model_name, tool_policy).await;
-        }
-
-        #[cfg(unix)]
-        {
-            if let Ok(tty) = fs::File::open("/dev/tty") {
-                let mut reader = io::BufReader::new(tty);
-                return run_repl_loop(&mut reader, &mut line, client, model_name, tool_policy)
-                    .await;
-            }
-        }
-
-        eprintln!("interactive mode requires a TTY; stdin is not a terminal");
-        Ok(())
-    }
-
     fn resolve_llm_with_config(&self, config: &Config) -> Result<(LlmClient, String)> {
         let provider_name = self
             .model
@@ -667,46 +644,6 @@ fn build_backend(
         LlmProvider::OpenAI => Box::new(OpenAiBackend),
         LlmProvider::Google => Box::new(GoogleBackend),
     }
-}
-
-async fn run_repl_loop<R: BufRead>(
-    reader: &mut R,
-    line: &mut String,
-    client: LlmClient,
-    model_name: String,
-    tool_policy: ToolPolicy,
-) -> Result<()> {
-    let runner = AgentRunner::new(client, model_name, tool_policy.clone());
-    let executor = ToolExecutor::with_policy(tool_policy);
-    loop {
-        print!("> ");
-        io::stdout().flush()?;
-        line.clear();
-
-        let bytes = reader.read_line(line)?;
-        if bytes == 0 {
-            break;
-        }
-
-        let input = line.trim();
-        if input.is_empty() {
-            continue;
-        }
-        if input.eq_ignore_ascii_case("exit") || input.eq_ignore_ascii_case("quit") {
-            break;
-        }
-
-        let output = runner.handle_prompt(input).await?;
-        println!("{}", output.response.content);
-        if let Some(result) = output.tool_result.as_ref() {
-            println!("{}", format_tool_result(result));
-            if let Some(applied) = apply_preview_write(&executor, result)? {
-                println!("{}", format_tool_result(&applied));
-            }
-        }
-    }
-
-    Ok(())
 }
 
 impl Cli {

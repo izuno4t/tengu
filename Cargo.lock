@@ -1661,6 +1661,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing-subscriber",
+ "unicode-width",
  "uuid",
 ]
 
