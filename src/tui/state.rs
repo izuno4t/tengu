@@ -87,6 +87,10 @@ impl AppState {
                 text: line.to_string(),
             });
         }
+        log_lines.push_back(LogLine {
+            role: LogRole::System,
+            text: String::new(),
+        });
         Self {
             should_quit: false,
             log_lines,

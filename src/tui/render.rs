@@ -29,6 +29,8 @@ pub fn draw(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
     let width = term_width as usize;
 
     let spacer_height = 1u16;
+    let status_height = 1u16;
+    let status_gap = 1u16;
     let divider_height = 1u16;
     let input_rows = state.input_row_count();
     let input_height = input_rows.saturating_add(1);
@@ -46,6 +48,8 @@ pub fn draw(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
 
     let total_height = log_height
         .saturating_add(spacer_height)
+        .saturating_add(status_height)
+        .saturating_add(status_gap)
         .saturating_add(divider_height)
         .saturating_add(input_height)
         .saturating_add(help_height)
@@ -53,7 +57,11 @@ pub fn draw(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
 
     let mut lines: Vec<String> = Vec::with_capacity(total_height as usize);
     lines.extend(build_log_lines(state, log_height, width));
+    if !lines.is_empty() {
+        lines.push(String::new());
+    }
     lines.extend(build_status_lines(state, width));
+    lines.push(String::new());
 
     lines.push(colorize_line(
         &"─".repeat(width),
@@ -104,19 +112,36 @@ pub fn draw(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
     } else {
         ""
     };
-    let app_status = align_right(&app_left, app_right, width);
     let footer_row = origin.saturating_add(total_height.saturating_sub(1));
+    let right_w = visible_width(app_right);
+    let left_max = if right_w == 0 || right_w + 1 > width {
+        width
+    } else {
+        width.saturating_sub(right_w + 1)
+    };
+    let left_trim = fit_width(&app_left, left_max);
     write!(
         stdout,
         "{}{}{}",
         ansi::move_to(footer_row.saturating_add(1), 1),
         ansi::clear_line(),
-        colorize_line(&app_status, width, ansi::set_fg(THEME.footer))
+        colorize_line(&left_trim, width, ansi::set_fg(THEME.footer))
     )?;
+    if right_w > 0 && right_w < width {
+        let right_col = width.saturating_sub(right_w).saturating_add(1);
+        write!(
+            stdout,
+            "{}{}",
+            ansi::move_to(footer_row.saturating_add(1), right_col as u16),
+            colorize_line(app_right, width, ansi::set_fg(THEME.footer))
+        )?;
+    }
 
     let input_row = origin
         .saturating_add(log_height)
         .saturating_add(spacer_height)
+        .saturating_add(status_height)
+        .saturating_add(status_gap)
         .saturating_add(divider_height)
         .saturating_add(input_rows.saturating_sub(1));
     let last_line = input_lines.last().copied().unwrap_or("");
@@ -157,21 +182,6 @@ fn colorize_line(text: &str, width: usize, prefix: String) -> String {
     out.push_str(&fit_width(text, width));
     out.push_str(&ansi::reset());
     out
-}
-
-fn align_right(left: &str, right: &str, width: usize) -> String {
-    if right.is_empty() {
-        return fit_width(left, width);
-    }
-    let right_w = visible_width(right);
-    if right_w >= width {
-        return fit_width(right, width);
-    }
-    let left_max = width.saturating_sub(right_w + 1);
-    let left_trim = fit_width(left, left_max);
-    let left_w = visible_width(&left_trim);
-    let pad = width.saturating_sub(left_w + right_w);
-    format!("{}{}{}", left_trim, " ".repeat(pad), right)
 }
 
 fn build_log_lines(state: &AppState, height: u16, width: usize) -> Vec<String> {
@@ -255,7 +265,7 @@ fn render_log_lines(lines: &[crate::tui::state::LogLine], width: usize) -> Vec<S
     let mut output = Vec::new();
     let mut buffer = String::new();
 
-    for line in lines {
+    for (idx, line) in lines.iter().enumerate() {
         match line.role {
             LogRole::User => {
                 if !buffer.is_empty() {
@@ -264,6 +274,13 @@ fn render_log_lines(lines: &[crate::tui::state::LogLine], width: usize) -> Vec<S
                 }
                 let styled = colorize_line(&line.text, width, ansi::set_fg(THEME.user));
                 output.extend(wrap_ansi_line(&styled, width));
+                let next_blank = lines.get(idx + 1).map_or(false, |next| {
+                    next.text.is_empty()
+                        && matches!(next.role, LogRole::System | LogRole::Assistant)
+                });
+                if !next_blank {
+                    output.push(String::new());
+                }
             }
             LogRole::Assistant | LogRole::System => {
                 if line.text.is_empty() {

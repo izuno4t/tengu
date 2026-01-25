@@ -173,6 +173,73 @@ impl AgentRunner {
         let mut tool_result: Option<ToolResult> = None;
 
         for attempt in 0..=MAX_TOOL_RETRIES {
+            if let Some(path) = detect_direct_read_path(input) {
+                let call = ToolCall::Read { path };
+                match self.execute_tool_call(call.clone()) {
+                    Ok(result) => {
+                        let follow_prompt = build_followup_prompt_with_context(
+                            input,
+                            context,
+                            &plan,
+                            &format_tool_result(&result),
+                        );
+                        tool_result = Some(result);
+                        return Ok((plan, follow_prompt, tool_result));
+                    }
+                    Err(err) => {
+                        if let Some(required) = err.downcast_ref::<ToolApprovalRequired>() {
+                            let request = ToolApprovalRequest {
+                                tool: required.tool,
+                                paths: required.paths.clone(),
+                            };
+                            match self.request_approval(request).await {
+                                Ok(decision) => match decision {
+                                    ToolApprovalDecision::AllowOnce => {
+                                        self.tool_policy
+                                            .set_approval_override(ApprovalOverride::AllowOnce(
+                                                required.tool,
+                                            ));
+                                        continue;
+                                    }
+                                    ToolApprovalDecision::AllowAll => {
+                                        self.tool_policy
+                                            .set_approval_override(ApprovalOverride::AllowAll);
+                                        continue;
+                                    }
+                                    ToolApprovalDecision::DenyOnce => {
+                                        return Err(anyhow::anyhow!(
+                                            "permission denied by user for tool: {:?}",
+                                            required.tool
+                                        ));
+                                    }
+                                    ToolApprovalDecision::DenyAll => {
+                                        self.tool_policy
+                                            .set_approval_override(ApprovalOverride::DenyAll);
+                                        return Err(anyhow::anyhow!(
+                                            "permission denied by user for tool: {:?}",
+                                            required.tool
+                                        ));
+                                    }
+                                },
+                                Err(_) => {
+                                    return Err(err);
+                                }
+                            }
+                        }
+                        last_error = Some(err.to_string());
+                        last_call = Some(call);
+                        if attempt >= MAX_TOOL_RETRIES {
+                            let fallback_prompt = build_failed_followup_prompt_with_context(
+                                input,
+                                context,
+                                &plan,
+                                last_error.as_deref(),
+                            );
+                            return Ok((plan, fallback_prompt, tool_result));
+                        }
+                    }
+                }
+            }
             let selection = self
                 .select_tool_with_context(
                     input,
@@ -471,5 +538,57 @@ fn parse_tool_call_loose(content: &str) -> Option<ToolCall> {
         | ToolCall::Write { .. }
         | ToolCall::Grep { .. }
         | ToolCall::Glob { .. } => Some(call),
+    }
+}
+
+fn detect_direct_read_path(input: &str) -> Option<String> {
+    let lowered = input.to_ascii_lowercase();
+    if !(lowered.contains("read") || input.contains('読')) {
+        return None;
+    }
+    extract_path_like(input)
+}
+
+fn extract_path_like(input: &str) -> Option<String> {
+    let mut current = String::new();
+    let mut best = String::new();
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '/' || ch == '.' || ch == '_' || ch == '-' {
+            current.push(ch);
+        } else {
+            if is_path_candidate(&current) {
+                best = pick_longer(best, current.clone());
+            }
+            current.clear();
+        }
+    }
+    if is_path_candidate(&current) {
+        best = pick_longer(best, current);
+    }
+    if best.is_empty() {
+        None
+    } else {
+        Some(best)
+    }
+}
+
+fn is_path_candidate(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    if value.contains('/') {
+        return true;
+    }
+    value.ends_with(".md")
+        || value.ends_with(".rs")
+        || value.ends_with(".toml")
+        || value.ends_with(".json")
+}
+
+fn pick_longer(current: String, candidate: String) -> String {
+    if candidate.len() > current.len() {
+        candidate
+    } else {
+        current
     }
 }

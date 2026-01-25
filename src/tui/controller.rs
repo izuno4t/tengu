@@ -61,8 +61,6 @@ impl App {
         writeln!(stdout)?;
         stdout.flush()?;
         enable_raw_mode()?;
-        writeln!(stdout)?;
-        stdout.flush()?;
         self.state.origin_y = position().map(|(_, y)| y).unwrap_or(0);
         let result = self.run_loop(&mut stdout);
 
@@ -151,6 +149,8 @@ impl App {
         let input_height = self.state.input_row_count().saturating_add(1);
         let divider_height = 1u16;
         let spacer_height = 1u16;
+        let status_height = 1u16;
+        let status_gap = 1u16;
         let app_status_height = 1u16;
         let help_height = if self.state.suggestions.is_empty() {
             0
@@ -164,6 +164,8 @@ impl App {
         desired_log = desired_log.max(self.state.inline.min_log_rows);
         desired_log
             .saturating_add(spacer_height)
+            .saturating_add(status_height)
+            .saturating_add(status_gap)
             .saturating_add(divider_height)
             .saturating_add(input_height)
             .saturating_add(help_height)
@@ -185,11 +187,11 @@ impl App {
         if input.is_empty() {
             return;
         }
-        self.push_history(&input);
-        if input == "/" || input == "／" {
-            self.state.append_message(&build_slash_help());
+        if input == "/" || input == "／" || input == "/help" {
+            self.state.suggestions = build_slash_help();
             return;
         }
+        self.push_history(&input);
         if let Some(response) = handle_slash_command(&input) {
             if input == "/exit" || input == "/quit" {
                 self.state.should_quit = true;
