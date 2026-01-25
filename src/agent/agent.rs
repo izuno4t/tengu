@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use futures_util::future::BoxFuture;
-use futures_util::stream::{self, BoxStream, StreamExt};
+use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -102,16 +102,12 @@ impl AgentRunner {
         Ok(AgentOutput { response, tool_result })
     }
 
-    pub async fn handle_prompt_stream(&self, input: &str) -> Result<LlmStream> {
-        self.handle_prompt_stream_with_context(input, "").await
-    }
-
     pub async fn handle_prompt_stream_with_context(
         &self,
         input: &str,
         context: &str,
     ) -> Result<LlmStream> {
-        let (plan, final_prompt, _tool_result) =
+        let (_plan, final_prompt, _tool_result) =
             self.resolve_final_prompt_with_context(input, context)
                 .await?;
         let stream = self
@@ -143,12 +139,6 @@ impl AgentRunner {
 }
 
 impl AgentRunner {
-    async fn generate_plan(&self, input: &str) -> Result<String> {
-        let prompt = build_plan_prompt(input);
-        let response = self.client.generate(&self.model_name, &prompt).await?;
-        Ok(response.content)
-    }
-
     async fn generate_plan_with_context(&self, input: &str, context: &str) -> Result<String> {
         let prompt = build_plan_prompt_with_context(input, context);
         let response = self.client.generate(&self.model_name, &prompt).await?;
@@ -339,18 +329,6 @@ impl AgentRunner {
         }
     }
 
-    async fn select_tool(
-        &self,
-        input: &str,
-        plan: &str,
-        last_error: Option<&str>,
-        last_call: Option<&ToolCall>,
-    ) -> Result<Option<ToolCall>> {
-        let prompt = build_tool_select_prompt(input, plan, last_error, last_call);
-        let response = self.client.generate(&self.model_name, &prompt).await?;
-        Ok(parse_tool_call_loose(&response.content))
-    }
-
     async fn select_tool_with_context(
         &self,
         input: &str,
@@ -401,33 +379,6 @@ fn build_execute_prompt_with_context(input: &str, context: &str, plan: &str) -> 
     }
     format!(
         "次の過去の会話と計画に従って実行してください。\n\n過去の会話:\n{}\n\n計画:\n{}\n\n指示:\n{}",
-        context, plan, input
-    )
-}
-
-fn build_tool_select_prompt(
-    input: &str,
-    plan: &str,
-    last_error: Option<&str>,
-    last_call: Option<&ToolCall>,
-) -> String {
-    let mut context = String::new();
-    if let Some(error) = last_error {
-        context.push_str("\n前回の失敗理由:\n");
-        context.push_str(error);
-        context.push('\n');
-    }
-    if let Some(call) = last_call {
-        if let Ok(json) = serde_json::to_string(call) {
-            context.push_str("前回のツール呼び出し:\n");
-            context.push_str(&json);
-            context.push('\n');
-        }
-    }
-    format!(
-        "次の計画を進めるために必要なツールがあれば、JSONのみで出力してください。\n\
-ツールが不要なら {{\"tool\":\"none\"}} とだけ出力してください。{}\n\n\
-計画:\n{}\n\n指示:\n{}",
         context, plan, input
     )
 }
