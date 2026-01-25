@@ -67,9 +67,9 @@
 |TASK-052|✅|TUIの入力送信をログに反映し候補行の表示を最小化する|TASK-049|
 |TASK-053|✅|TUIの候補表示を入力欄の下に出るレイアウトに変更する|TASK-049|
 |TASK-054|✅|TUIのステータス行に実行中/待機中を表示する|TASK-049|
-|TASK-055|✅|TUIのステータス行に動作中インジケータを追加する|TASK-054|
-|TASK-056|✅|TUIの動作中インジケータを👺アニメーションにする|TASK-055|
-|TASK-057|✅|TUIの動作中インジケータを移動アニメーションにする|TASK-056|
+|TASK-055|✅|TUIのステータス行に動作中インジケーターを追加する|TASK-054|
+|TASK-056|✅|TUIの動作中インジケーターを👺アニメーションにする|TASK-055|
+|TASK-057|✅|TUIの動作中インジケーターを移動アニメーションにする|TASK-056|
 |TASK-058|✅|TUIの入力受付を安定化するためLLM処理を非同期委譲する|TASK-046|
 |TASK-059|✅|TUI入力を即時ログ化し処理キューで直列実行する|TASK-058|
 |TASK-061|✅|TUI実装をstate/render/controllerに分割する|TASK-049|
@@ -95,9 +95,9 @@
 |TASK-080|✅|ツール実行許可UI（y/n/a/d）を実装する|TASK-088|
 |TASK-081|✅|結果エリアでMarkdownレンダリング（コードハイライト含む）を実装する|TASK-075|
 |TASK-083|✅|ユーザー入力とAI応答を視覚的に区別して表示する|TASK-075|
-|TASK-084|⏳|思考表示（折りたたみ）を実装する|TASK-075|
-|TASK-085|⏳|Todoリスト表示UIを実装する|TASK-088|
-|TASK-086|⏳|エラー表示の色分け・折りたたみ仕様を実装する|TASK-088|
+|TASK-084|✅|思考表示（折りたたみ）を実装する|TASK-075|
+|TASK-085|✅|Todoリスト表示UIを実装する|TASK-088|
+|TASK-086|✅|エラー表示の色分け・折りたたみ仕様を実装する|TASK-088|
 |TASK-072|✅|TUIレイアウト仕様をdocsに整理する|TASK-062|
 
 ### Phase 4: 品質・ドキュメント
@@ -119,6 +119,8 @@
 |TASK-018|⏳|認証管理と監査ログの確認を完了する|TASK-003,TASK-013|
 |TASK-082|⏳|フッターにトークン/コスト表示を追加する|TASK-079|
 |TASK-060|⏳|TUI入力を文脈で束ねて進行中処理へ反映する|TASK-059|
+|TASK-089|⏳|ストリーム中はプレーン表示し、構造確定後に該当範囲を再描画する|TASK-075|
+
 
 ## Task Details (only when clarification needed)
 
@@ -164,25 +166,25 @@
 
 ### TASK-014
 
-- Note: TASK-032〜TASK-037 の完了で確認完了とする
+- Note: TASK-032〜TASK-037の完了で確認完了とする
 
 ### TASK-032
 
-- Note: STDIO と HTTP/SSE の仕様を調査して要点をまとめる
+- Note: STDIOとHTTP/SSEの仕様を調査して要点をまとめる
 - Note: ツール名は名前空間で区別する
 
 ### TASK-033
 
-- Note: 設定保存先は .tengu/mcp.toml を使用する
+- Note: 設定保存先は .tengu/mcp.tomlを使用する
 
 ### TASK-035
 
-- Note: ツール参照は @server/tool 形式で扱う
+- Note: ツール参照は @server/tool形式で扱う
 
 ### TASK-036
 
-- Note: ツール参照は @server/tool 形式で扱う
+- Note: ツール参照は @server/tool形式で扱う
 
 ### TASK-037
 
-- Note: CLI と TUI の双方で MCP 一覧/選択を扱う
+- Note: CLIとTUIの双方でMCP一覧/選択を扱う

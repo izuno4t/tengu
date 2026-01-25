@@ -261,10 +261,34 @@ fn render_log_lines(lines: &[crate::tui::state::LogLine], width: usize) -> Vec<S
     }
 
     if !buffer.is_empty() {
-        output.extend(render_markdown_lines(&buffer, width));
+        let collapsed = collapse_thought_blocks(&buffer);
+        output.extend(render_markdown_lines(&collapse_error_blocks(&collapsed), width));
     }
 
     output
+}
+
+fn collapse_thought_blocks(text: &str) -> String {
+    let mut out = Vec::new();
+    let mut in_thought = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("思考:") || trimmed.eq_ignore_ascii_case("thoughts:") {
+            if !in_thought {
+                out.push("思考:（折りたたみ）".to_string());
+                in_thought = true;
+            }
+            continue;
+        }
+        if in_thought {
+            if trimmed.is_empty() {
+                in_thought = false;
+            }
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    out.join("\n")
 }
 
 fn render_markdown_lines(markdown: &str, width: usize) -> Vec<String> {
@@ -358,7 +382,7 @@ fn render_markdown_lines(markdown: &str, width: usize) -> Vec<String> {
             Event::End(TagEnd::Item) => {
                 list_prefix_pending = false;
                 if !current.trim().is_empty() {
-                    lines.extend(wrap_ansi_line(&current, width));
+                    lines.extend(style_task_line(&current, width));
                     current.clear();
                 }
             }
@@ -414,10 +438,45 @@ fn render_markdown_lines(markdown: &str, width: usize) -> Vec<String> {
     }
 
     if !current.trim().is_empty() {
-        lines.extend(wrap_ansi_line(&current, width));
+        lines.extend(style_task_line(&current, width));
     }
 
     lines
+}
+
+fn collapse_error_blocks(text: &str) -> String {
+    let mut out = Vec::new();
+    let mut in_detail = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("error:") || trimmed.starts_with("error ") || trimmed.starts_with("ERROR") {
+            let styled = format!(
+                "{}{}{}",
+                ansi::set_fg(THEME.error),
+                trimmed,
+                ansi::reset()
+            );
+            out.push(styled);
+            in_detail = true;
+            continue;
+        }
+        if in_detail {
+            if trimmed.is_empty() {
+                in_detail = false;
+            }
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    if in_detail {
+        out.push(format!(
+            "{}{}{}",
+            ansi::set_fg(THEME.error_detail),
+            "details:（折りたたみ）",
+            ansi::reset()
+        ));
+    }
+    out.join("\n")
 }
 
 fn normalize_markdown(input: &str) -> String {
@@ -511,4 +570,32 @@ fn wrap_ansi_line(text: &str, width: usize) -> Vec<String> {
     }
 
     lines
+}
+
+fn style_task_line(line: &str, width: usize) -> Vec<String> {
+    let trimmed = line.trim_start();
+    let prefix_len = line.len() - trimmed.len();
+    let (prefix_space, _rest) = line.split_at(prefix_len);
+    let patterns = [("- [ ] ", false), ("- [x] ", true), ("- [X] ", true)];
+    for (pattern, checked) in patterns {
+        if trimmed.starts_with(pattern) {
+            let content = trimmed.strip_prefix(pattern).unwrap_or("");
+            let box_color = if checked {
+                THEME.todo_checked
+            } else {
+                THEME.todo_unchecked
+            };
+            let checkbox = if checked { "[x]" } else { "[ ]" };
+            let styled = format!(
+                "{}- {}{} {}",
+                prefix_space,
+                ansi::set_fg(box_color),
+                checkbox,
+                ansi::reset()
+            );
+            let full = format!("{styled}{content}");
+            return wrap_ansi_line(&full, width);
+        }
+    }
+    wrap_ansi_line(line, width)
 }

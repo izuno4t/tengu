@@ -15,6 +15,10 @@ struct ThemeConfig {
     inline_code: String,
     divider: String,
     footer: String,
+    todo_checked: String,
+    todo_unchecked: String,
+    error: String,
+    error_detail: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -28,6 +32,10 @@ struct ThemeConfigOpt {
     inline_code: Option<String>,
     divider: Option<String>,
     footer: Option<String>,
+    todo_checked: Option<String>,
+    todo_unchecked: Option<String>,
+    error: Option<String>,
+    error_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -41,6 +49,10 @@ pub struct Theme {
     pub inline_code: Color,
     pub divider: Color,
     pub footer: Color,
+    pub todo_checked: Color,
+    pub todo_unchecked: Color,
+    pub error: Color,
+    pub error_detail: Color,
 }
 
 pub static THEME: Lazy<Theme> = Lazy::new(|| {
@@ -60,6 +72,10 @@ pub static THEME: Lazy<Theme> = Lazy::new(|| {
         inline_code: resolve_color(&config.inline_code, &map),
         divider: resolve_color(&config.divider, &map),
         footer: resolve_color(&config.footer, &map),
+        todo_checked: resolve_color(&config.todo_checked, &map),
+        todo_unchecked: resolve_color(&config.todo_unchecked, &map),
+        error: resolve_color(&config.error, &map),
+        error_detail: resolve_color(&config.error_detail, &map),
     }
 });
 
@@ -74,6 +90,10 @@ fn default_theme() -> ThemeConfig {
         inline_code: "cyan".to_string(),
         divider: "grey".to_string(),
         footer: "grey".to_string(),
+        todo_checked: "green".to_string(),
+        todo_unchecked: "dark_grey".to_string(),
+        error: "red".to_string(),
+        error_detail: "dark_red".to_string(),
     }
 }
 
@@ -111,6 +131,18 @@ fn apply_override(config: &mut ThemeConfig, override_config: ThemeConfigOpt) {
     }
     if let Some(value) = override_config.footer {
         config.footer = value;
+    }
+    if let Some(value) = override_config.todo_checked {
+        config.todo_checked = value;
+    }
+    if let Some(value) = override_config.todo_unchecked {
+        config.todo_unchecked = value;
+    }
+    if let Some(value) = override_config.error {
+        config.error = value;
+    }
+    if let Some(value) = override_config.error_detail {
+        config.error_detail = value;
     }
 }
 
