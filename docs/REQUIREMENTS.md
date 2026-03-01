@@ -1,25 +1,218 @@
-# AIコーディングエージェントCLI 要件定義書
+# Claude Code基準 AIコーディングエージェントCLI 要件定義書
 
 ## 📋 概要
 
-本ドキュメントは、AIコーディングエージェントのコマンドラインインターフェース（CLI）を構築するための要件定義書です。主要なAIサービスベンダーが提供する公式CLIツール（Claude Code、Codex CLI、Gemini CLI、Kiro CLI）を調査し、必要な機能を体系的に整理しています。
+本ドキュメントは、AIコーディングエージェントのコマンドラインインターフェース（CLI）を構築するための要件定義書です。まずClaude Codeを基準仕様として中核機能を成立させ、そのうえで他ベンダーCLIに見られる機能要件を段階的に追加できる構成で整理します。
 
-### 調査対象ツール
+### 基準仕様と拡張対象
 
-| ツール | ベンダー | 主要モデル | 特徴 |
-|--------|---------|-----------|------|
-| **Claude Code** | Anthropic | Claude Sonnet/Opus/Haiku | MCP統合、Skills、Hooks機能 |
-| **Codex CLI** | OpenAI | GPT-5, o3-mini | サンドボックス、Cloud実行 |
-| **Gemini CLI** | Google | Gemini 2.5/3 Pro | オープンソース、ReActループ |
-| **Kiro CLI** | AWS | Claude (Auto mode) | カスタムエージェント、Steering files |
+| ツール          | ベンダー  | 主要モデル               | 本書での扱い                           |
+| --------------- | --------- | ------------------------ | -------------------------------------- |
+| **Claude Code** | Anthropic | Claude Sonnet/Opus/Haiku | 基準仕様。優先的に追従する対象         |
+| **Codex CLI**   | OpenAI    | GPT-5, o3-mini           | Claude Code基準の上に追加検討する拡張要件 |
+| **Gemini CLI**  | Google    | Gemini 2.5/3 Pro         | Claude Code基準の上に追加検討する拡張要件 |
+| **Kiro CLI**    | AWS       | Claude (Auto mode)       | Claude Code基準の上に追加検討する拡張要件 |
+
+### 要件整理の前提
+
+- 実装順序の第一段階はClaude Codeの操作感、権限制御、ツール実行体験、拡張性を成立させること
+- 多ベンダー要件は削除しない。Claude Code基準の中核機能を満たしたあとに拡張要件として積み上げる
+- 他CLIに見られる一般的な設計は、Claude Code基準と矛盾しない範囲で統合する
+- 挙動解釈に迷いがある場合は、まずClaude Codeに近づく方向を優先し、その後に拡張差分を定義する
+- 本書の各要件は「Claude Code基準で成立し、将来的に多ベンダー拡張可能なローカルCLIエージェント」を成立させる観点で定義する
+
+### 本書の読み方
+
+- 各章の「必須機能」「必須要件」は、原則としてClaude Code基準の中核要件として読む
+- 他ベンダー固有の機能、Optional、高度機能、将来拡張に関する記述は、Claude Code基準を満たした後に積み上げる拡張要件として読む
+- 実装やタスク分解では、各章を「先に基準実装」「後で拡張実装」の順で処理する
+
+### 適用区分マップ
+
+**区分ラベル**
+
+- `Claude Code基準`: 最初に成立させる中核要件
+- `基準先行 + 拡張統合`: 先にClaude Code基準で成立させ、その後に多ベンダー差分を統合する要件
+- `多ベンダー拡張`: Claude Code基準の実装後に追加する要件
+
+**1. コア機能要件**
+
+- `1.1 実行モード`: Claude Code基準
+- `1.1.1 対話モード (Interactive/REPL)`: Claude Code基準
+- `1.1.2 非対話モード (Headless/Print mode)`: Claude Code基準
+- `1.1.3 出力フォーマット`: 基準先行 + 拡張統合
+- `1.2 セッション管理`: Claude Code基準
+- `1.2.1 セッション永続化`: Claude Code基準
+- `1.2.2 セッション操作`: Claude Code基準
+
+**2. LLMモデル管理要件**
+
+- `2.1 モデルプロバイダー抽象化`: 基準先行 + 拡張統合
+- `2.1.1 サポートプロバイダー`: 基準先行 + 拡張統合
+- `2.1.2 プロバイダー設定`: 基準先行 + 拡張統合
+- `2.2 モデル切り替え`: 基準先行 + 拡張統合
+- `2.2.1 セッション内切り替え`: 基準先行 + 拡張統合
+- `2.2.2 起動時指定`: 基準先行 + 拡張統合
+- `2.3 モデルパラメータ設定`: 基準先行 + 拡張統合
+
+**3. システムプロンプト & コンテキスト管理要件**
+
+- `3.1 プロジェクト設定ファイル`: Claude Code基準
+- `3.1.1 階層的設定`: Claude Code基準
+- `3.1.2 設定ファイル形式 (Markdown)`: Claude Code基準
+- `3.2 システムプロンプト制御`: Claude Code基準
+- `3.2.1 コマンドライン引数`: Claude Code基準
+- `3.2.2 優先順位`: Claude Code基準
+- `コーディング標準`: Claude Code基準
+- `アーキテクチャ`: Claude Code基準
+- `ファイル構成`: Claude Code基準
+
+**4. ツール & パーミッション管理要件**
+
+- `4.1 ビルトインツール`: Claude Code基準
+- `4.1.1 必須ツール一覧`: Claude Code基準
+- `4.1.2 ツール定義形式`: Claude Code基準
+- `4.2 パーミッション制御`: Claude Code基準
+- `4.2.1 承認ポリシー`: Claude Code基準
+- `4.2.2 ツール別制御`: Claude Code基準
+- `4.2.3 パターンマッチング仕様`: Claude Code基準
+- `4.3 サンドボックス機能`: 基準先行 + 拡張統合
+- `4.3.1 サンドボックスモード`: 基準先行 + 拡張統合
+
+**5. MCP (Model Context Protocol) 統合要件**
+
+- `5.1 MCP Server管理`: Claude Code基準
+- `5.1.1 対応形式`: Claude Code基準
+- `5.1.2 設定ファイル`: Claude Code基準
+- `5.1.3 MCPコマンド`: Claude Code基準
+- `5.2 MCPツール検出`: Claude Code基準
+
+**6. フック & オートメーション要件**
+
+- `6.1 フック種類`: Claude Code基準
+- `6.1.1 エージェントライフサイクルフック`: Claude Code基準
+- `6.1.2 ツール実行フック`: Claude Code基準
+- `6.2 フック実行仕様`: Claude Code基準
+
+**7. スラッシュコマンド要件**
+
+- `7.1 必須ビルトインコマンド`: Claude Code基準
+- `7.1.1 セッション管理`: Claude Code基準
+- `7.1.2 設定・ステータス`: Claude Code基準
+- `7.1.3 Git統合`: Claude Code基準
+- `7.1.4 その他`: Claude Code基準
+- `7.2 カスタムコマンド`: 多ベンダー拡張
+- `7.2.1 定義場所`: 多ベンダー拡張
+- `7.2.2 カスタムコマンド形式`: 多ベンダー拡張
+
+**8. カスタムエージェント要件**
+
+- `8.1 エージェント定義`: 基準先行 + 拡張統合
+- `8.1.1 設定ファイル構造`: 基準先行 + 拡張統合
+- `8.2 エージェント操作`: 基準先行 + 拡張統合
+- `8.2.1 CLIコマンド`: 基準先行 + 拡張統合
+- `8.2.2 エージェント起動`: 基準先行 + 拡張統合
+
+**9. ファイル操作要件**
+
+- `9.1 ファイル参照`: Claude Code基準
+- `9.1.1 @ 記法`: Claude Code基準
+- `9.1.2 ファイル補完`: Claude Code基準
+- `9.2 画像ファイル対応`: 基準先行 + 拡張統合
+- `9.2.1 画像入力`: 基準先行 + 拡張統合
+- `9.2.2 サポート形式`: 基準先行 + 拡張統合
+
+**10. Git統合要件**
+
+- `10.1 Git操作`: Claude Code基準
+- `10.1.1 必須機能`: Claude Code基準
+- `10.1.2 Git履歴活用`: Claude Code基準
+- `10.2 GitHub/GitLab統合`: 多ベンダー拡張
+- `10.2.1 必須機能（gh/glab CLI使用）`: 多ベンダー拡張
+
+**11. 設定ファイル要件**
+
+- `11.1 設定ファイル形式`: 基準先行 + 拡張統合
+- `11.2 設定例`: 基準先行 + 拡張統合
+
+**12. 認証要件**
+
+- `12.1 認証方式`: 基準先行 + 拡張統合
+- `12.1.1 API Key認証`: Claude Code基準
+- `12.1.2 OAuth認証`: 多ベンダー拡張
+- `12.2 セッショントークン管理`: 基準先行 + 拡張統合
+
+**13. 出力・UI要件**
+
+- `13.1 TUI (Terminal User Interface)`: Claude Code基準
+- `13.1.1 必須要素`: Claude Code基準
+- `13.1.2 推奨フレームワーク`: 基準先行 + 拡張統合
+- `13.2 シンタックスハイライト`: Claude Code基準
+- `13.3 ストリーミング出力`: Claude Code基準
+
+**14. 高度な機能要件（Optional）**
+
+- `14.1 メモリー機能`: 多ベンダー拡張
+- `14.2 チェックポイント機能`: 多ベンダー拡張
+- `14.3 ナレッジベース`: 多ベンダー拡張
+- `14.4 クラウド実行`: 多ベンダー拡張
+- `14.5 レビューモード`: 多ベンダー拡張
+
+**15. 実装優先順位**
+
+- `Phase 1: MVP（Minimum Viable Product）`: Claude Code基準
+- `Phase 2: 拡張機能`: 多ベンダー拡張
+- `Phase 3: 高度な機能`: 多ベンダー拡張
+- `Phase 4: エンタープライズ機能`: 多ベンダー拡張
+
+**16. 技術スタック推奨**
+
+- `16.1 プログラミング言語`: 基準先行 + 拡張統合
+- `16.2 主要ライブラリ（Rust）`: Claude Code基準
+- `16.3 アーキテクチャ`: Claude Code基準
+
+**17. テスト要件**
+
+- `17.1 ユニットテスト`: Claude Code基準
+- `17.2 統合テスト`: 基準先行 + 拡張統合
+- `17.3 E2Eテスト`: 基準先行 + 拡張統合
+
+**18. ドキュメント要件**
+
+- `18.1 必須ドキュメント`: 基準先行 + 拡張統合
+
+**19. パフォーマンス要件**
+
+- `19.1 レスポンス時間`: Claude Code基準
+- `19.2 メモリ使用量`: Claude Code基準
+- `19.3 並行処理`: 基準先行 + 拡張統合
+
+**20. セキュリティ要件**
+
+- `20.1 機密情報の保護`: Claude Code基準
+- `20.2 コマンド実行の安全性`: Claude Code基準
+- `20.3 監査ログ`: 基準先行 + 拡張統合
+
+**21. 参考資料 / 付録**
+
+- `21.1 公式ドキュメント`: 基準先行 + 拡張統合
+- `21.2 仕様・標準`: 基準先行 + 拡張統合
+- `21.3 関連ツール`: 多ベンダー拡張
+- `付録A: 用語集`: 基準先行 + 拡張統合
+- `付録B: サンプル設定ファイル`: 基準先行 + 拡張統合
+- `完全な設定例`: 基準先行 + 拡張統合
 
 ---
 
 ## 1. コア機能要件
 
+この章は、Claude Code基準として最初に成立させる基本操作を定義し、後続のCLI拡張はこの土台の上に追加する。
+
 ### 1.1 実行モード
+区分: Claude Code基準
 
 #### 1.1.1 対話モード (Interactive/REPL)
+区分: Claude Code基準
 **必須機能:**
 - フルスクリーンTUIによる対話環境
 - リアルタイムストリーミング出力
@@ -37,6 +230,7 @@ $ your-agent --add-dir /path/to/project
 ```
 
 #### 1.1.2 非対話モード (Headless/Print mode)
+区分: Claude Code基準
 **必須機能:**
 - ワンショット実行
 - パイプラインサポート
@@ -56,10 +250,26 @@ $ your-agent -p "lint実行してエラーがあれば修正" --auto-approve
 ```
 
 #### 1.1.3 出力フォーマット
+区分: 基準先行 + 拡張統合
 **必須機能:**
 - プレーンテキスト（デフォルト）
 - JSON構造化出力
 - ストリーミングJSON（`stream-json`）
+
+**`stream-json` イベント仕様:**
+- `start`: ストリーム開始
+- `chunk`: 生成テキストの差分チャンク
+- `tool`: ツール実行結果または適用結果
+- `error`: ストリーム中のエラー
+- `end`: ストリーム終了
+
+**イベント例:**
+```json
+{"type":"start","mode":"llm"}
+{"type":"chunk","mode":"llm","delta":"Hello"}
+{"type":"tool","mode":"tool","content":"status: 0"}
+{"type":"end","mode":"llm"}
+```
 
 **実装例:**
 ```bash
@@ -71,8 +281,10 @@ $ your-agent -p "テスト実行" --output-format stream-json
 ```
 
 ### 1.2 セッション管理
+区分: Claude Code基準
 
 #### 1.2.1 セッション永続化
+区分: Claude Code基準
 **必須機能:**
 - 自動セッション保存
 - セッションID管理
@@ -87,6 +299,7 @@ $ your-agent -p "テスト実行" --output-format stream-json
 ```
 
 #### 1.2.2 セッション操作
+区分: Claude Code基準
 **必須コマンド:**
 ```bash
 # 最新セッションを再開
@@ -115,9 +328,13 @@ $ your-agent -p "テスト実行" --output-format stream-json
 
 ## 2. LLMモデル管理要件
 
+この章は、まずClaude Code基準のモデル選択と実行経路を定義し、多プロバイダー化は互換層としてその上に追加する。
+
 ### 2.1 モデルプロバイダー抽象化
+区分: 基準先行 + 拡張統合
 
 #### 2.1.1 サポートプロバイダー
+区分: 基準先行 + 拡張統合
 **必須:**
 - OpenAI (GPT-4o, o3-mini, etc.)
 - Anthropic (Claude Sonnet, Opus, Haiku)
@@ -125,6 +342,7 @@ $ your-agent -p "テスト実行" --output-format stream-json
 - ローカルモデル (Ollama, LM Studio)
 
 #### 2.1.2 プロバイダー設定
+区分: 基準先行 + 拡張統合
 **設定ファイル例 (TOML):**
 ```toml
 [model]
@@ -146,8 +364,10 @@ api_key = "not-needed"
 ```
 
 ### 2.2 モデル切り替え
+区分: 基準先行 + 拡張統合
 
 #### 2.2.1 セッション内切り替え
+区分: 基準先行 + 拡張統合
 **必須コマンド:**
 ```bash
 # モデル選択画面
@@ -161,12 +381,14 @@ api_key = "not-needed"
 ```
 
 #### 2.2.2 起動時指定
+区分: 基準先行 + 拡張統合
 ```bash
 $ your-agent --model claude-sonnet-4
 $ your-agent --model gpt-4o
 ```
 
 ### 2.3 モデルパラメータ設定
+区分: 基準先行 + 拡張統合
 
 **設定可能項目:**
 - `max_tokens`: 最大トークン数
@@ -186,9 +408,13 @@ reasoning_effort = "high"  # low/medium/high
 
 ## 3. システムプロンプト & コンテキスト管理要件
 
+この章は、Claude Code基準のコンテキスト合成とプロジェクト指示を先に定義し、他CLI由来の補助設定は拡張として扱う。
+
 ### 3.1 プロジェクト設定ファイル
+区分: Claude Code基準
 
 #### 3.1.1 階層的設定
+区分: Claude Code基準
 **ファイル構造:**
 ```
 # グローバル設定
@@ -202,6 +428,7 @@ reasoning_effort = "high"  # low/medium/high
 ```
 
 #### 3.1.2 設定ファイル形式 (Markdown)
+区分: Claude Code基準
 **AGENT.md 例:**
 ```markdown
 # プロジェクトコンテキスト
@@ -225,8 +452,10 @@ reasoning_effort = "high"  # low/medium/high
 ```
 
 ### 3.2 システムプロンプト制御
+区分: Claude Code基準
 
 #### 3.2.1 コマンドライン引数
+区分: Claude Code基準
 ```bash
 # システムプロンプト完全置換
 $ your-agent --system-prompt "カスタムプロンプト"
@@ -242,6 +471,7 @@ $ your-agent --append-system-prompt-file ./additions.md
 ```
 
 #### 3.2.2 優先順位
+区分: Claude Code基準
 1. `--system-prompt` / `--system-prompt-file` （最高優先）
 2. `--append-system-prompt` / `--append-system-prompt-file`
 3. ワークスペース設定 (`./.your-agent/AGENT.md`)
@@ -252,9 +482,13 @@ $ your-agent --append-system-prompt-file ./additions.md
 
 ## 4. ツール & パーミッション管理要件
 
+この章は、Claude Code基準の承認付きツール実行を先に満たし、追加ツール種別や高度な制御は段階的拡張として扱う。
+
 ### 4.1 ビルトインツール
+区分: Claude Code基準
 
 #### 4.1.1 必須ツール一覧
+区分: Claude Code基準
 | ツール名 | 機能 | リスク |
 |---------|------|--------|
 | `Read` | ファイル読み込み | 低 |
@@ -266,6 +500,7 @@ $ your-agent --append-system-prompt-file ./additions.md
 | `WebSearch` | Web検索 | 低 |
 
 #### 4.1.2 ツール定義形式
+区分: Claude Code基準
 ```json
 {
   "name": "read_file",
@@ -284,8 +519,10 @@ $ your-agent --append-system-prompt-file ./additions.md
 ```
 
 ### 4.2 パーミッション制御
+区分: Claude Code基準
 
 #### 4.2.1 承認ポリシー
+区分: Claude Code基準
 **設定値:**
 - `always`: 常に承認を求める（最安全）
 - `on-request`: エージェントが必要と判断した時のみ
@@ -299,6 +536,7 @@ approval_policy = "on-request"
 ```
 
 #### 4.2.2 ツール別制御
+区分: Claude Code基準
 **設定例:**
 ```json
 {
@@ -321,14 +559,17 @@ approval_policy = "on-request"
 ```
 
 #### 4.2.3 パターンマッチング仕様
+区分: Claude Code基準
 **サポート形式:**
 - Glob パターン: `*.py`, `src/**/*.ts`
 - 正規表現: `Bash(git (status|log|diff))`
 - 否定パターン: `!Write(node_modules/**)`
 
 ### 4.3 サンドボックス機能
+区分: 基準先行 + 拡張統合
 
 #### 4.3.1 サンドボックスモード
+区分: 基準先行 + 拡張統合
 **レベル:**
 - `none`: サンドボックスなし
 - `read-only`: 読み取り専用
@@ -354,13 +595,18 @@ blocked_paths = [
 
 ## 5. MCP (Model Context Protocol) 統合要件
 
+この章は、Claude Code基準のMCP利用体験を基準とし、接続方式や運用差分の拡張はその上に積み増す。
+
 ### 5.1 MCP Server管理
+区分: Claude Code基準
 
 #### 5.1.1 対応形式
+区分: Claude Code基準
 - **STDIO Server**: ローカルプロセスとして起動
 - **HTTP Server (SSE)**: リモートサーバーに接続
 
 #### 5.1.2 設定ファイル
+区分: Claude Code基準
 **TOML形式例:**
 ```toml
 [mcp_servers.filesystem]
@@ -381,6 +627,7 @@ http_headers = { "X-Custom-Header" = "value" }
 ```
 
 #### 5.1.3 MCPコマンド
+区分: Claude Code基準
 ```bash
 # MCPサーバー追加
 $ your-agent mcp add <name> --command <cmd> --args <args>
@@ -396,6 +643,7 @@ $ your-agent mcp remove <name>
 ```
 
 ### 5.2 MCPツール検出
+区分: Claude Code基準
 
 **必須機能:**
 - サーバー起動時の自動ツール検出
@@ -413,9 +661,13 @@ $ your-agent mcp remove <name>
 
 ## 6. フック & オートメーション要件
 
+この章は、Claude Code基準で有効な自動化ポイントを先に定義し、ベンダー差分のある自動化は追加拡張として整理する。
+
 ### 6.1 フック種類
+区分: Claude Code基準
 
 #### 6.1.1 エージェントライフサイクルフック
+区分: Claude Code基準
 ```json
 {
   "hooks": {
@@ -436,6 +688,7 @@ $ your-agent mcp remove <name>
 ```
 
 #### 6.1.2 ツール実行フック
+区分: Claude Code基準
 ```json
 {
   "hooks": {
@@ -464,6 +717,7 @@ $ your-agent mcp remove <name>
 ```
 
 ### 6.2 フック実行仕様
+区分: Claude Code基準
 
 **環境変数:**
 - `$file`: 操作対象ファイルパス
@@ -480,9 +734,13 @@ $ your-agent mcp remove <name>
 
 ## 7. スラッシュコマンド要件
 
+この章は、Claude Code基準の対話操作コマンドを先に揃え、他CLI固有の補助コマンドは追加要件として扱う。
+
 ### 7.1 必須ビルトインコマンド
+区分: Claude Code基準
 
 #### 7.1.1 セッション管理
+区分: Claude Code基準
 ```
 /new              新規セッション開始
 /clear            履歴クリア
@@ -494,6 +752,7 @@ $ your-agent mcp remove <name>
 ```
 
 #### 7.1.2 設定・ステータス
+区分: Claude Code基準
 ```
 /model            モデル選択
 /approvals        承認ポリシー変更
@@ -503,6 +762,7 @@ $ your-agent mcp remove <name>
 ```
 
 #### 7.1.3 Git統合
+区分: Claude Code基準
 ```
 /diff             Git差分表示
 /commit           コミット作成
@@ -510,6 +770,7 @@ $ your-agent mcp remove <name>
 ```
 
 #### 7.1.4 その他
+区分: Claude Code基準
 ```
 /help             ヘルプ表示
 /exit, /quit      終了
@@ -517,14 +778,17 @@ $ your-agent mcp remove <name>
 ```
 
 ### 7.2 カスタムコマンド
+区分: 多ベンダー拡張
 
 #### 7.2.1 定義場所
+区分: 多ベンダー拡張
 ```
 ~/.your-agent/commands/         # グローバル
 ./.your-agent/commands/         # プロジェクト
 ```
 
 #### 7.2.2 カスタムコマンド形式
+区分: 多ベンダー拡張
 **ファイル: `.your-agent/commands/security-review.md`**
 ```markdown
 ---
@@ -549,9 +813,13 @@ description: セキュリティレビューを実行
 
 ## 8. カスタムエージェント要件
 
+この章は、Claude Code基準のエージェント拡張性を基準にし、将来的なベンダー固有カスタマイズは上位拡張として扱う。
+
 ### 8.1 エージェント定義
+区分: 基準先行 + 拡張統合
 
 #### 8.1.1 設定ファイル構造
+区分: 基準先行 + 拡張統合
 **場所:**
 ```
 ~/.your-agent/agents/           # グローバルエージェント
@@ -591,8 +859,10 @@ description: セキュリティレビューを実行
 ```
 
 ### 8.2 エージェント操作
+区分: 基準先行 + 拡張統合
 
 #### 8.2.1 CLIコマンド
+区分: 基準先行 + 拡張統合
 ```bash
 # エージェント一覧
 $ your-agent agent list
@@ -611,6 +881,7 @@ $ your-agent agent create my-agent
 ```
 
 #### 8.2.2 エージェント起動
+区分: 基準先行 + 拡張統合
 ```bash
 # エージェント指定で起動
 $ your-agent --agent code-reviewer
@@ -623,9 +894,13 @@ $ your-agent --agent code-reviewer
 
 ## 9. ファイル操作要件
 
+この章は、Claude Code基準の安全な読取・編集・差分適用を最優先とし、その上で補助的な編集体験を追加する。
+
 ### 9.1 ファイル参照
+区分: Claude Code基準
 
 #### 9.1.1 @ 記法
+区分: Claude Code基準
 ```bash
 # 単一ファイル
 > このファイルを解析して @src/main.py
@@ -641,6 +916,7 @@ $ your-agent --agent code-reviewer
 ```
 
 #### 9.1.2 ファイル補完
+区分: Claude Code基準
 **必須機能:**
 - TABキーによる補完
 - Fuzzyマッチング
@@ -648,8 +924,10 @@ $ your-agent --agent code-reviewer
 - `.gitignore` 考慮
 
 ### 9.2 画像ファイル対応
+区分: 基準先行 + 拡張統合
 
 #### 9.2.1 画像入力
+区分: 基準先行 + 拡張統合
 ```bash
 # コマンドライン
 $ your-agent --image screenshot.png -p "この画面を分析"
@@ -663,6 +941,7 @@ $ your-agent --image design.png,mockup.png
 ```
 
 #### 9.2.2 サポート形式
+区分: 基準先行 + 拡張統合
 - PNG, JPEG, GIF, WebP
 - Base64エンコード対応
 - サイズ制限: 5MB推奨
@@ -671,9 +950,13 @@ $ your-agent --image design.png,mockup.png
 
 ## 10. Git統合要件
 
+この章は、Claude Code基準で必要な最小Git連携を先に定義し、自動化や高度な連携は拡張段階で扱う。
+
 ### 10.1 Git操作
+区分: Claude Code基準
 
 #### 10.1.1 必須機能
+区分: Claude Code基準
 - コミットメッセージ生成
 - 差分表示・解析
 - ブランチ検出
@@ -681,6 +964,7 @@ $ your-agent --image design.png,mockup.png
 - コンフリクト解決支援
 
 #### 10.1.2 Git履歴活用
+区分: Claude Code基準
 ```bash
 > 最新3コミットを分析
 > v1.2.3の変更内容を説明
@@ -689,8 +973,10 @@ $ your-agent --image design.png,mockup.png
 ```
 
 ### 10.2 GitHub/GitLab統合
+区分: 多ベンダー拡張
 
 #### 10.2.1 必須機能（gh/glab CLI使用）
+区分: 多ベンダー拡張
 - Issue取得・作成
 - PR作成・レビュー
 - コメント追加
@@ -706,7 +992,10 @@ $ your-agent --image design.png,mockup.png
 
 ## 11. 設定ファイル要件
 
+この章は、Claude Code基準の基本設定を成立させるための必須構成を定義し、多ベンダー設定は互換拡張として加える。
+
 ### 11.1 設定ファイル形式
+区分: 基準先行 + 拡張統合
 
 **推奨: TOML** (可読性と表現力のバランス)
 
@@ -726,6 +1015,7 @@ $ your-agent --image design.png,mockup.png
 ```
 
 ### 11.2 設定例
+区分: 基準先行 + 拡張統合
 
 **config.toml:**
 ```toml
@@ -770,9 +1060,13 @@ command = "cargo fmt"
 
 ## 12. 認証要件
 
+この章は、Claude Code基準の認証成立を優先し、追加プロバイダーの認証方式はその後に統合する。
+
 ### 12.1 認証方式
+区分: 基準先行 + 拡張統合
 
 #### 12.1.1 API Key認証
+区分: Claude Code基準
 **環境変数:**
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
@@ -788,6 +1082,7 @@ openai_api_key_env = "OPENAI_API_KEY"
 ```
 
 #### 12.1.2 OAuth認証
+区分: 多ベンダー拡張
 ```bash
 # ブラウザ経由で認証
 $ your-agent login
@@ -800,6 +1095,7 @@ $ your-agent logout
 ```
 
 ### 12.2 セッショントークン管理
+区分: 基準先行 + 拡張統合
 
 **保存場所:**
 ```
@@ -812,20 +1108,26 @@ $ your-agent logout
 
 ## 13. 出力・UI要件
 
+この章は、Claude Code基準の対話体験を優先して定義し、表示強化や別CLI流のUI要素は拡張として扱う。
+
 ### 13.1 TUI (Terminal User Interface)
+区分: Claude Code基準
 
 #### 13.1.1 必須要素
+区分: Claude Code基準
 - メッセージエリア（スクロール可能）
 - 入力エリア（マルチライン対応）
 - ステータスバー（モデル、トークン使用量表示）
 - プログレスインジケーター
 
 #### 13.1.2 推奨フレームワーク
+区分: 基準先行 + 拡張統合
 - **Rust**: `ratatui`
 - **Python**: `textual`, `rich`
 - **Node.js**: `ink`, `blessed`
 
 ### 13.2 シンタックスハイライト
+区分: Claude Code基準
 
 **必須機能:**
 - Markdownレンダリング
@@ -833,6 +1135,7 @@ $ your-agent logout
 - 差分表示（unified diff形式）
 
 ### 13.3 ストリーミング出力
+区分: Claude Code基準
 
 **必須機能:**
 - リアルタイム表示
@@ -844,7 +1147,10 @@ $ your-agent logout
 
 ## 14. 高度な機能要件（Optional）
 
+この章は、Claude Code基準の中核実装完了後に着手する拡張機能をまとめる章として扱う。
+
 ### 14.1 メモリー機能
+区分: 多ベンダー拡張
 
 **機能:**
 - 永続的な事実の保存
@@ -859,6 +1165,7 @@ $ your-agent logout
 ```
 
 ### 14.2 チェックポイント機能
+区分: 多ベンダー拡張
 
 **機能:**
 - プロジェクト状態のスナップショット
@@ -873,6 +1180,7 @@ $ your-agent logout
 ```
 
 ### 14.3 ナレッジベース
+区分: 多ベンダー拡張
 
 **機能:**
 - PDFドキュメントのインデックス化
@@ -880,6 +1188,7 @@ $ your-agent logout
 - コンテキストウィンドウ節約
 
 ### 14.4 クラウド実行
+区分: 多ベンダー拡張
 
 **機能:**
 - リモートサンドボックス実行
@@ -894,6 +1203,7 @@ $ your-agent cloud pull <task-id>
 ```
 
 ### 14.5 レビューモード
+区分: 多ベンダー拡張
 
 **機能:**
 - 専用レビューエージェント起動
@@ -911,7 +1221,10 @@ $ your-agent cloud pull <task-id>
 
 ## 15. 実装優先順位
 
+この章は、常にClaude Code基準の中核要件を先行させ、その後に多ベンダー拡張を積む順序で解釈する。
+
 ### Phase 1: MVP（Minimum Viable Product）
+区分: Claude Code基準
 
 **目標: 基本的な対話型AIエージェントの実現**
 
@@ -942,6 +1255,7 @@ $ your-agent cloud pull <task-id>
 **期間: 2-3週間**
 
 ### Phase 2: 拡張機能
+区分: 多ベンダー拡張
 
 **目標: 実用的な機能の追加**
 
@@ -968,6 +1282,7 @@ $ your-agent cloud pull <task-id>
 **期間: 3-4週間**
 
 ### Phase 3: 高度な機能
+区分: 多ベンダー拡張
 
 **目標: プロフェッショナル向け機能**
 
@@ -994,6 +1309,7 @@ $ your-agent cloud pull <task-id>
 **期間: 4-5週間**
 
 ### Phase 4: エンタープライズ機能
+区分: 多ベンダー拡張
 
 **目標: チーム・企業での利用**
 
@@ -1023,7 +1339,10 @@ $ your-agent cloud pull <task-id>
 
 ## 16. 技術スタック推奨
 
+この章は、まずClaude Code基準の実装成立に必要な技術を優先し、拡張要件に応じて追加技術を採用する前提で読む。
+
 ### 16.1 プログラミング言語
+区分: 基準先行 + 拡張統合
 
 | 言語 | メリット | デメリット |
 |------|---------|----------|
@@ -1035,6 +1354,7 @@ $ your-agent cloud pull <task-id>
 **推奨: Rust** (高速・安全・配布が容易)
 
 ### 16.2 主要ライブラリ（Rust）
+区分: Claude Code基準
 
 ```toml
 [dependencies]
@@ -1064,6 +1384,7 @@ tracing = "0.1"
 ```
 
 ### 16.3 アーキテクチャ
+区分: Claude Code基準
 
 **レイヤー構成:**
 ```
@@ -1086,7 +1407,10 @@ tracing = "0.1"
 
 ## 17. テスト要件
 
+この章は、Claude Code基準の中核挙動を最優先で検証対象とし、拡張機能の検証はその後に追加する。
+
 ### 17.1 ユニットテスト
+区分: Claude Code基準
 
 **カバレッジ目標: 80%以上**
 
@@ -1097,6 +1421,7 @@ tracing = "0.1"
 - セッション永続化
 
 ### 17.2 統合テスト
+区分: 基準先行 + 拡張統合
 
 **テストシナリオ:**
 - LLM API通信（モック）
@@ -1105,6 +1430,7 @@ tracing = "0.1"
 - Git操作
 
 ### 17.3 E2Eテスト
+区分: 基準先行 + 拡張統合
 
 **テストケース:**
 - 基本的な対話フロー
@@ -1116,7 +1442,10 @@ tracing = "0.1"
 
 ## 18. ドキュメント要件
 
+この章は、Claude Code基準の利用と実装に必要な文書を先に整備し、拡張機能の説明は段階追加とする。
+
 ### 18.1 必須ドキュメント
+区分: 基準先行 + 拡張統合
 
 1. **README.md**
    - プロジェクト概要
@@ -1147,7 +1476,10 @@ tracing = "0.1"
 
 ## 19. パフォーマンス要件
 
+この章は、まずClaude Code基準の体験を損なわない性能水準を定義し、追加機能の最適化は後続で扱う。
+
 ### 19.1 レスポンス時間
+区分: Claude Code基準
 
 - **起動時間**: < 500ms
 - **コマンド実行**: < 100ms
@@ -1155,12 +1487,14 @@ tracing = "0.1"
 - **LLM応答開始**: < 2s (ストリーミング開始)
 
 ### 19.2 メモリ使用量
+区分: Claude Code基準
 
 - **アイドル時**: < 50MB
 - **通常使用時**: < 200MB
 - **大規模プロジェクト**: < 500MB
 
 ### 19.3 並行処理
+区分: 基準先行 + 拡張統合
 
 - 複数ツールの並列実行
 - 非同期I/O
@@ -1170,19 +1504,24 @@ tracing = "0.1"
 
 ## 20. セキュリティ要件
 
+この章は、Claude Code基準の安全性を成立させる要件を最優先とし、多ベンダー拡張に伴う追加リスクはその上で管理する。
+
 ### 20.1 機密情報の保護
+区分: Claude Code基準
 
 - APIキーの暗号化保存
 - `.env` ファイルの読み取り拒否（デフォルト）
 - ログからの機密情報除外
 
 ### 20.2 コマンド実行の安全性
+区分: Claude Code基準
 
 - 危険なコマンドの警告
 - 承認フローの強制
 - シェルインジェクション対策
 
 ### 20.3 監査ログ
+区分: 基準先行 + 拡張統合
 
 - 全ツール実行のログ記録
 - タイムスタンプ付き
@@ -1193,6 +1532,7 @@ tracing = "0.1"
 ## 21. 参考資料
 
 ### 21.1 公式ドキュメント
+区分: 基準先行 + 拡張統合
 
 - [Claude Code Documentation](https://code.claude.com/docs/)
 - [Codex CLI Documentation](https://developers.openai.com/codex/cli/)
@@ -1200,19 +1540,24 @@ tracing = "0.1"
 - [Kiro CLI Documentation](https://kiro.dev/docs/cli/)
 
 ### 21.2 仕様・標準
+区分: 基準先行 + 拡張統合
 
 - [Model Context Protocol](https://modelcontextprotocol.io/)
-- [OpenAI API Reference](https://platform.openai.com/docs/api-reference)
 - [Anthropic API Reference](https://docs.anthropic.com/en/api/)
+- [OpenAI API Reference](https://platform.openai.com/docs/api-reference)
 
 ### 21.3 関連ツール
+区分: 多ベンダー拡張
 
 - [Aider](https://aider.chat/) - オープンソースAIコーディングツール
+- [Kiro CLI Documentation](https://kiro.dev/docs/cli/)
+- [OpenAI API Reference](https://platform.openai.com/docs/api-reference)
 - [Continue](https://continue.dev/) - IDE統合AIアシスタント
 
 ---
 
 ## 付録A: 用語集
+区分: 基準先行 + 拡張統合
 
 | 用語 | 説明 |
 |------|------|
@@ -1227,8 +1572,10 @@ tracing = "0.1"
 ---
 
 ## 付録B: サンプル設定ファイル
+区分: 基準先行 + 拡張統合
 
 ### 完全な設定例
+区分: 基準先行 + 拡張統合
 
 ```toml
 # ~/.your-agent/config.toml

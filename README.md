@@ -51,6 +51,31 @@ tengu --model claude-sonnet-4 -p "Write tests"
 tengu -p "Fix bugs" --allowed-tools "Read,Write,Edit"
 ```
 
+### Connectivity Checks
+
+Use these commands to verify each backend can start streaming responses from your local environment.
+
+```bash
+# Anthropic
+export ANTHROPIC_API_KEY="sk-ant-..."
+tengu --model claude-sonnet-4-20250514 -p "Reply with OK" --output-format stream-json
+
+# OpenAI
+export OPENAI_API_KEY="sk-..."
+tengu --model gpt-4o-mini -p "Reply with OK" --output-format stream-json
+
+# Google
+export GOOGLE_API_KEY="..."
+tengu --model gemini-2.0-flash -p "Reply with OK" --output-format stream-json
+```
+
+Expected behavior:
+
+- A `start` event is printed first
+- One or more `chunk` events follow
+- An `end` event is printed last
+- If a backend fails, an `error` event is emitted before exit
+
 ## 📖 Examples
 
 ### File Operations

@@ -10,6 +10,7 @@ use crate::tools::{ToolExecutor, ToolInput, ToolPolicy, ToolResult};
 use crate::tui::App;
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use futures_util::StreamExt;
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
@@ -217,6 +218,13 @@ pub enum ToolCommands {
         path: PathBuf,
         /// 書き込み内容
         content: String,
+    },
+    /// シェルコマンド実行
+    Shell {
+        /// 実行コマンド
+        command: String,
+        /// 引数（複数可）
+        args: Vec<String>,
     },
     /// 文字列検索
     Grep {
@@ -446,6 +454,10 @@ impl Cli {
                 }
                 return Ok(());
             }
+            ToolCommands::Shell { command, args } => executor.execute(ToolInput::Shell {
+                command: command.clone(),
+                args: args.clone(),
+            })?,
             ToolCommands::Grep { pattern, paths } => executor.execute(ToolInput::Grep {
                 pattern: pattern.clone(),
                 paths: paths.clone(),
@@ -489,6 +501,59 @@ impl Cli {
     async fn execute_headless(&self) -> Result<()> {
         let (system_prompt, sources) = self.resolve_system_prompt()?;
         self.log_system_prompt_sources(&sources, system_prompt.as_deref());
+        if let Some(prompt) = self.prompt.as_deref() {
+            if self.output_format == "stream-json" {
+                let config = load_config().unwrap_or_default();
+                let (client, model_name) = self.resolve_llm_with_config(&config)?;
+                let policy = ToolPolicy::from_config(&config);
+                let runner = AgentRunner::new(client, model_name, policy);
+                let (mut stream, tool_result) =
+                    runner.handle_prompt_stream_with_tool_context(prompt, "").await?;
+
+                println!("{}", json!({ "type": "start", "mode": "llm" }));
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(text) => {
+                            println!(
+                                "{}",
+                                json!({ "type": "chunk", "mode": "llm", "delta": text })
+                            );
+                        }
+                        Err(err) => {
+                            println!(
+                                "{}",
+                                json!({ "type": "error", "mode": "llm", "message": err.to_string() })
+                            );
+                            println!("{}", json!({ "type": "end", "mode": "llm" }));
+                            return Err(err);
+                        }
+                    }
+                }
+
+                if let Some(result) = tool_result.as_ref() {
+                    println!(
+                        "{}",
+                        json!({
+                            "type": "tool",
+                            "mode": "tool",
+                            "content": format_tool_result(result)
+                        })
+                    );
+                    if let Some(applied) = apply_preview_write_with_config(result)? {
+                        println!(
+                            "{}",
+                            json!({
+                                "type": "tool",
+                                "mode": "tool",
+                                "content": format_tool_result(&applied)
+                            })
+                        );
+                    }
+                }
+                println!("{}", json!({ "type": "end", "mode": "llm" }));
+                return Ok(());
+            }
+        }
         let message = format!("Headless mode with prompt: {:?}", self.prompt);
         self.print_output("headless", &message, self.prompt.as_deref());
         if let Some(prompt) = self.prompt.as_deref() {
@@ -597,19 +662,39 @@ impl Cli {
     }
 
     fn resolve_llm_with_config(&self, config: &Config) -> Result<(LlmClient, String)> {
-        let provider_name = self
+        let configured_provider_name = if !config.model.provider.trim().is_empty() {
+            config.model.provider.as_str()
+        } else {
+            config
+                .model
+                .backend
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("anthropic")
+        };
+        let configured_provider = LlmProvider::from_str(configured_provider_name)?;
+        let model_name = self
             .model
             .as_deref()
-            .or_else(|| config.model.backend.as_deref())
-            .unwrap_or("ollama");
-        let provider = LlmProvider::from_str(provider_name)?;
+            .filter(|value| LlmProvider::from_str(value).is_err())
+            .map(|value| value.to_string())
+            .or_else(|| {
+                config
+                    .model
+                    .name
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| value.to_string())
+            })
+            .or_else(|| {
+                (!config.model.default.trim().is_empty()).then(|| config.model.default.clone())
+            })
+            .ok_or_else(|| anyhow!("model name is not set in config.toml"))?;
+        let provider = match self.model.as_deref() {
+            Some(value) => LlmProvider::from_str(value).unwrap_or(configured_provider),
+            None => configured_provider,
+        };
         let backend = build_backend(&provider, &config, self.ollama_base_url.clone());
-        let model_name = config
-            .model
-            .name
-            .as_deref()
-            .ok_or_else(|| anyhow!("model name is not set in config.toml"))?
-            .to_string();
         Ok((LlmClient::new(backend), model_name))
     }
 }
@@ -645,9 +730,15 @@ fn build_backend(
                 .unwrap_or_else(|| "http://localhost:11434".to_string());
             Box::new(OllamaBackend::new(base_url))
         }
-        LlmProvider::Anthropic => Box::new(AnthropicBackend),
-        LlmProvider::OpenAI => Box::new(OpenAiBackend),
-        LlmProvider::Google => Box::new(GoogleBackend),
+        LlmProvider::Anthropic => Box::new(AnthropicBackend::new(
+            config.model.backend_url.clone(),
+            config.model.max_tokens,
+        )),
+        LlmProvider::OpenAI => Box::new(OpenAiBackend::new(
+            config.model.backend_url.clone(),
+            config.model.max_tokens,
+        )),
+        LlmProvider::Google => Box::new(GoogleBackend::new(config.model.backend_url.clone())),
     }
 }
 

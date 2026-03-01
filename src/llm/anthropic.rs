@@ -1,9 +1,126 @@
 use anyhow::{anyhow, Result};
+use bytes::Bytes;
+use futures_util::stream::{self, BoxStream, StreamExt};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::llm::{LlmBackend, LlmProvider, LlmResponse};
+use crate::llm::{LlmBackend, LlmProvider, LlmResponse, LlmStream};
+
+const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
+const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 #[derive(Debug, Clone)]
-pub struct AnthropicBackend;
+pub struct AnthropicBackend {
+    pub base_url: String,
+    pub max_tokens: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct MessageRequest {
+    model: String,
+    max_tokens: u32,
+    messages: Vec<MessageInput>,
+    stream: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MessageInput {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageResponse {
+    content: Vec<ContentBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContentBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    text: Option<String>,
+}
+
+impl AnthropicBackend {
+    pub fn new(base_url: Option<String>, max_tokens: Option<u32>) -> Self {
+        Self {
+            base_url: base_url.unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE_URL.to_string()),
+            max_tokens: max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        }
+    }
+
+    fn messages_url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        if base.ends_with("/v1") {
+            format!("{}/messages", base)
+        } else {
+            format!("{}/v1/messages", base)
+        }
+    }
+
+    fn api_key(&self) -> Result<String> {
+        std::env::var("ANTHROPIC_API_KEY")
+            .map_err(|_| anyhow!("ANTHROPIC_API_KEY is not set"))
+    }
+
+    fn request_body(&self, model: &str, prompt: &str, stream: bool) -> MessageRequest {
+        MessageRequest {
+            model: model.to_string(),
+            max_tokens: self.max_tokens,
+            messages: vec![MessageInput {
+                role: "user".to_string(),
+                content: prompt.to_string(),
+            }],
+            stream,
+        }
+    }
+
+    fn collect_text(blocks: Vec<ContentBlock>) -> String {
+        blocks
+            .into_iter()
+            .filter(|block| block.kind == "text")
+            .filter_map(|block| block.text)
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    fn parse_stream_event(data: &str) -> Result<Option<String>> {
+        let payload = data.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            return Ok(None);
+        }
+
+        let value: Value = serde_json::from_str(payload)?;
+        if let Some(error) = value
+            .get("error")
+            .and_then(|err| err.get("message"))
+            .and_then(Value::as_str)
+        {
+            return Err(anyhow!("anthropic stream error: {}", error));
+        }
+
+        if let Some(text) = value
+            .get("delta")
+            .and_then(|delta| delta.get("text"))
+            .and_then(Value::as_str)
+        {
+            return Ok(Some(text.to_string()));
+        }
+
+        if let Some(text) = value
+            .get("content_block")
+            .and_then(|block| block.get("text"))
+            .and_then(Value::as_str)
+        {
+            if !text.is_empty() {
+                return Ok(Some(text.to_string()));
+            }
+        }
+
+        Ok(None)
+    }
+}
 
 #[async_trait::async_trait]
 impl LlmBackend for AnthropicBackend {
@@ -11,11 +128,152 @@ impl LlmBackend for AnthropicBackend {
         LlmProvider::Anthropic
     }
 
-    async fn generate(&self, _model: &str, _prompt: &str) -> Result<LlmResponse> {
-        Err(anyhow!("anthropic backend not implemented"))
+    async fn generate(&self, model: &str, prompt: &str) -> Result<LlmResponse> {
+        let api_key = self.api_key()?;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(self.messages_url())
+            .header("x-api-key", api_key)
+            .header("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&self.request_body(model, prompt, false))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("anthropic error: {} {}", status, body.trim()));
+        }
+
+        let body: MessageResponse = response.json().await?;
+        Ok(LlmResponse {
+            content: Self::collect_text(body.content),
+        })
     }
 
-    async fn generate_stream(&self, _model: &str, _prompt: &str) -> Result<crate::llm::LlmStream> {
-        Err(anyhow!("anthropic backend streaming not implemented"))
+    async fn generate_stream(&self, model: &str, prompt: &str) -> Result<LlmStream> {
+        let api_key = self.api_key()?;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(self.messages_url())
+            .header("x-api-key", api_key)
+            .header("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&self.request_body(model, prompt, true))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("anthropic error: {} {}", status, body.trim()));
+        }
+
+        struct StreamState {
+            stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+            buffer: String,
+            pending_event: Option<String>,
+            pending_data: Vec<String>,
+            finished: bool,
+        }
+
+        fn take_message(state: &mut StreamState) -> Result<Option<String>> {
+            while let Some(idx) = state.buffer.find('\n') {
+                let mut line = state.buffer[..idx].to_string();
+                state.buffer = state.buffer[idx + 1..].to_string();
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+
+                if line.is_empty() {
+                    if state.pending_event.is_some() || !state.pending_data.is_empty() {
+                        let data = state.pending_data.join("\n");
+                        state.pending_event = None;
+                        state.pending_data.clear();
+                        return AnthropicBackend::parse_stream_event(&data);
+                    }
+                    continue;
+                }
+
+                if let Some(event) = line.strip_prefix("event:") {
+                    state.pending_event = Some(event.trim().to_string());
+                    continue;
+                }
+
+                if let Some(data) = line.strip_prefix("data:") {
+                    state.pending_data.push(data.trim_start().to_string());
+                }
+            }
+
+            Ok(None)
+        }
+
+        let state = StreamState {
+            stream: Box::pin(response.bytes_stream()),
+            buffer: String::new(),
+            pending_event: None,
+            pending_data: Vec::new(),
+            finished: false,
+        };
+
+        let output = stream::unfold(state, |mut state| async move {
+            if state.finished {
+                return None;
+            }
+
+            loop {
+                match take_message(&mut state) {
+                    Ok(Some(text)) => return Some((Ok(text), state)),
+                    Ok(None) => {}
+                    Err(err) => {
+                        state.finished = true;
+                        return Some((Err(err), state));
+                    }
+                }
+
+                match state.stream.next().await {
+                    Some(Ok(chunk)) => {
+                        state.buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    }
+                    Some(Err(err)) => {
+                        state.finished = true;
+                        return Some((Err(anyhow::Error::new(err)), state));
+                    }
+                    None => {
+                        state.finished = true;
+                        if !state.pending_data.is_empty() {
+                            let data = state.pending_data.join("\n");
+                            match AnthropicBackend::parse_stream_event(&data) {
+                                Ok(Some(text)) => return Some((Ok(text), state)),
+                                Ok(None) => return None,
+                                Err(err) => return Some((Err(err), state)),
+                            }
+                        }
+                        return None;
+                    }
+                }
+            }
+        });
+
+        Ok(Box::pin(output) as BoxStream<'static, Result<String>>)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_messages_url_from_default_base() {
+        let backend = AnthropicBackend::new(None, None);
+        assert_eq!(backend.messages_url(), "https://api.anthropic.com/v1/messages");
+    }
+
+    #[test]
+    fn parses_text_delta_from_stream_payload() {
+        let payload = r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}"#;
+        let parsed = AnthropicBackend::parse_stream_event(payload).unwrap();
+        assert_eq!(parsed.as_deref(), Some("hello"));
     }
 }

@@ -40,6 +40,7 @@ struct ThemeConfigOpt {
     error_detail: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
     pub user: Color,

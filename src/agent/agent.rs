@@ -54,6 +54,11 @@ enum ToolCall {
         path: String,
         content: String,
     },
+    Shell {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
     Grep {
         pattern: String,
         paths: Vec<String>,
@@ -89,7 +94,7 @@ impl AgentRunner {
         input: &str,
         context: &str,
     ) -> Result<AgentOutput> {
-        let (plan, final_prompt, tool_result) =
+        let (_plan, final_prompt, tool_result) =
             self.resolve_final_prompt_with_context(input, context)
                 .await?;
         let final_response = self
@@ -107,14 +112,25 @@ impl AgentRunner {
         input: &str,
         context: &str,
     ) -> Result<LlmStream> {
-        let (_plan, final_prompt, _tool_result) =
+        let (stream, _tool_result) = self
+            .handle_prompt_stream_with_tool_context(input, context)
+            .await?;
+        Ok(stream)
+    }
+
+    pub async fn handle_prompt_stream_with_tool_context(
+        &self,
+        input: &str,
+        context: &str,
+    ) -> Result<(LlmStream, Option<ToolResult>)> {
+        let (_plan, final_prompt, tool_result) =
             self.resolve_final_prompt_with_context(input, context)
                 .await?;
         let stream = self
             .client
             .generate_stream(&self.model_name, &final_prompt)
             .await?;
-        Ok(Box::pin(stream) as BoxStream<'static, Result<String>>)
+        Ok((Box::pin(stream) as BoxStream<'static, Result<String>>, tool_result))
     }
 
     fn execute_tool_call(&self, call: ToolCall) -> Result<ToolResult> {
@@ -125,6 +141,9 @@ impl AgentRunner {
             }),
             ToolCall::Write { path, content } => {
                 executor.preview_write(PathBuf::from(path), content)
+            }
+            ToolCall::Shell { command, args } => {
+                executor.execute(ToolInput::Shell { command, args })
             }
             ToolCall::Grep { pattern, paths } => executor.execute(ToolInput::Grep {
                 pattern,
@@ -143,13 +162,6 @@ impl AgentRunner {
         let prompt = build_plan_prompt_with_context(input, context);
         let response = self.client.generate(&self.model_name, &prompt).await?;
         Ok(response.content)
-    }
-
-    async fn resolve_final_prompt(
-        &self,
-        input: &str,
-    ) -> Result<(String, String, Option<ToolResult>)> {
-        self.resolve_final_prompt_with_context(input, "").await
     }
 
     async fn resolve_final_prompt_with_context(
@@ -487,6 +499,7 @@ fn parse_tool_call_loose(content: &str) -> Option<ToolCall> {
     match call {
         ToolCall::Read { .. }
         | ToolCall::Write { .. }
+        | ToolCall::Shell { .. }
         | ToolCall::Grep { .. }
         | ToolCall::Glob { .. } => Some(call),
     }

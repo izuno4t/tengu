@@ -122,6 +122,21 @@
 |TASK-060|⏳|TUI入力を文脈で束ねて進行中処理へ反映する|TASK-059|
 |TASK-089|⏳|ストリーム中はプレーン表示し、構造確定後に該当範囲を再描画する|TASK-075|
 
+### Phase 6: Claude Code基準実装
+
+|ID|Status|Summary|DependsOn|
+|----|--------|---------|-----------|
+|TASK-091|✅|Claude Code基準のPhase 1タスクを定義し実装順を固定する|-|
+|TASK-092|✅|Anthropic (Claude) 実接続を実装しClaude Code基準の既定経路を成立させる|TASK-091|
+|TASK-093|✅|モデル解決ロジックを修正しprovider/default/CLI指定を整合させる|TASK-091|
+|TASK-094|✅|Claude Code基準のPhase 1残タスクを既存実装との差分で棚卸しする|TASK-091,TASK-092,TASK-093|
+|TASK-095|✅|ShellツールをCLI/エージェントの公開経路に接続しPhase 1の基本ツール実装を完成させる|TASK-094|
+|TASK-096|✅|ヘッドレスのstream-jsonを実ストリーミング出力に寄せる差分を整理する|TASK-094|
+|TASK-097|✅|OpenAI/Googleの未実装バックエンドをPhase 2拡張候補として切り出す|TASK-094|
+|TASK-098|✅|OpenAIバックエンドを実装し多ベンダー拡張の先行経路を成立させる|TASK-097|
+|TASK-099|✅|Googleバックエンドを実装し多ベンダー拡張の候補を解消する|TASK-097|
+|TASK-100|✅|複数バックエンドの疎通確認手順と最小検証ケースを追加する|TASK-092,TASK-098,TASK-099|
+
 
 ## Task Details (only when clarification needed)
 

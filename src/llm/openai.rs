@@ -1,9 +1,113 @@
 use anyhow::{anyhow, Result};
+use bytes::Bytes;
+use futures_util::stream::{self, BoxStream, StreamExt};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::llm::{LlmBackend, LlmProvider, LlmResponse};
+use crate::llm::{LlmBackend, LlmProvider, LlmResponse, LlmStream};
+
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
 #[derive(Debug, Clone)]
-pub struct OpenAiBackend;
+pub struct OpenAiBackend {
+    pub base_url: String,
+    pub max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatCompletionRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionResponse {
+    choices: Vec<ChatChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatChoice {
+    message: Option<ChatMessage>,
+}
+
+impl OpenAiBackend {
+    pub fn new(base_url: Option<String>, max_tokens: Option<u32>) -> Self {
+        Self {
+            base_url: base_url.unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string()),
+            max_tokens,
+        }
+    }
+
+    fn chat_completions_url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        if base.ends_with("/v1") {
+            format!("{}/chat/completions", base)
+        } else {
+            format!("{}/v1/chat/completions", base)
+        }
+    }
+
+    fn api_key(&self) -> Result<String> {
+        std::env::var("OPENAI_API_KEY").map_err(|_| anyhow!("OPENAI_API_KEY is not set"))
+    }
+
+    fn request_body(&self, model: &str, prompt: &str, stream: bool) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: prompt.to_string(),
+            }],
+            stream,
+            max_tokens: self.max_tokens,
+        }
+    }
+
+    fn parse_stream_data(data: &str) -> Result<Option<String>> {
+        let payload = data.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            return Ok(None);
+        }
+
+        let value: Value = serde_json::from_str(payload)?;
+        if let Some(error) = value
+            .get("error")
+            .and_then(|err| err.get("message"))
+            .and_then(Value::as_str)
+        {
+            return Err(anyhow!("openai stream error: {}", error));
+        }
+
+        let Some(choice) = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+        else {
+            return Ok(None);
+        };
+
+        let Some(delta) = choice.get("delta") else {
+            return Ok(None);
+        };
+
+        if let Some(text) = delta.get("content").and_then(Value::as_str) {
+            if !text.is_empty() {
+                return Ok(Some(text.to_string()));
+            }
+        }
+
+        Ok(None)
+    }
+}
 
 #[async_trait::async_trait]
 impl LlmBackend for OpenAiBackend {
@@ -11,11 +115,148 @@ impl LlmBackend for OpenAiBackend {
         LlmProvider::OpenAI
     }
 
-    async fn generate(&self, _model: &str, _prompt: &str) -> Result<LlmResponse> {
-        Err(anyhow!("openai backend not implemented"))
+    async fn generate(&self, model: &str, prompt: &str) -> Result<LlmResponse> {
+        let api_key = self.api_key()?;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(self.chat_completions_url())
+            .bearer_auth(api_key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&self.request_body(model, prompt, false))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("openai error: {} {}", status, body.trim()));
+        }
+
+        let body: ChatCompletionResponse = response.json().await?;
+        let content = body
+            .choices
+            .into_iter()
+            .find_map(|choice| choice.message.map(|message| message.content))
+            .unwrap_or_default();
+        Ok(LlmResponse { content })
     }
 
-    async fn generate_stream(&self, _model: &str, _prompt: &str) -> Result<crate::llm::LlmStream> {
-        Err(anyhow!("openai backend streaming not implemented"))
+    async fn generate_stream(&self, model: &str, prompt: &str) -> Result<LlmStream> {
+        let api_key = self.api_key()?;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(self.chat_completions_url())
+            .bearer_auth(api_key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&self.request_body(model, prompt, true))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("openai error: {} {}", status, body.trim()));
+        }
+
+        struct StreamState {
+            stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+            buffer: String,
+            pending_data: Vec<String>,
+            finished: bool,
+        }
+
+        fn take_message(state: &mut StreamState) -> Result<Option<String>> {
+            while let Some(idx) = state.buffer.find('\n') {
+                let mut line = state.buffer[..idx].to_string();
+                state.buffer = state.buffer[idx + 1..].to_string();
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+
+                if line.is_empty() {
+                    if !state.pending_data.is_empty() {
+                        let data = state.pending_data.join("\n");
+                        state.pending_data.clear();
+                        return OpenAiBackend::parse_stream_data(&data);
+                    }
+                    continue;
+                }
+
+                if let Some(data) = line.strip_prefix("data:") {
+                    state.pending_data.push(data.trim_start().to_string());
+                }
+            }
+
+            Ok(None)
+        }
+
+        let state = StreamState {
+            stream: Box::pin(response.bytes_stream()),
+            buffer: String::new(),
+            pending_data: Vec::new(),
+            finished: false,
+        };
+
+        let output = stream::unfold(state, |mut state| async move {
+            if state.finished {
+                return None;
+            }
+
+            loop {
+                match take_message(&mut state) {
+                    Ok(Some(text)) => return Some((Ok(text), state)),
+                    Ok(None) => {}
+                    Err(err) => {
+                        state.finished = true;
+                        return Some((Err(err), state));
+                    }
+                }
+
+                match state.stream.next().await {
+                    Some(Ok(chunk)) => {
+                        state.buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    }
+                    Some(Err(err)) => {
+                        state.finished = true;
+                        return Some((Err(anyhow::Error::new(err)), state));
+                    }
+                    None => {
+                        state.finished = true;
+                        if !state.pending_data.is_empty() {
+                            let data = state.pending_data.join("\n");
+                            match OpenAiBackend::parse_stream_data(&data) {
+                                Ok(Some(text)) => return Some((Ok(text), state)),
+                                Ok(None) => return None,
+                                Err(err) => return Some((Err(err), state)),
+                            }
+                        }
+                        return None;
+                    }
+                }
+            }
+        });
+
+        Ok(Box::pin(output) as BoxStream<'static, Result<String>>)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_chat_completions_url_from_default_base() {
+        let backend = OpenAiBackend::new(None, None);
+        assert_eq!(
+            backend.chat_completions_url(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn parses_content_delta_from_stream_payload() {
+        let payload = r#"{"choices":[{"delta":{"content":"hello"}}]}"#;
+        let parsed = OpenAiBackend::parse_stream_data(payload).unwrap();
+        assert_eq!(parsed.as_deref(), Some("hello"));
     }
 }

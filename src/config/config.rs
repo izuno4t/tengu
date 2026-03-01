@@ -74,6 +74,15 @@ impl Config {
     fn expand_env_vars(&mut self) {
         self.model.provider = expand_env_vars_in_string(&self.model.provider);
         self.model.default = expand_env_vars_in_string(&self.model.default);
+        if let Some(backend) = &self.model.backend {
+            self.model.backend = Some(expand_env_vars_in_string(backend));
+        }
+        if let Some(name) = &self.model.name {
+            self.model.name = Some(expand_env_vars_in_string(name));
+        }
+        if let Some(backend_url) = &self.model.backend_url {
+            self.model.backend_url = Some(expand_env_vars_in_string(backend_url));
+        }
         if let Some(permissions) = &mut self.permissions {
             if let Some(approval_policy) = &permissions.approval_policy {
                 permissions.approval_policy = Some(expand_env_vars_in_string(approval_policy));

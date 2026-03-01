@@ -6,16 +6,8 @@ pub fn clear_line() -> String {
     format!("{ESC}[K")
 }
 
-pub fn carriage_return() -> String {
-    "\r".to_string()
-}
-
 pub fn move_to(row: u16, col: u16) -> String {
     format!("{ESC}[{};{}H", row, col)
-}
-
-pub fn hide_cursor() -> String {
-    format!("{ESC}[?25l")
 }
 
 pub fn show_cursor() -> String {
