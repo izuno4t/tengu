@@ -105,7 +105,9 @@ fn default_theme() -> ThemeConfig {
 
 fn load_home_override() -> Option<ThemeConfigOpt> {
     let home = std::env::var_os("HOME")?;
-    let path = std::path::PathBuf::from(home).join(".tengu").join("theme.toml");
+    let path = std::path::PathBuf::from(home)
+        .join(".tengu")
+        .join("theme.toml");
     let content = std::fs::read_to_string(path).ok()?;
     toml::from_str(&content).ok()
 }

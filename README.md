@@ -10,8 +10,8 @@ Tengu is a flexible, multi-LLM coding agent that integrates with MCP servers, su
 - **MCP Integration**: Connect to Model Context Protocol servers
 - **Custom Agents**: Define specialized agents with custom prompts and tools
 - **Permission Control**: Fine-grained tool permissions with glob patterns
-- **Hooks & Automation**: Pre/post-execution hooks for workflow automation
-- **Project Configuration**: Hierarchical `AGENT.md` files for project context
+- **Streaming JSON**: `start` / `chunk` / `tool` / `error` / `end` events for automation
+- **Project Configuration**: Hierarchical `.tengu/TENGU.md` files for project context
 
 ## 🚀 Quick Start
 
@@ -104,6 +104,14 @@ tengu review --base main --preset security
 ```
 
 In TUI, use `/review`, `/review --base main`, or `/review --preset security`.
+You can also use `/new`, `/clear`, `/resume`, `/save`, `/save <path>`, `/load <path>`, `/fork`, and `/diff` (optionally `/diff --stat`) for local session management and quick diff inspection.
+Use `/image <path> [more_paths...]` to attach images to the next TUI prompt.
+Dragging image file paths into the TUI input also auto-attaches them for the next prompt.
+For local git actions, `/commit <message>` and `/pr [args]` ask for `y/n` confirmation before running `git commit` or `gh pr create`, and `/editor [path]` opens your `$VISUAL` or `$EDITOR`.
+Saved sessions now restore conversation history, visible logs, queued prompts, pending image attachments, and approval prompts that can be acknowledged again after restore.
+Additional TUI workflow commands now include `/plan`, `/taskwriter`, `/apply-plan`, `/compact`, `/memory`, `/init`, `/config`, `/doctor`, `/add-dir`, `/agents`, `/login`, `/logout`, `/pr_comments`, `/terminal-setup`, `/strategy`, `/bg`, `/cost`, `/model`, and `/vim`.
+`/config` supports `list`, `get <key>`, and `set <key> <value>` for common local settings such as `model.default`, `model.provider`, and `plan_mode`.
+`/cost` shows provider-agnostic session usage estimates only; exact billing still depends on each provider dashboard and pricing model.
 
 ### Image Input
 
@@ -136,11 +144,14 @@ tengu agent list
 # Use specific agent
 tengu --agent code-reviewer
 
-# Create new agent
+# Create a local scaffold
 tengu agent create my-agent
+
+# Generate an agent with the current LLM provider
+tengu agent generate
 ```
 
-`agent create` writes a local scaffold under `./.tengu/agents/`, and `--agent <name>` loads that prompt into the session.
+`agent create` writes a local scaffold under `./.tengu/agents/`, `agent generate` asks the current model to produce an agent JSON and saves it locally, and `--agent <name>` loads that prompt into the session.
 
 ### CI/CD
 
@@ -154,7 +165,7 @@ tengu agent create my-agent
 
 ## ⚙️ Configuration
 
-See [`config.toml.example`](config.toml.example) and [`AGENT.md.example`](AGENT.md.example) for full configuration options.
+Tengu reads configuration from `~/.tengu/config.toml` and `./.tengu/config.toml`.
 
 ### Basic Config (~/.tengu/config.toml)
 
@@ -185,7 +196,7 @@ divider = "grey"
 footer = "grey"
 ```
 
-### Project Context (./AGENT.md)
+### Project Context (./.tengu/TENGU.md)
 
 ```markdown
 # Project Context

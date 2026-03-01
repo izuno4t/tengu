@@ -75,9 +75,7 @@ pub fn draw(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
         let input_line = format!("{}{}", prefix, line);
         lines.push(fit_width(&input_line, width));
     }
-    while lines.len()
-        < (log_height + spacer_height + divider_height + input_rows) as usize
-    {
+    while lines.len() < (log_height + spacer_height + divider_height + input_rows) as usize {
         lines.push(String::new());
     }
 
@@ -106,7 +104,10 @@ pub fn draw(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
         )?;
     }
 
-    let app_left = format!("model: {} • build {}", state.status_model, state.status_build);
+    let app_left = format!(
+        "model: {} • build {}",
+        state.status_model, state.status_build
+    );
     let app_right = if state.suggestions.is_empty() {
         "Ctrl+C to quit • ? for shortcuts"
     } else {
@@ -251,14 +252,20 @@ fn build_status_lines(state: &AppState, width: usize) -> Vec<String> {
         ("•", THEME.status)
     };
     let status_line = format!(
-        "{}{}{} status: {} {}",
+        "{}{}{} mode: {}{} • status: {} {}",
         ansi::set_fg(bullet_color),
         bullet,
         ansi::reset(),
+        if state.plan_mode { "plan" } else { "default" },
+        if state.vim_mode { " +vim" } else { "" },
         state.status_detail,
         spinner
     );
-    vec![colorize_line(&status_line, width, ansi::set_fg(THEME.status))]
+    vec![colorize_line(
+        &status_line,
+        width,
+        ansi::set_fg(THEME.status),
+    )]
 }
 
 fn render_log_lines(lines: &[crate::tui::state::LogLine], width: usize) -> Vec<String> {
@@ -301,7 +308,10 @@ fn render_log_lines(lines: &[crate::tui::state::LogLine], width: usize) -> Vec<S
 
     if !buffer.is_empty() {
         let collapsed = collapse_thought_blocks(&buffer);
-        output.extend(render_markdown_lines(&collapse_error_blocks(&collapsed), width));
+        output.extend(render_markdown_lines(
+            &collapse_error_blocks(&collapsed),
+            width,
+        ));
     }
 
     output
@@ -477,7 +487,12 @@ fn render_markdown_lines(markdown: &str, width: usize) -> Vec<String> {
                 if blockquote_depth > 0 && current.is_empty() {
                     current.push_str("> ");
                 }
-                let styled = format!("{}{}{}", ansi::set_fg(THEME.inline_code), text, ansi::reset());
+                let styled = format!(
+                    "{}{}{}",
+                    ansi::set_fg(THEME.inline_code),
+                    text,
+                    ansi::reset()
+                );
                 current.push_str(&styled);
             }
             Event::SoftBreak => {
@@ -508,13 +523,11 @@ fn collapse_error_blocks(text: &str) -> String {
     let mut in_detail = false;
     for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("error:") || trimmed.starts_with("error ") || trimmed.starts_with("ERROR") {
-            let styled = format!(
-                "{}{}{}",
-                ansi::set_fg(THEME.error),
-                trimmed,
-                ansi::reset()
-            );
+        if trimmed.starts_with("error:")
+            || trimmed.starts_with("error ")
+            || trimmed.starts_with("ERROR")
+        {
+            let styled = format!("{}{}{}", ansi::set_fg(THEME.error), trimmed, ansi::reset());
             out.push(styled);
             in_detail = true;
             continue;

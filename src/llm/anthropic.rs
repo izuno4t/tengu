@@ -4,7 +4,9 @@ use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::llm::{LlmBackend, LlmProvider, LlmRequest, LlmResponse, LlmStream};
+use crate::llm::{
+    LlmBackend, LlmProvider, LlmRequest, LlmResponse, LlmStream, LlmStreamEvent, LlmUsage,
+};
 
 const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -33,12 +35,8 @@ struct MessageInput {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum MessageContentBlock {
-    Text {
-        text: String,
-    },
-    Image {
-        source: ImageSource,
-    },
+    Text { text: String },
+    Image { source: ImageSource },
 }
 
 #[derive(Debug, Serialize)]
@@ -52,6 +50,20 @@ struct ImageSource {
 #[derive(Debug, Deserialize)]
 struct MessageResponse {
     content: Vec<ContentBlock>,
+    #[serde(default)]
+    usage: Option<MessageUsage>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct MessageUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,8 +91,7 @@ impl AnthropicBackend {
     }
 
     fn api_key(&self) -> Result<String> {
-        std::env::var("ANTHROPIC_API_KEY")
-            .map_err(|_| anyhow!("ANTHROPIC_API_KEY is not set"))
+        std::env::var("ANTHROPIC_API_KEY").map_err(|_| anyhow!("ANTHROPIC_API_KEY is not set"))
     }
 
     fn request_body(&self, model: &str, request: &LlmRequest, stream: bool) -> MessageRequest {
@@ -116,7 +127,35 @@ impl AnthropicBackend {
             .join("")
     }
 
-    fn parse_stream_event(data: &str) -> Result<Option<String>> {
+    fn normalize_usage(usage: MessageUsage, raw: Option<Value>) -> LlmUsage {
+        let total_tokens = match (usage.input_tokens, usage.output_tokens) {
+            (Some(input), Some(output)) => Some(input + output),
+            _ => None,
+        };
+        LlmUsage {
+            provider: "anthropic".to_string(),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            reasoning_tokens: None,
+            raw,
+        }
+    }
+
+    fn extract_usage_value(value: &Value) -> Option<LlmUsage> {
+        let usage_value = value.get("usage").cloned().or_else(|| {
+            value
+                .get("message")
+                .and_then(|msg| msg.get("usage"))
+                .cloned()
+        })?;
+        let usage = serde_json::from_value::<MessageUsage>(usage_value.clone()).ok()?;
+        Some(Self::normalize_usage(usage, Some(usage_value)))
+    }
+
+    fn parse_stream_event(data: &str) -> Result<Option<LlmStreamEvent>> {
         let payload = data.trim();
         if payload.is_empty() || payload == "[DONE]" {
             return Ok(None);
@@ -131,12 +170,16 @@ impl AnthropicBackend {
             return Err(anyhow!("anthropic stream error: {}", error));
         }
 
+        if let Some(usage) = Self::extract_usage_value(&value) {
+            return Ok(Some(LlmStreamEvent::Usage(usage)));
+        }
+
         if let Some(text) = value
             .get("delta")
             .and_then(|delta| delta.get("text"))
             .and_then(Value::as_str)
         {
-            return Ok(Some(text.to_string()));
+            return Ok(Some(LlmStreamEvent::Text(text.to_string())));
         }
 
         if let Some(text) = value
@@ -145,7 +188,7 @@ impl AnthropicBackend {
             .and_then(Value::as_str)
         {
             if !text.is_empty() {
-                return Ok(Some(text.to_string()));
+                return Ok(Some(LlmStreamEvent::Text(text.to_string())));
             }
         }
 
@@ -180,6 +223,7 @@ impl LlmBackend for AnthropicBackend {
         let body: MessageResponse = response.json().await?;
         Ok(LlmResponse {
             content: Self::collect_text(body.content),
+            usage: body.usage.map(|usage| Self::normalize_usage(usage, None)),
         })
     }
 
@@ -209,7 +253,7 @@ impl LlmBackend for AnthropicBackend {
             finished: bool,
         }
 
-        fn take_message(state: &mut StreamState) -> Result<Option<String>> {
+        fn take_message(state: &mut StreamState) -> Result<Option<LlmStreamEvent>> {
             while let Some(idx) = state.buffer.find('\n') {
                 let mut line = state.buffer[..idx].to_string();
                 state.buffer = state.buffer[idx + 1..].to_string();
@@ -287,7 +331,7 @@ impl LlmBackend for AnthropicBackend {
             }
         });
 
-        Ok(Box::pin(output) as BoxStream<'static, Result<String>>)
+        Ok(Box::pin(output) as BoxStream<'static, Result<LlmStreamEvent>>)
     }
 }
 
@@ -298,13 +342,17 @@ mod tests {
     #[test]
     fn builds_messages_url_from_default_base() {
         let backend = AnthropicBackend::new(None, None);
-        assert_eq!(backend.messages_url(), "https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            backend.messages_url(),
+            "https://api.anthropic.com/v1/messages"
+        );
     }
 
     #[test]
     fn parses_text_delta_from_stream_payload() {
-        let payload = r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}"#;
+        let payload =
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}"#;
         let parsed = AnthropicBackend::parse_stream_event(payload).unwrap();
-        assert_eq!(parsed.as_deref(), Some("hello"));
+        assert!(matches!(parsed, Some(LlmStreamEvent::Text(text)) if text == "hello"));
     }
 }

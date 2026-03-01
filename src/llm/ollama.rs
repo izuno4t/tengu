@@ -1,9 +1,11 @@
 use anyhow::{anyhow, Result};
-use futures_util::stream::{self, BoxStream, StreamExt};
 use bytes::Bytes;
+use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 
-use crate::llm::{LlmBackend, LlmProvider, LlmRequest, LlmResponse, LlmStream};
+use crate::llm::{
+    LlmBackend, LlmProvider, LlmRequest, LlmResponse, LlmStream, LlmStreamEvent, LlmUsage,
+};
 
 #[derive(Debug, Clone)]
 pub struct OllamaBackend {
@@ -22,12 +24,20 @@ struct GenerateRequest {
 #[derive(Debug, Deserialize)]
 struct GenerateResponse {
     response: String,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    eval_count: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct GenerateStreamResponse {
     response: String,
     done: bool,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    eval_count: Option<u64>,
 }
 
 impl OllamaBackend {
@@ -42,6 +52,28 @@ impl OllamaBackend {
         } else {
             format!("{}/api/generate", base)
         }
+    }
+
+    fn normalize_usage(
+        prompt_eval_count: Option<u64>,
+        eval_count: Option<u64>,
+    ) -> Option<LlmUsage> {
+        if prompt_eval_count.is_none() && eval_count.is_none() {
+            return None;
+        }
+        Some(LlmUsage {
+            provider: "local".to_string(),
+            input_tokens: prompt_eval_count,
+            output_tokens: eval_count,
+            total_tokens: match (prompt_eval_count, eval_count) {
+                (Some(input), Some(output)) => Some(input + output),
+                _ => None,
+            },
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+            reasoning_tokens: None,
+            raw: None,
+        })
     }
 }
 
@@ -76,6 +108,7 @@ impl LlmBackend for OllamaBackend {
         let body: GenerateResponse = response.json().await?;
         Ok(LlmResponse {
             content: body.response,
+            usage: Self::normalize_usage(body.prompt_eval_count, body.eval_count),
         })
     }
 
@@ -105,12 +138,14 @@ impl LlmBackend for OllamaBackend {
         struct StreamState {
             stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
             buffer: String,
+            pending_usage: Option<LlmUsage>,
             done: bool,
         }
 
         let state = StreamState {
             stream: Box::pin(response.bytes_stream()),
             buffer: String::new(),
+            pending_usage: None,
             done: false,
         };
 
@@ -119,6 +154,11 @@ impl LlmBackend for OllamaBackend {
                 return None;
             }
             loop {
+                if let Some(usage) = state.pending_usage.take() {
+                    state.done = true;
+                    return Some((Ok(LlmStreamEvent::Usage(usage)), state));
+                }
+
                 if let Some(idx) = state.buffer.find('\n') {
                     let line = state.buffer[..idx].to_string();
                     state.buffer = state.buffer[idx + 1..].to_string();
@@ -129,16 +169,26 @@ impl LlmBackend for OllamaBackend {
                     match serde_json::from_str::<GenerateStreamResponse>(line) {
                         Ok(msg) => {
                             if msg.done {
+                                state.pending_usage = OllamaBackend::normalize_usage(
+                                    msg.prompt_eval_count,
+                                    msg.eval_count,
+                                );
                                 if msg.response.is_empty() {
+                                    if let Some(usage) = state.pending_usage.take() {
+                                        state.done = true;
+                                        return Some((Ok(LlmStreamEvent::Usage(usage)), state));
+                                    }
                                     return None;
                                 }
-                                state.done = true;
                             }
-                            return Some((Ok(msg.response), state));
+                            return Some((Ok(LlmStreamEvent::Text(msg.response)), state));
                         }
                         Err(err) => {
                             state.done = true;
-                            return Some((Err(anyhow!("ollama stream parse error: {}", err)), state));
+                            return Some((
+                                Err(anyhow!("ollama stream parse error: {}", err)),
+                                state,
+                            ));
                         }
                     }
                 }
@@ -159,12 +209,24 @@ impl LlmBackend for OllamaBackend {
                         state.buffer.clear();
                         match serde_json::from_str::<GenerateStreamResponse>(line.trim()) {
                             Ok(msg) => {
-                                state.done = true;
-                                return Some((Ok(msg.response), state));
+                                state.pending_usage = OllamaBackend::normalize_usage(
+                                    msg.prompt_eval_count,
+                                    msg.eval_count,
+                                );
+                                if msg.response.is_empty() {
+                                    if let Some(usage) = state.pending_usage.take() {
+                                        state.done = true;
+                                        return Some((Ok(LlmStreamEvent::Usage(usage)), state));
+                                    }
+                                }
+                                return Some((Ok(LlmStreamEvent::Text(msg.response)), state));
                             }
                             Err(err) => {
                                 state.done = true;
-                                return Some((Err(anyhow!("ollama stream parse error: {}", err)), state));
+                                return Some((
+                                    Err(anyhow!("ollama stream parse error: {}", err)),
+                                    state,
+                                ));
                             }
                         }
                     }
@@ -172,6 +234,6 @@ impl LlmBackend for OllamaBackend {
             }
         });
 
-        Ok(Box::pin(output) as BoxStream<'static, Result<String>>)
+        Ok(Box::pin(output) as BoxStream<'static, Result<LlmStreamEvent>>)
     }
 }

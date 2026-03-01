@@ -39,10 +39,7 @@ pub fn parse_review_args(args: &[&str]) -> Result<ReviewOptions> {
 }
 
 pub fn build_review_prompt(options: &ReviewOptions) -> Result<Option<String>> {
-    let range = options
-        .base
-        .as_deref()
-        .map(|base| format!("{base}...HEAD"));
+    let range = options.base.as_deref().map(|base| format!("{base}...HEAD"));
 
     let stat = run_git_diff(range.as_deref(), true)?;
     let diff = run_git_diff(range.as_deref(), false)?;
@@ -146,7 +143,8 @@ mod tests {
 
     #[test]
     fn returns_none_when_diff_is_empty() {
-        let prompt = build_review_prompt_from_diff(" no files changed", "", &ReviewOptions::default());
+        let prompt =
+            build_review_prompt_from_diff(" no files changed", "", &ReviewOptions::default());
         assert!(prompt.is_none());
     }
 }

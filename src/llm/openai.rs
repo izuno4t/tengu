@@ -4,7 +4,9 @@ use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::llm::{LlmBackend, LlmProvider, LlmRequest, LlmResponse, LlmStream};
+use crate::llm::{
+    LlmBackend, LlmProvider, LlmRequest, LlmResponse, LlmStream, LlmStreamEvent, LlmUsage,
+};
 
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -21,6 +23,13 @@ struct ChatCompletionRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -32,6 +41,34 @@ struct ChatMessage {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    total_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<OpenAiCompletionTokensDetails>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct OpenAiCompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,7 +102,12 @@ impl OpenAiBackend {
         std::env::var("OPENAI_API_KEY").map_err(|_| anyhow!("OPENAI_API_KEY is not set"))
     }
 
-    fn request_body(&self, model: &str, request: &LlmRequest, stream: bool) -> ChatCompletionRequest {
+    fn request_body(
+        &self,
+        model: &str,
+        request: &LlmRequest,
+        stream: bool,
+    ) -> ChatCompletionRequest {
         let content = if request.images.is_empty() {
             Value::String(request.prompt.clone())
         } else {
@@ -91,10 +133,35 @@ impl OpenAiBackend {
             }],
             stream,
             max_tokens: self.max_tokens,
+            stream_options: stream.then_some(StreamOptions {
+                include_usage: true,
+            }),
         }
     }
 
-    fn parse_stream_data(data: &str) -> Result<Option<String>> {
+    fn normalize_usage(usage: OpenAiUsage, raw: Option<Value>) -> LlmUsage {
+        LlmUsage {
+            provider: "openai".to_string(),
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens.or_else(|| {
+                match (usage.prompt_tokens, usage.completion_tokens) {
+                    (Some(input), Some(output)) => Some(input + output),
+                    _ => None,
+                }
+            }),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: usage
+                .prompt_tokens_details
+                .and_then(|details| details.cached_tokens),
+            reasoning_tokens: usage
+                .completion_tokens_details
+                .and_then(|details| details.reasoning_tokens),
+            raw,
+        }
+    }
+
+    fn parse_stream_data(data: &str) -> Result<Option<LlmStreamEvent>> {
         let payload = data.trim();
         if payload.is_empty() || payload == "[DONE]" {
             return Ok(None);
@@ -107,6 +174,15 @@ impl OpenAiBackend {
             .and_then(Value::as_str)
         {
             return Err(anyhow!("openai stream error: {}", error));
+        }
+
+        if let Some(usage_value) = value.get("usage").cloned() {
+            if let Ok(usage) = serde_json::from_value::<OpenAiUsage>(usage_value.clone()) {
+                return Ok(Some(LlmStreamEvent::Usage(Self::normalize_usage(
+                    usage,
+                    Some(usage_value),
+                ))));
+            }
         }
 
         let Some(choice) = value
@@ -123,7 +199,7 @@ impl OpenAiBackend {
 
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
             if !text.is_empty() {
-                return Ok(Some(text.to_string()));
+                return Ok(Some(LlmStreamEvent::Text(text.to_string())));
             }
         }
 
@@ -169,7 +245,10 @@ impl LlmBackend for OpenAiBackend {
                 _ => String::new(),
             })
             .unwrap_or_default();
-        Ok(LlmResponse { content })
+        Ok(LlmResponse {
+            content,
+            usage: body.usage.map(|usage| Self::normalize_usage(usage, None)),
+        })
     }
 
     async fn generate_stream(&self, model: &str, request: &LlmRequest) -> Result<LlmStream> {
@@ -196,7 +275,7 @@ impl LlmBackend for OpenAiBackend {
             finished: bool,
         }
 
-        fn take_message(state: &mut StreamState) -> Result<Option<String>> {
+        fn take_message(state: &mut StreamState) -> Result<Option<LlmStreamEvent>> {
             while let Some(idx) = state.buffer.find('\n') {
                 let mut line = state.buffer[..idx].to_string();
                 state.buffer = state.buffer[idx + 1..].to_string();
@@ -267,7 +346,7 @@ impl LlmBackend for OpenAiBackend {
             }
         });
 
-        Ok(Box::pin(output) as BoxStream<'static, Result<String>>)
+        Ok(Box::pin(output) as BoxStream<'static, Result<LlmStreamEvent>>)
     }
 }
 
@@ -288,6 +367,6 @@ mod tests {
     fn parses_content_delta_from_stream_payload() {
         let payload = r#"{"choices":[{"delta":{"content":"hello"}}]}"#;
         let parsed = OpenAiBackend::parse_stream_data(payload).unwrap();
-        assert_eq!(parsed.as_deref(), Some("hello"));
+        assert!(matches!(parsed, Some(LlmStreamEvent::Text(text)) if text == "hello"));
     }
 }

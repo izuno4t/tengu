@@ -2,8 +2,7 @@ use crate::agent::{AgentOutput, AgentRunner, AgentStore, StoredAgent};
 use crate::config::Config;
 use crate::llm::{
     AnthropicBackend, GoogleBackend, LlmBackend, LlmClient, LlmImage, LlmProvider, LlmRequest,
-    OllamaBackend,
-    OpenAiBackend,
+    LlmStreamEvent, LlmUsage, OllamaBackend, OpenAiBackend,
 };
 use crate::mcp::{list_tools_http, list_tools_stdio, McpServerConfig, McpStore};
 use crate::review::{build_review_prompt, ReviewOptions};
@@ -281,7 +280,8 @@ impl Cli {
             Commands::Tool { command } => self.execute_tool_command(command).await,
             Commands::Tui => self.execute_tui().await,
             Commands::Review { base, preset } => {
-                self.execute_review_command(base.clone(), preset.clone()).await
+                self.execute_review_command(base.clone(), preset.clone())
+                    .await
             }
             Commands::Resume { session_id, last } => {
                 let store = SessionStore::new(SessionStore::default_root()?);
@@ -424,9 +424,7 @@ impl Cli {
                 }
                 Ok(())
             }
-            AgentCommands::Generate => {
-                self.generate_agent_with_llm(&store).await
-            }
+            AgentCommands::Generate => self.generate_agent_with_llm(&store).await,
         }
     }
 
@@ -468,7 +466,10 @@ impl Cli {
         match command {
             AuthCommands::Login => {
                 let Some(env_name) = required_env else {
-                    return Err(anyhow!("auth login is unsupported for provider: {}", provider_name));
+                    return Err(anyhow!(
+                        "auth login is unsupported for provider: {}",
+                        provider_name
+                    ));
                 };
                 if std::env::var(env_name).is_err() {
                     return Err(anyhow!("{} is not set", env_name));
@@ -561,13 +562,23 @@ impl Cli {
         let runner = AgentRunner::new(client, model_name, policy);
 
         if self.output_format == "stream-json" {
-            let (mut stream, _tool_result) =
-                runner.handle_prompt_stream_with_tool_context(&prompt, "").await?;
+            let (mut stream, _tool_result) = runner
+                .handle_prompt_stream_with_tool_context(&prompt, "")
+                .await?;
             println!("{}", json!({ "type": "start", "mode": "review" }));
             while let Some(chunk) = stream.next().await {
                 match chunk {
-                    Ok(text) => {
-                        println!("{}", json!({ "type": "chunk", "mode": "review", "delta": text }));
+                    Ok(LlmStreamEvent::Text(text)) => {
+                        println!(
+                            "{}",
+                            json!({ "type": "chunk", "mode": "review", "delta": text })
+                        );
+                    }
+                    Ok(LlmStreamEvent::Usage(usage)) => {
+                        println!(
+                            "{}",
+                            json!({ "type": "usage", "mode": "review", "usage": usage_to_json(&usage) })
+                        );
                     }
                     Err(err) => {
                         println!(
@@ -626,10 +637,16 @@ impl Cli {
                     println!("{}", json!({ "type": "start", "mode": "llm" }));
                     while let Some(chunk) = stream.next().await {
                         match chunk {
-                            Ok(text) => {
+                            Ok(LlmStreamEvent::Text(text)) => {
                                 println!(
                                     "{}",
                                     json!({ "type": "chunk", "mode": "llm", "delta": text })
+                                );
+                            }
+                            Ok(LlmStreamEvent::Usage(usage)) => {
+                                println!(
+                                    "{}",
+                                    json!({ "type": "usage", "mode": "llm", "usage": usage_to_json(&usage) })
                                 );
                             }
                             Err(err) => {
@@ -647,18 +664,23 @@ impl Cli {
                 }
                 let policy = ToolPolicy::from_config(&config);
                 let runner = AgentRunner::new(client, model_name, policy);
-                let (mut stream, tool_result) =
-                    runner
-                        .handle_prompt_stream_with_tool_context(&request.prompt, "")
-                        .await?;
+                let (mut stream, tool_result) = runner
+                    .handle_prompt_stream_with_tool_context(&request.prompt, "")
+                    .await?;
 
                 println!("{}", json!({ "type": "start", "mode": "llm" }));
                 while let Some(chunk) = stream.next().await {
                     match chunk {
-                        Ok(text) => {
+                        Ok(LlmStreamEvent::Text(text)) => {
                             println!(
                                 "{}",
                                 json!({ "type": "chunk", "mode": "llm", "delta": text })
+                            );
+                        }
+                        Ok(LlmStreamEvent::Usage(usage)) => {
+                            println!(
+                                "{}",
+                                json!({ "type": "usage", "mode": "llm", "usage": usage_to_json(&usage) })
                             );
                         }
                         Err(err) => {
@@ -704,12 +726,28 @@ impl Cli {
             let (client, model_name) = self.resolve_llm_with_config(&config)?;
             if !request.images.is_empty() {
                 let output = client.generate(&model_name, &request).await?;
+                if self.output_format == "json" {
+                    if let Some(usage) = output.usage.as_ref() {
+                        println!(
+                            "{}",
+                            json!({ "type": "usage", "usage": usage_to_json(usage) })
+                        );
+                    }
+                }
                 self.print_output("llm", &output.content, Some(prompt));
                 return Ok(());
             }
             let policy = ToolPolicy::from_config(&config);
             let runner = AgentRunner::new(client, model_name, policy);
             let output = runner.handle_prompt(&request.prompt).await?;
+            if self.output_format == "json" {
+                if let Some(usage) = output.response.usage.as_ref() {
+                    println!(
+                        "{}",
+                        json!({ "type": "usage", "usage": usage_to_json(usage) })
+                    );
+                }
+            }
             self.print_output("llm", &output.response.content, Some(prompt));
             self.print_tool_result(&output);
         }
@@ -911,8 +949,8 @@ impl Cli {
              - do not include markdown fences or extra commentary",
         );
         let response = client.generate(&model_name, &request).await?;
-        let agent = parse_generated_agent(&response.content)
-            .unwrap_or_else(|_| fallback_generated_agent());
+        let agent =
+            parse_generated_agent(&response.content).unwrap_or_else(|_| fallback_generated_agent());
         let path = store.save_local(&agent)?;
         println!("agent generated: {}", path.display());
         Ok(())
@@ -1030,6 +1068,19 @@ fn clear_auth_session_at(path: &Path) -> Result<()> {
         fs::remove_file(path)?;
     }
     Ok(())
+}
+
+fn usage_to_json(usage: &LlmUsage) -> serde_json::Value {
+    json!({
+        "provider": &usage.provider,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens,
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+        "cache_read_input_tokens": usage.cache_read_input_tokens,
+        "reasoning_tokens": usage.reasoning_tokens,
+        "raw": usage.raw.as_ref(),
+    })
 }
 
 fn parse_generated_agent(raw: &str) -> Result<StoredAgent> {
@@ -1153,7 +1204,10 @@ mod tests {
 
     #[test]
     fn maps_provider_to_expected_auth_env_var() {
-        assert_eq!(auth_env_var_for_provider("anthropic"), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(
+            auth_env_var_for_provider("anthropic"),
+            Some("ANTHROPIC_API_KEY")
+        );
         assert_eq!(auth_env_var_for_provider("openai"), Some("OPENAI_API_KEY"));
         assert_eq!(auth_env_var_for_provider("gemini"), Some("GOOGLE_API_KEY"));
         assert_eq!(auth_env_var_for_provider("local"), None);

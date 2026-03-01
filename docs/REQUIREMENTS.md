@@ -871,15 +871,20 @@ description: セキュリティレビューを実行
 # エージェント一覧
 $ your-agent agent list
 
-# エージェント作成（対話式）
+# エージェント作成（ローカルひな形）
 $ your-agent agent create my-agent
 
-# エージェント生成
+# エージェント生成（現在のLLMでJSON作成）
 $ your-agent agent generate
 
 # エージェント指定で起動
 $ your-agent --agent code-reviewer
 ```
+
+**現行実装メモ:**
+- `tengu agent create <name>` は `./.tengu/agents/<name>.json` にローカルひな形を作成する
+- `tengu agent generate` は現在のモデル設定を使って `name/description/prompt` を生成し、ローカルへ保存する
+- `--agent <name>` はローカル優先でエージェント定義を読み込み、システムプロンプトへ連結する
 
 #### 8.2.2 エージェント起動
 区分: 基準先行 + 拡張統合
@@ -1086,14 +1091,14 @@ openai_api_key_env = "OPENAI_API_KEY"
 #### 12.1.2 OAuth認証
 区分: 多ベンダー拡張
 ```bash
-# ブラウザ経由で認証
-$ your-agent login
+# 認証状態を保存
+$ your-agent auth login
 
 # ステータス確認
 $ your-agent auth status
 
 # ログアウト
-$ your-agent logout
+$ your-agent auth logout
 ```
 
 ### 12.2 セッショントークン管理

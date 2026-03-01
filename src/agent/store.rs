@@ -61,7 +61,10 @@ impl AgentStore {
                 }
                 let data = fs::read_to_string(&path)?;
                 let agent: StoredAgent = serde_json::from_str(&data)?;
-                if !agents.iter().any(|existing: &StoredAgent| existing.name == agent.name) {
+                if !agents
+                    .iter()
+                    .any(|existing: &StoredAgent| existing.name == agent.name)
+                {
                     agents.push(agent);
                 }
             }

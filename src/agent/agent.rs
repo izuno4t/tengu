@@ -3,15 +3,14 @@
 
 use anyhow::Result;
 use futures_util::future::BoxFuture;
-use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::llm::{LlmClient, LlmRequest, LlmResponse, LlmStream};
 use crate::tools::{
-    ApprovalOverride, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequired, ToolExecutor,
-    ToolInput, ToolPolicy, ToolResult,
+    ApprovalOverride, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequired,
+    ToolExecutor, ToolInput, ToolPolicy, ToolResult,
 };
 
 #[allow(dead_code)]
@@ -89,24 +88,66 @@ impl AgentRunner {
         self.handle_prompt_with_context(input, "").await
     }
 
+    pub async fn handle_request_with_context(
+        &self,
+        request: LlmRequest,
+        context: &str,
+    ) -> Result<AgentOutput> {
+        if request.images.is_empty() {
+            return self
+                .handle_prompt_with_context(&request.prompt, context)
+                .await;
+        }
+        let final_prompt = if context.trim().is_empty() {
+            request.prompt
+        } else {
+            format!(
+                "Conversation context:\n{}\n\nUser request:\n{}",
+                context, request.prompt
+            )
+        };
+        let final_response = self
+            .client
+            .generate(
+                &self.model_name,
+                &LlmRequest {
+                    prompt: final_prompt,
+                    images: request.images,
+                },
+            )
+            .await?;
+        Ok(AgentOutput {
+            response: LlmResponse {
+                content: final_response.content.trim().to_string(),
+                usage: final_response.usage,
+            },
+            tool_result: None,
+        })
+    }
+
     pub async fn handle_prompt_with_context(
         &self,
         input: &str,
         context: &str,
     ) -> Result<AgentOutput> {
-        let (_plan, final_prompt, tool_result) =
-            self.resolve_final_prompt_with_context(input, context)
-                .await?;
+        let (_plan, final_prompt, tool_result) = self
+            .resolve_final_prompt_with_context(input, context)
+            .await?;
         let final_response = self
             .client
             .generate(&self.model_name, &LlmRequest::text(final_prompt))
             .await?;
         let response = LlmResponse {
             content: final_response.content.trim().to_string(),
+            usage: final_response.usage,
         };
-        Ok(AgentOutput { response, tool_result })
+        Ok(AgentOutput {
+            response,
+            tool_result,
+        })
     }
 
+    #[allow(dead_code)]
     pub async fn handle_prompt_stream_with_context(
         &self,
         input: &str,
@@ -118,19 +159,50 @@ impl AgentRunner {
         Ok(stream)
     }
 
+    pub async fn handle_request_stream_with_context(
+        &self,
+        request: LlmRequest,
+        context: &str,
+    ) -> Result<(LlmStream, Option<ToolResult>)> {
+        if request.images.is_empty() {
+            return self
+                .handle_prompt_stream_with_tool_context(&request.prompt, context)
+                .await;
+        }
+        let final_prompt = if context.trim().is_empty() {
+            request.prompt
+        } else {
+            format!(
+                "Conversation context:\n{}\n\nUser request:\n{}",
+                context, request.prompt
+            )
+        };
+        let stream = self
+            .client
+            .generate_stream(
+                &self.model_name,
+                &LlmRequest {
+                    prompt: final_prompt,
+                    images: request.images,
+                },
+            )
+            .await?;
+        Ok((stream, None))
+    }
+
     pub async fn handle_prompt_stream_with_tool_context(
         &self,
         input: &str,
         context: &str,
     ) -> Result<(LlmStream, Option<ToolResult>)> {
-        let (_plan, final_prompt, tool_result) =
-            self.resolve_final_prompt_with_context(input, context)
-                .await?;
+        let (_plan, final_prompt, tool_result) = self
+            .resolve_final_prompt_with_context(input, context)
+            .await?;
         let stream = self
             .client
             .generate_stream(&self.model_name, &LlmRequest::text(final_prompt))
             .await?;
-        Ok((Box::pin(stream) as BoxStream<'static, Result<String>>, tool_result))
+        Ok((stream, tool_result))
     }
 
     fn execute_tool_call(&self, call: ToolCall) -> Result<ToolResult> {
@@ -158,6 +230,14 @@ impl AgentRunner {
 }
 
 impl AgentRunner {
+    pub async fn generate_plan_text_with_context(
+        &self,
+        input: &str,
+        context: &str,
+    ) -> Result<String> {
+        self.generate_plan_with_context(input, context).await
+    }
+
     async fn generate_plan_with_context(&self, input: &str, context: &str) -> Result<String> {
         let prompt = build_plan_prompt_with_context(input, context);
         let response = self
@@ -200,10 +280,9 @@ impl AgentRunner {
                             match self.request_approval(request).await {
                                 Ok(decision) => match decision {
                                     ToolApprovalDecision::AllowOnce => {
-                                        self.tool_policy
-                                            .set_approval_override(ApprovalOverride::AllowOnce(
-                                                required.tool,
-                                            ));
+                                        self.tool_policy.set_approval_override(
+                                            ApprovalOverride::AllowOnce(required.tool),
+                                        );
                                         continue;
                                     }
                                     ToolApprovalDecision::AllowAll => {
@@ -279,10 +358,9 @@ impl AgentRunner {
                         match self.request_approval(request).await {
                             Ok(decision) => match decision {
                                 ToolApprovalDecision::AllowOnce => {
-                                    self.tool_policy
-                                        .set_approval_override(ApprovalOverride::AllowOnce(
-                                            required.tool,
-                                        ));
+                                    self.tool_policy.set_approval_override(
+                                        ApprovalOverride::AllowOnce(required.tool),
+                                    );
                                     continue;
                                 }
                                 ToolApprovalDecision::AllowAll => {
@@ -328,10 +406,7 @@ impl AgentRunner {
         Err(anyhow::anyhow!("final prompt is missing"))
     }
 
-    async fn request_approval(
-        &self,
-        request: ToolApprovalRequest,
-    ) -> Result<ToolApprovalDecision> {
+    async fn request_approval(&self, request: ToolApprovalRequest) -> Result<ToolApprovalDecision> {
         let handler = self
             .approval_handler
             .lock()

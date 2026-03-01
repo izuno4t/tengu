@@ -4,7 +4,9 @@ use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::llm::{LlmBackend, LlmProvider, LlmRequest, LlmResponse, LlmStream};
+use crate::llm::{
+    LlmBackend, LlmProvider, LlmRequest, LlmResponse, LlmStream, LlmStreamEvent, LlmUsage,
+};
 
 const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -41,6 +43,22 @@ struct GoogleInlineData {
 #[derive(Debug, Deserialize)]
 struct GenerateContentResponse {
     candidates: Option<Vec<GoogleCandidate>>,
+    #[serde(rename = "usageMetadata", default)]
+    usage_metadata: Option<GoogleUsageMetadata>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct GoogleUsageMetadata {
+    #[serde(rename = "promptTokenCount", default)]
+    prompt_token_count: Option<u64>,
+    #[serde(rename = "candidatesTokenCount", default)]
+    candidates_token_count: Option<u64>,
+    #[serde(rename = "totalTokenCount", default)]
+    total_token_count: Option<u64>,
+    #[serde(rename = "cachedContentTokenCount", default)]
+    cached_content_token_count: Option<u64>,
+    #[serde(rename = "thoughtsTokenCount", default)]
+    thoughts_token_count: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,9 +102,7 @@ impl GoogleBackend {
             });
         }
         GenerateContentRequest {
-            contents: vec![GoogleContent {
-                parts,
-            }],
+            contents: vec![GoogleContent { parts }],
         }
     }
 
@@ -125,7 +141,25 @@ impl GoogleBackend {
             .join("")
     }
 
-    fn parse_stream_data(data: &str) -> Result<Option<String>> {
+    fn normalize_usage(usage: GoogleUsageMetadata, raw: Option<Value>) -> LlmUsage {
+        LlmUsage {
+            provider: "google".to_string(),
+            input_tokens: usage.prompt_token_count,
+            output_tokens: usage.candidates_token_count,
+            total_tokens: usage.total_token_count.or_else(|| {
+                match (usage.prompt_token_count, usage.candidates_token_count) {
+                    (Some(input), Some(output)) => Some(input + output),
+                    _ => None,
+                }
+            }),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: usage.cached_content_token_count,
+            reasoning_tokens: usage.thoughts_token_count,
+            raw,
+        }
+    }
+
+    fn parse_stream_data(data: &str) -> Result<Option<LlmStreamEvent>> {
         let payload = data.trim();
         if payload.is_empty() || payload == "[DONE]" {
             return Ok(None);
@@ -138,11 +172,19 @@ impl GoogleBackend {
         {
             return Err(anyhow!("google stream error: {}", error));
         }
+        if let Some(usage_value) = value.get("usageMetadata").cloned() {
+            if let Ok(usage) = serde_json::from_value::<GoogleUsageMetadata>(usage_value.clone()) {
+                return Ok(Some(LlmStreamEvent::Usage(Self::normalize_usage(
+                    usage,
+                    Some(usage_value),
+                ))));
+            }
+        }
         let text = Self::extract_text(&value);
         if text.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(text))
+            Ok(Some(LlmStreamEvent::Text(text)))
         }
     }
 }
@@ -181,7 +223,12 @@ impl LlmBackend for GoogleBackend {
             .filter_map(|part| part.text)
             .collect::<Vec<_>>()
             .join("");
-        Ok(LlmResponse { content })
+        Ok(LlmResponse {
+            content,
+            usage: body
+                .usage_metadata
+                .map(|usage| Self::normalize_usage(usage, None)),
+        })
     }
 
     async fn generate_stream(&self, model: &str, request: &LlmRequest) -> Result<LlmStream> {
@@ -207,7 +254,7 @@ impl LlmBackend for GoogleBackend {
             finished: bool,
         }
 
-        fn take_message(state: &mut StreamState) -> Result<Option<String>> {
+        fn take_message(state: &mut StreamState) -> Result<Option<LlmStreamEvent>> {
             while let Some(idx) = state.buffer.find('\n') {
                 let mut line = state.buffer[..idx].to_string();
                 state.buffer = state.buffer[idx + 1..].to_string();
@@ -278,7 +325,7 @@ impl LlmBackend for GoogleBackend {
             }
         });
 
-        Ok(Box::pin(output) as BoxStream<'static, Result<String>>)
+        Ok(Box::pin(output) as BoxStream<'static, Result<LlmStreamEvent>>)
     }
 }
 
@@ -300,6 +347,6 @@ mod tests {
     fn parses_text_from_stream_payload() {
         let payload = r#"{"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}"#;
         let parsed = GoogleBackend::parse_stream_data(payload).unwrap();
-        assert_eq!(parsed.as_deref(), Some("hello"));
+        assert!(matches!(parsed, Some(LlmStreamEvent::Text(text)) if text == "hello"));
     }
 }

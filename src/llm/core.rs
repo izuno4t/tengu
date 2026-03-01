@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use futures_util::stream::BoxStream;
+use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmProvider {
@@ -24,6 +25,25 @@ impl LlmProvider {
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
     pub content: String,
+    pub usage: Option<LlmUsage>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LlmUsage {
+    pub provider: String,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub raw: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub enum LlmStreamEvent {
+    Text(String),
+    Usage(LlmUsage),
 }
 
 #[derive(Debug, Clone)]
@@ -47,7 +67,7 @@ impl LlmRequest {
     }
 }
 
-pub type LlmStream = BoxStream<'static, Result<String>>;
+pub type LlmStream = BoxStream<'static, Result<LlmStreamEvent>>;
 
 pub struct LlmClient {
     backend: Box<dyn LlmBackend + Send + Sync>,
