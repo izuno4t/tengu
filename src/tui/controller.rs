@@ -1,4 +1,6 @@
 use std::io::{self, Stdout, Write};
+use std::fs;
+use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
@@ -15,6 +17,7 @@ use tokio::sync::oneshot;
 use crate::agent::AgentRunner;
 use crate::config::Config;
 use crate::mcp::McpStore;
+use crate::review::{build_review_prompt, parse_review_args};
 use crate::tui::render;
 use crate::tui::state::{AppState, ApprovalPending, TuiEvent};
 use crate::tools::{Tool, ToolApprovalDecision, ToolApprovalRequest};
@@ -94,10 +97,10 @@ impl App {
                             self.state.should_quit = true;
                         }
                     }
-                    if self.state.approval_pending.is_some() {
-                        if self.handle_approval_key(&key.code) {
-                            continue;
-                        }
+                    if self.state.approval_pending.is_some()
+                        && self.handle_approval_key(&key.code)
+                    {
+                        continue;
                     }
                     match key.code {
                         KeyCode::Char(ch) => {
@@ -192,13 +195,28 @@ impl App {
             return;
         }
         self.push_history(&input);
-        if let Some(response) = handle_slash_command(&input) {
-            if input == "/exit" || input == "/quit" {
-                self.state.should_quit = true;
-                return;
+        if let Some(outcome) = handle_slash_command(&input) {
+            match outcome {
+                SlashCommandOutcome::Display(response) => {
+                    self.state.append_message(&response);
+                    return;
+                }
+                SlashCommandOutcome::Exit(response) => {
+                    self.state.append_message(&response);
+                    self.state.should_quit = true;
+                    return;
+                }
+                SlashCommandOutcome::Submit(prompt) => {
+                    self.state.append_message(&format!("custom command expanded:\n{}", prompt));
+                    self.state.append_user_message(&format!("> {}", prompt));
+                    self.state.queue.push_back(crate::tui::state::PendingInput {
+                        text: prompt,
+                        logged: true,
+                    });
+                    self.maybe_start_next();
+                    return;
+                }
             }
-            self.state.append_message(&response);
-            return;
         }
 
         if self.state.status_state == "running" {
@@ -381,7 +399,13 @@ impl App {
     }
 }
 
-fn handle_slash_command(input: &str) -> Option<String> {
+enum SlashCommandOutcome {
+    Display(String),
+    Submit(String),
+    Exit(String),
+}
+
+fn handle_slash_command(input: &str) -> Option<SlashCommandOutcome> {
     let trimmed = input.trim_start();
     let normalized = if let Some(rest) = trimmed.strip_prefix('／') {
         let mut normalized = String::from("/");
@@ -395,26 +419,133 @@ fn handle_slash_command(input: &str) -> Option<String> {
     }
     let mut parts = normalized.split_whitespace();
     let command = parts.next().unwrap_or("");
-    let _args: Vec<&str> = parts.collect();
+    let args: Vec<&str> = parts.collect();
 
     match command {
-        "/help" => Some(build_slash_help()),
-        "/mcp" => list_mcp_servers().ok(),
-        "/tools" => Some(list_builtin_tools()),
-        "/status" => show_status().ok(),
-        "/model" => show_model().ok(),
-        "/approvals" => show_approvals().ok(),
+        "/help" => Some(SlashCommandOutcome::Display(build_slash_help())),
+        "/mcp" => list_mcp_servers().ok().map(SlashCommandOutcome::Display),
+        "/tools" => Some(SlashCommandOutcome::Display(list_builtin_tools())),
+        "/status" => show_status().ok().map(SlashCommandOutcome::Display),
+        "/model" => show_model().ok().map(SlashCommandOutcome::Display),
+        "/approvals" => show_approvals().ok().map(SlashCommandOutcome::Display),
+        "/review" => match parse_review_args(&args) {
+            Ok(options) => match build_review_prompt(&options) {
+                Ok(Some(prompt)) => Some(SlashCommandOutcome::Submit(prompt)),
+                Ok(None) => Some(SlashCommandOutcome::Display("no diff to review".to_string())),
+                Err(err) => Some(SlashCommandOutcome::Display(format!("review failed: {}", err))),
+            },
+            Err(err) => Some(SlashCommandOutcome::Display(format!("review args error: {}", err))),
+        },
         "/new" | "/clear" | "/resume" | "/fork" | "/save" | "/load" | "/diff" | "/commit"
-        | "/pr" | "/editor" => Some(format!("{} is not implemented in TUI yet.", command)),
+        | "/pr" | "/editor" => Some(SlashCommandOutcome::Display(format!(
+            "{} is not implemented in TUI yet.",
+            command
+        ))),
+        "/exit" | "/quit" => Some(SlashCommandOutcome::Exit(
+            "exit requested".to_string(),
+        )),
         _ => {
+            if let Some(expanded) = resolve_custom_command(command, &args) {
+                return Some(SlashCommandOutcome::Submit(expanded));
+            }
             let filtered = build_slash_help_filtered(command);
             if filtered.is_empty() {
-                Some(format!("unknown command: {}", command))
+                Some(SlashCommandOutcome::Display(format!(
+                    "unknown command: {}",
+                    command
+                )))
             } else {
-                Some(filtered)
+                Some(SlashCommandOutcome::Display(filtered))
             }
         }
     }
+}
+
+fn resolve_custom_command(input: &str, args: &[&str]) -> Option<String> {
+    let (scope, name) = parse_custom_command_name(input)?;
+    let template = load_custom_command_template(scope, &name).ok()??;
+    Some(expand_custom_command_template(&template, args))
+}
+
+fn parse_custom_command_name(input: &str) -> Option<(&'static str, String)> {
+    if let Some(name) = input.strip_prefix("/project:") {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        return Some(("project", trimmed.to_string()));
+    }
+    if let Some(name) = input.strip_prefix('/') {
+        let trimmed = name.trim();
+        if trimmed.is_empty() || trimmed.contains('/') {
+            return None;
+        }
+        return Some(("global", trimmed.to_string()));
+    }
+    None
+}
+
+fn load_custom_command_template(scope: &str, name: &str) -> anyhow::Result<Option<String>> {
+    let mut candidates = Vec::new();
+    match scope {
+        "project" => {
+            candidates.push(PathBuf::from(".").join(".tengu").join("commands").join(format!("{name}.md")));
+        }
+        "global" => {
+            if let Some(home) = std::env::var_os("HOME") {
+                candidates.push(
+                    PathBuf::from(home)
+                        .join(".tengu")
+                        .join("commands")
+                        .join(format!("{name}.md")),
+                );
+            }
+            candidates.push(PathBuf::from(".").join(".tengu").join("commands").join(format!("{name}.md")));
+        }
+        _ => {}
+    }
+
+    for path in candidates {
+        if path.exists() {
+            let content = fs::read_to_string(path)?;
+            return Ok(Some(strip_frontmatter(&content)));
+        }
+    }
+
+    Ok(None)
+}
+
+fn strip_frontmatter(content: &str) -> String {
+    let mut lines = content.lines();
+    if lines.next() != Some("---") {
+        return content.trim().to_string();
+    }
+
+    for line in &mut lines {
+        if line.trim() == "---" {
+            let body = lines.collect::<Vec<_>>().join("\n");
+            return body.trim().to_string();
+        }
+    }
+
+    content.trim().to_string()
+}
+
+fn expand_custom_command_template(template: &str, args: &[&str]) -> String {
+    let joined_args = args.join(" ");
+    let mut expanded = template
+        .replace("{{args}}", &joined_args)
+        .replace("$ARGS", &joined_args);
+
+    if !joined_args.is_empty()
+        && !template.contains("{{args}}")
+        && !template.contains("$ARGS")
+    {
+        expanded.push_str("\n\nArguments:\n");
+        expanded.push_str(&joined_args);
+    }
+
+    expanded
 }
 
 fn format_approval_prompt(request: &ToolApprovalRequest) -> String {
@@ -507,8 +638,20 @@ fn slash_help_items() -> Vec<SlashCommandHelp> {
             desc_en: "gh pr create (pass-through args)",
         },
         SlashCommandHelp {
+            cmd: "/review [opts]",
+            desc_en: "Review current git diff with LLM",
+        },
+        SlashCommandHelp {
             cmd: "/editor [path]",
             desc_en: "Open external editor",
+        },
+        SlashCommandHelp {
+            cmd: "/project:<name>",
+            desc_en: "Run a project custom command",
+        },
+        SlashCommandHelp {
+            cmd: "/<name>",
+            desc_en: "Run a global or local custom command",
         },
         SlashCommandHelp {
             cmd: "/help",
@@ -646,4 +789,28 @@ fn load_config() -> Option<Config> {
         }
     }
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_frontmatter_from_custom_command() {
+        let content = "---\nname: test\ndescription: demo\n---\nRun checks";
+        assert_eq!(strip_frontmatter(content), "Run checks");
+    }
+
+    #[test]
+    fn expands_custom_command_args_placeholder() {
+        let template = "Review files: {{args}}";
+        let expanded = expand_custom_command_template(template, &["src/main.rs", "src/lib.rs"]);
+        assert_eq!(expanded, "Review files: src/main.rs src/lib.rs");
+    }
+
+    #[test]
+    fn parses_project_custom_command_name() {
+        let parsed = parse_custom_command_name("/project:security-review");
+        assert_eq!(parsed, Some(("project", "security-review".to_string())));
+    }
 }

@@ -48,7 +48,7 @@ tengu -p "Analyze this codebase"
 tengu --model claude-sonnet-4 -p "Write tests"
 
 # Allow file editing
-tengu -p "Fix bugs" --allowed-tools "Read,Write,Edit"
+tengu -p "Fix bugs" --allowed-tools "Read,Write,Shell"
 ```
 
 ### Connectivity Checks
@@ -76,6 +76,8 @@ Expected behavior:
 - An `end` event is printed last
 - If a backend fails, an `error` event is emitted before exit
 
+You can also inspect provider auth readiness with `tengu auth status`.
+
 ## 📖 Examples
 
 ### File Operations
@@ -85,8 +87,35 @@ Expected behavior:
 tengu -p "Create utils.rs with helper functions" --allowed-tools "Write"
 
 # Edit existing files
-tengu -p "Fix lint errors in all .rs files" --allowed-tools "Read,Write,Edit,Bash(cargo:*)"
+tengu -p "Fix lint errors in all .rs files" --allowed-tools "Read,Write,Shell(cargo *)"
 ```
+
+### Review
+
+```bash
+# Review the current working tree diff
+tengu review
+
+# Review changes against a base branch
+tengu review --base main
+
+# Focus the review on security risks
+tengu review --base main --preset security
+```
+
+In TUI, use `/review`, `/review --base main`, or `/review --preset security`.
+
+### Image Input
+
+```bash
+# Ask about a screenshot
+tengu --image screenshot.png -p "Describe the UI issues in this screen"
+
+# Pass multiple images
+tengu --image before.png,after.png -p "Compare these two screenshots"
+```
+
+`--image` is currently supported for headless execution. Images are sent to the selected remote LLM provider, while tools and file operations stay local.
 
 ### MCP Servers
 
@@ -111,6 +140,8 @@ tengu --agent code-reviewer
 tengu agent create my-agent
 ```
 
+`agent create` writes a local scaffold under `./.tengu/agents/`, and `--agent <name>` loads that prompt into the session.
+
 ### CI/CD
 
 ```yaml
@@ -118,7 +149,7 @@ tengu agent create my-agent
 - name: Auto-fix lint
   run: |
     tengu -p "Run lint and fix errors" \
-      --allowed-tools "Read,Write,Edit,Bash(cargo:*)"
+      --allowed-tools "Read,Write,Shell(cargo *)"
 ```
 
 ## ⚙️ Configuration

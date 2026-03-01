@@ -4,7 +4,7 @@ use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::llm::{LlmBackend, LlmProvider, LlmResponse, LlmStream};
+use crate::llm::{LlmBackend, LlmProvider, LlmRequest, LlmResponse, LlmStream};
 
 const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -27,7 +27,26 @@ struct MessageRequest {
 #[derive(Debug, Serialize)]
 struct MessageInput {
     role: String,
-    content: String,
+    content: Vec<MessageContentBlock>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum MessageContentBlock {
+    Text {
+        text: String,
+    },
+    Image {
+        source: ImageSource,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct ImageSource {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    media_type: String,
+    data: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,13 +83,25 @@ impl AnthropicBackend {
             .map_err(|_| anyhow!("ANTHROPIC_API_KEY is not set"))
     }
 
-    fn request_body(&self, model: &str, prompt: &str, stream: bool) -> MessageRequest {
+    fn request_body(&self, model: &str, request: &LlmRequest, stream: bool) -> MessageRequest {
+        let mut content = vec![MessageContentBlock::Text {
+            text: request.prompt.clone(),
+        }];
+        for image in &request.images {
+            content.push(MessageContentBlock::Image {
+                source: ImageSource {
+                    kind: "base64",
+                    media_type: image.media_type.clone(),
+                    data: image.data_base64.clone(),
+                },
+            });
+        }
         MessageRequest {
             model: model.to_string(),
             max_tokens: self.max_tokens,
             messages: vec![MessageInput {
                 role: "user".to_string(),
-                content: prompt.to_string(),
+                content,
             }],
             stream,
         }
@@ -128,7 +159,7 @@ impl LlmBackend for AnthropicBackend {
         LlmProvider::Anthropic
     }
 
-    async fn generate(&self, model: &str, prompt: &str) -> Result<LlmResponse> {
+    async fn generate(&self, model: &str, request: &LlmRequest) -> Result<LlmResponse> {
         let api_key = self.api_key()?;
         let client = reqwest::Client::new();
         let response = client
@@ -136,7 +167,7 @@ impl LlmBackend for AnthropicBackend {
             .header("x-api-key", api_key)
             .header("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&self.request_body(model, prompt, false))
+            .json(&self.request_body(model, request, false))
             .send()
             .await?;
 
@@ -152,7 +183,7 @@ impl LlmBackend for AnthropicBackend {
         })
     }
 
-    async fn generate_stream(&self, model: &str, prompt: &str) -> Result<LlmStream> {
+    async fn generate_stream(&self, model: &str, request: &LlmRequest) -> Result<LlmStream> {
         let api_key = self.api_key()?;
         let client = reqwest::Client::new();
         let response = client
@@ -160,7 +191,7 @@ impl LlmBackend for AnthropicBackend {
             .header("x-api-key", api_key)
             .header("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&self.request_body(model, prompt, true))
+            .json(&self.request_body(model, request, true))
             .send()
             .await?;
 

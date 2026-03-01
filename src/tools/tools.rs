@@ -176,13 +176,13 @@ impl ToolPolicy {
             .trim()
             .to_ascii_lowercase();
 
-        if matches!(mode.as_str(), "read-only") {
-            if matches!(input, ToolInput::Write { .. } | ToolInput::Shell { .. }) {
-                return Err(anyhow!(
-                    "sandbox denies write in read-only mode: {}",
-                    tool_name(input)
-                ));
-            }
+        if matches!(mode.as_str(), "read-only")
+            && matches!(input, ToolInput::Write { .. } | ToolInput::Shell { .. })
+        {
+            return Err(anyhow!(
+                "sandbox denies write in read-only mode: {}",
+                tool_name(input)
+            ));
         }
 
         if matches!(mode.as_str(), "workspace-write") {
@@ -228,13 +228,11 @@ impl ToolPolicy {
             if !path_matches_any(&resolved_str, rel_str.as_deref(), allowed) {
                 return Err(anyhow!("sandbox path not allowed: {}", resolved_str));
             }
-        } else if require_within_workspace {
-            if !resolved.starts_with(&self.workspace_root) {
-                return Err(anyhow!(
-                    "sandbox denies write outside workspace: {}",
-                    resolved_str
-                ));
-            }
+        } else if require_within_workspace && !resolved.starts_with(&self.workspace_root) {
+            return Err(anyhow!(
+                "sandbox denies write outside workspace: {}",
+                resolved_str
+            ));
         }
 
         Ok(())
@@ -531,10 +529,8 @@ fn collect_glob_matches(root: &Path, pattern: &str, out: &mut Vec<PathBuf>) -> R
         return Ok(());
     }
 
-    if root.is_file() {
-        if matches_glob(pattern, root) {
-            out.push(root.to_path_buf());
-        }
+    if root.is_file() && matches_glob(pattern, root) {
+        out.push(root.to_path_buf());
     }
     Ok(())
 }

@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub model: ModelConfig,
@@ -38,16 +38,6 @@ pub struct SandboxConfig {
     pub mode: Option<String>,
     pub allowed_paths: Option<Vec<String>>,
     pub blocked_paths: Option<Vec<String>>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            model: ModelConfig::default(),
-            permissions: None,
-            sandbox: None,
-        }
-    }
 }
 
 impl Default for ModelConfig {

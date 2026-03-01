@@ -26,6 +26,27 @@ pub struct LlmResponse {
     pub content: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct LlmImage {
+    pub media_type: String,
+    pub data_base64: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LlmRequest {
+    pub prompt: String,
+    pub images: Vec<LlmImage>,
+}
+
+impl LlmRequest {
+    pub fn text(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            images: Vec::new(),
+        }
+    }
+}
+
 pub type LlmStream = BoxStream<'static, Result<String>>;
 
 pub struct LlmClient {
@@ -42,12 +63,12 @@ impl LlmClient {
         self.backend.provider()
     }
 
-    pub async fn generate(&self, model: &str, prompt: &str) -> Result<LlmResponse> {
-        self.backend.generate(model, prompt).await
+    pub async fn generate(&self, model: &str, request: &LlmRequest) -> Result<LlmResponse> {
+        self.backend.generate(model, request).await
     }
 
-    pub async fn generate_stream(&self, model: &str, prompt: &str) -> Result<LlmStream> {
-        self.backend.generate_stream(model, prompt).await
+    pub async fn generate_stream(&self, model: &str, request: &LlmRequest) -> Result<LlmStream> {
+        self.backend.generate_stream(model, request).await
     }
 }
 
@@ -55,6 +76,6 @@ impl LlmClient {
 pub trait LlmBackend {
     #[allow(dead_code)]
     fn provider(&self) -> LlmProvider;
-    async fn generate(&self, model: &str, prompt: &str) -> Result<LlmResponse>;
-    async fn generate_stream(&self, model: &str, prompt: &str) -> Result<LlmStream>;
+    async fn generate(&self, model: &str, request: &LlmRequest) -> Result<LlmResponse>;
+    async fn generate_stream(&self, model: &str, request: &LlmRequest) -> Result<LlmStream>;
 }

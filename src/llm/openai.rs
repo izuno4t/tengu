@@ -4,7 +4,7 @@ use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::llm::{LlmBackend, LlmProvider, LlmResponse, LlmStream};
+use crate::llm::{LlmBackend, LlmProvider, LlmRequest, LlmResponse, LlmStream};
 
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -26,7 +26,7 @@ struct ChatCompletionRequest {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ChatMessage {
     role: String,
-    content: String,
+    content: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,7 +36,12 @@ struct ChatCompletionResponse {
 
 #[derive(Debug, Deserialize)]
 struct ChatChoice {
-    message: Option<ChatMessage>,
+    message: Option<ChatMessageResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatMessageResponse {
+    content: Value,
 }
 
 impl OpenAiBackend {
@@ -60,12 +65,29 @@ impl OpenAiBackend {
         std::env::var("OPENAI_API_KEY").map_err(|_| anyhow!("OPENAI_API_KEY is not set"))
     }
 
-    fn request_body(&self, model: &str, prompt: &str, stream: bool) -> ChatCompletionRequest {
+    fn request_body(&self, model: &str, request: &LlmRequest, stream: bool) -> ChatCompletionRequest {
+        let content = if request.images.is_empty() {
+            Value::String(request.prompt.clone())
+        } else {
+            let mut items = vec![serde_json::json!({
+                "type": "text",
+                "text": request.prompt,
+            })];
+            for image in &request.images {
+                items.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{};base64,{}", image.media_type, image.data_base64)
+                    }
+                }));
+            }
+            Value::Array(items)
+        };
         ChatCompletionRequest {
             model: model.to_string(),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
-                content: prompt.to_string(),
+                content,
             }],
             stream,
             max_tokens: self.max_tokens,
@@ -115,14 +137,14 @@ impl LlmBackend for OpenAiBackend {
         LlmProvider::OpenAI
     }
 
-    async fn generate(&self, model: &str, prompt: &str) -> Result<LlmResponse> {
+    async fn generate(&self, model: &str, request: &LlmRequest) -> Result<LlmResponse> {
         let api_key = self.api_key()?;
         let client = reqwest::Client::new();
         let response = client
             .post(self.chat_completions_url())
             .bearer_auth(api_key)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&self.request_body(model, prompt, false))
+            .json(&self.request_body(model, request, false))
             .send()
             .await?;
 
@@ -137,18 +159,27 @@ impl LlmBackend for OpenAiBackend {
             .choices
             .into_iter()
             .find_map(|choice| choice.message.map(|message| message.content))
+            .map(|content| match content {
+                Value::String(text) => text,
+                Value::Array(items) => items
+                    .into_iter()
+                    .filter_map(|item| item.get("text").and_then(Value::as_str).map(str::to_string))
+                    .collect::<Vec<_>>()
+                    .join(""),
+                _ => String::new(),
+            })
             .unwrap_or_default();
         Ok(LlmResponse { content })
     }
 
-    async fn generate_stream(&self, model: &str, prompt: &str) -> Result<LlmStream> {
+    async fn generate_stream(&self, model: &str, request: &LlmRequest) -> Result<LlmStream> {
         let api_key = self.api_key()?;
         let client = reqwest::Client::new();
         let response = client
             .post(self.chat_completions_url())
             .bearer_auth(api_key)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&self.request_body(model, prompt, true))
+            .json(&self.request_body(model, request, true))
             .send()
             .await?;
 

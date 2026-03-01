@@ -246,7 +246,7 @@ $ your-agent -p "プロンプトテキスト"
 $ cat error.log | your-agent -p "このエラーを解析して"
 
 # CI/CDでの利用
-$ your-agent -p "lint実行してエラーがあれば修正" --auto-approve
+$ your-agent -p "lint実行してエラーがあれば修正" --allowed-tools "Read,Write,Shell(cargo *)"
 ```
 
 #### 1.1.3 出力フォーマット
@@ -304,9 +304,6 @@ $ your-agent -p "テスト実行" --output-format stream-json
 ```bash
 # 最新セッションを再開
 /resume
-
-# セッション選択画面
-/resume --picker
 
 # セッション一覧
 /sessions list
@@ -376,8 +373,8 @@ api_key = "not-needed"
 # 直接指定
 /model claude-opus-4
 
-# デフォルト設定
-/model set-default gpt-5
+# 現行実装では表示のみ
+/model
 ```
 
 #### 2.2.2 起動時指定
@@ -807,7 +804,14 @@ description: セキュリティレビューを実行
 **使用例:**
 ```bash
 > /project:security-review
+> /project:security-review src/auth.rs
+> /security-review
 ```
+
+**現行実装メモ:**
+- `/.tengu/commands/<name>.md` を `/project:<name>` で実行できる
+- `~/.tengu/commands/<name>.md` または `./.tengu/commands/<name>.md` を `/<name>` で実行できる
+- 先頭の frontmatter は除去し、本文を展開して LLM 入力へ渡す
 
 ---
 
@@ -870,14 +874,11 @@ $ your-agent agent list
 # エージェント作成（対話式）
 $ your-agent agent create my-agent
 
-# エージェント生成（AI支援）
-> /agent generate
+# エージェント生成
+$ your-agent agent generate
 
-# エージェント切り替え
-> /agent swap code-reviewer
-
-# デフォルトエージェント設定
-> /agent set-default code-reviewer
+# エージェント指定で起動
+$ your-agent --agent code-reviewer
 ```
 
 #### 8.2.2 エージェント起動
@@ -886,8 +887,8 @@ $ your-agent agent create my-agent
 # エージェント指定で起動
 $ your-agent --agent code-reviewer
 
-# セッション内で切り替え
-> /agent swap debugger
+# 別エージェントを指定して起動
+$ your-agent --agent debugger
 ```
 
 ---
@@ -933,12 +934,13 @@ $ your-agent --agent code-reviewer
 $ your-agent --image screenshot.png -p "この画面を分析"
 
 # 複数画像
-$ your-agent --image design.png,mockup.png
-
-# セッション内
-> 画像を貼り付け（クリップボードから）
-> ドラッグ&ドロップ
+$ your-agent --image design.png,mockup.png -p "差分を説明"
 ```
+
+**現行実装メモ:**
+- `tengu` の現行CLIでは headless 実行時に `--image` をサポートする
+- 画像は選択中の LLM プロバイダーへ送信し、ツール実行とファイル操作はローカルに残す
+- TUI での画像貼り付けやドラッグ&ドロップは未実装
 
 #### 9.2.2 サポート形式
 区分: 基準先行 + 拡張統合
@@ -1088,7 +1090,7 @@ openai_api_key_env = "OPENAI_API_KEY"
 $ your-agent login
 
 # ステータス確認
-$ your-agent login status
+$ your-agent auth status
 
 # ログアウト
 $ your-agent logout
@@ -1191,16 +1193,14 @@ $ your-agent logout
 区分: 多ベンダー拡張
 
 **機能:**
-- リモートサンドボックス実行
-- 長時間タスクの非同期処理
-- ローカルへの結果プル
+- LLM推論をクラウドAPI（Anthropic/OpenAI/Google）で実行
+- ツール実行とファイル操作はローカルで維持
+- API障害時のフォールバックとエラー可視化
 
-**コマンド:**
-```bash
-$ your-agent cloud exec "大規模リファクタリング"
-$ your-agent cloud list
-$ your-agent cloud pull <task-id>
-```
+**現行実装メモ:**
+- `tengu` の現行CLIに独立した `cloud` サブコマンドは持たせない
+- 通常の `-p` / TUI 実行時に、選択したプロバイダーAPIへ直接問い合わせる
+- Claude Code基準では「推論はクラウド、ツールはローカル」の責務分離を保つ
 
 ### 14.5 レビューモード
 区分: 多ベンダー拡張
@@ -1215,7 +1215,16 @@ $ your-agent cloud pull <task-id>
 > /review
 > /review --base main
 > /review --preset security
+
+$ your-agent review
+$ your-agent review --base main
+$ your-agent review --base main --preset security
 ```
+
+**現行実装メモ:**
+- `tengu review` と TUI の `/review` は最小実装済み
+- `git diff` を収集し、レビュー用プロンプトを生成して LLM に渡す
+- `--base` は `<base>...HEAD` の差分、`--preset` は `general/security/performance/correctness` をサポートする
 
 ---
 
@@ -1276,7 +1285,7 @@ $ your-agent cloud pull <task-id>
 
 9. ✅ **カスタムコマンド**
    - Markdownベースのコマンド定義
-   - `/project:` プレフィックス
+   - プロジェクトスコープの呼び出し規則
    - 引数の受け渡し
 
 **期間: 3-4週間**
@@ -1313,10 +1322,10 @@ $ your-agent cloud pull <task-id>
 
 **目標: チーム・企業での利用**
 
-14. ✅ **クラウド実行**
-    - リモートサンドボックス
-    - 非同期タスク管理
-    - 結果の同期
+14. ✅ **クラウドLLM推論運用**
+    - プロバイダーAPIの安定運用
+    - API障害時のエラー処理
+    - ローカルツール実行との責務分離
 
 15. ✅ **高度なMCP機能**
     - HTTPサーバーサポート

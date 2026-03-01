@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::llm::{LlmClient, LlmResponse, LlmStream};
+use crate::llm::{LlmClient, LlmRequest, LlmResponse, LlmStream};
 use crate::tools::{
     ApprovalOverride, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequired, ToolExecutor,
     ToolInput, ToolPolicy, ToolResult,
@@ -99,7 +99,7 @@ impl AgentRunner {
                 .await?;
         let final_response = self
             .client
-            .generate(&self.model_name, &final_prompt)
+            .generate(&self.model_name, &LlmRequest::text(final_prompt))
             .await?;
         let response = LlmResponse {
             content: final_response.content.trim().to_string(),
@@ -128,7 +128,7 @@ impl AgentRunner {
                 .await?;
         let stream = self
             .client
-            .generate_stream(&self.model_name, &final_prompt)
+            .generate_stream(&self.model_name, &LlmRequest::text(final_prompt))
             .await?;
         Ok((Box::pin(stream) as BoxStream<'static, Result<String>>, tool_result))
     }
@@ -160,7 +160,10 @@ impl AgentRunner {
 impl AgentRunner {
     async fn generate_plan_with_context(&self, input: &str, context: &str) -> Result<String> {
         let prompt = build_plan_prompt_with_context(input, context);
-        let response = self.client.generate(&self.model_name, &prompt).await?;
+        let response = self
+            .client
+            .generate(&self.model_name, &LlmRequest::text(prompt))
+            .await?;
         Ok(response.content)
     }
 
@@ -351,7 +354,10 @@ impl AgentRunner {
     ) -> Result<Option<ToolCall>> {
         let prompt =
             build_tool_select_prompt_with_context(input, context, plan, last_error, last_call);
-        let response = self.client.generate(&self.model_name, &prompt).await?;
+        let response = self
+            .client
+            .generate(&self.model_name, &LlmRequest::text(prompt))
+            .await?;
         Ok(parse_tool_call_loose(&response.content))
     }
 }

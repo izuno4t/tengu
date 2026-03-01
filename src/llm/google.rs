@@ -4,7 +4,7 @@ use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::llm::{LlmBackend, LlmProvider, LlmResponse, LlmStream};
+use crate::llm::{LlmBackend, LlmProvider, LlmRequest, LlmResponse, LlmStream};
 
 const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -25,7 +25,17 @@ struct GoogleContent {
 
 #[derive(Debug, Serialize)]
 struct GooglePart {
-    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(rename = "inlineData", skip_serializing_if = "Option::is_none")]
+    inline_data: Option<GoogleInlineData>,
+}
+
+#[derive(Debug, Serialize)]
+struct GoogleInlineData {
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    data: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,12 +69,23 @@ impl GoogleBackend {
         std::env::var("GOOGLE_API_KEY").map_err(|_| anyhow!("GOOGLE_API_KEY is not set"))
     }
 
-    fn request_body(&self, prompt: &str) -> GenerateContentRequest {
+    fn request_body(&self, request: &LlmRequest) -> GenerateContentRequest {
+        let mut parts = vec![GooglePart {
+            text: Some(request.prompt.clone()),
+            inline_data: None,
+        }];
+        for image in &request.images {
+            parts.push(GooglePart {
+                text: None,
+                inline_data: Some(GoogleInlineData {
+                    mime_type: image.media_type.clone(),
+                    data: image.data_base64.clone(),
+                }),
+            });
+        }
         GenerateContentRequest {
             contents: vec![GoogleContent {
-                parts: vec![GooglePart {
-                    text: prompt.to_string(),
-                }],
+                parts,
             }],
         }
     }
@@ -132,13 +153,13 @@ impl LlmBackend for GoogleBackend {
         LlmProvider::Google
     }
 
-    async fn generate(&self, model: &str, prompt: &str) -> Result<LlmResponse> {
+    async fn generate(&self, model: &str, request: &LlmRequest) -> Result<LlmResponse> {
         let api_key = self.api_key()?;
         let client = reqwest::Client::new();
         let response = client
             .post(self.generate_url(model, false, &api_key))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&self.request_body(prompt))
+            .json(&self.request_body(request))
             .send()
             .await?;
 
@@ -163,13 +184,13 @@ impl LlmBackend for GoogleBackend {
         Ok(LlmResponse { content })
     }
 
-    async fn generate_stream(&self, model: &str, prompt: &str) -> Result<LlmStream> {
+    async fn generate_stream(&self, model: &str, request: &LlmRequest) -> Result<LlmStream> {
         let api_key = self.api_key()?;
         let client = reqwest::Client::new();
         let response = client
             .post(self.generate_url(model, true, &api_key))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&self.request_body(prompt))
+            .json(&self.request_body(request))
             .send()
             .await?;
 

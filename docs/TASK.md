@@ -136,6 +136,17 @@
 |TASK-098|✅|OpenAIバックエンドを実装し多ベンダー拡張の先行経路を成立させる|TASK-097|
 |TASK-099|✅|Googleバックエンドを実装し多ベンダー拡張の候補を解消する|TASK-097|
 |TASK-100|✅|複数バックエンドの疎通確認手順と最小検証ケースを追加する|TASK-092,TASK-098,TASK-099|
+|TASK-101|✅|TUIでカスタムコマンド（/project:<name>, /<name>）の最小実装を追加する|TASK-094|
+|TASK-102|✅|cloud exec/list/pull の最小実装を追加し将来のクラウド実行IFの土台を作る|TASK-094|
+|TASK-103|✅|Claude Code基準との乖離を整理し、継続実装 + 誤方向の是正で進める判断を記録する|-|
+|TASK-104|✅|誤って追加した cloud サブコマンドを削除し、LLM推論のみクラウドという前提に戻す|TASK-103,TASK-102|
+|TASK-105|✅|REQUIREMENTS/README を LLM推論のみリモート・ツールはローカル に再整合する|TASK-103,TASK-104|
+|TASK-106|⏳|Claude Code基準との差分として未実装の画像入力とレビュー専用導線を整理する|TASK-103|
+|TASK-107|✅|新しい製品実装用タスク文書 docs/alt-claude-code/TASK.md を作成し、最優先実装を開始する|TASK-103|
+|TASK-108|✅|レビュー導線（CLI review / TUI /review）の最小製品化とドキュメント反映を行う|TASK-107|
+|TASK-109|✅|エージェント管理コマンドを永続化し --agent が実際にプロンプトへ反映されるようにする|TASK-107|
+|TASK-110|✅|auth コマンドを環境変数ベースの認証状態確認として実体化する|TASK-107|
+|TASK-111|✅|headless の --image を実装しマルチモーダル入力の最小導線を追加する|TASK-107|
 
 
 ## Task Details (only when clarification needed)

@@ -3,7 +3,7 @@ use futures_util::stream::{self, BoxStream, StreamExt};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::llm::{LlmBackend, LlmProvider, LlmResponse, LlmStream};
+use crate::llm::{LlmBackend, LlmProvider, LlmRequest, LlmResponse, LlmStream};
 
 #[derive(Debug, Clone)]
 pub struct OllamaBackend {
@@ -15,6 +15,8 @@ struct GenerateRequest {
     model: String,
     prompt: String,
     stream: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    images: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,12 +51,17 @@ impl LlmBackend for OllamaBackend {
         LlmProvider::Local
     }
 
-    async fn generate(&self, model: &str, prompt: &str) -> Result<LlmResponse> {
+    async fn generate(&self, model: &str, request: &LlmRequest) -> Result<LlmResponse> {
         let client = reqwest::Client::new();
         let payload = GenerateRequest {
             model: model.to_string(),
-            prompt: prompt.to_string(),
+            prompt: request.prompt.clone(),
             stream: false,
+            images: request
+                .images
+                .iter()
+                .map(|image| image.data_base64.clone())
+                .collect(),
         };
         let response = client
             .post(self.generate_url())
@@ -72,12 +79,17 @@ impl LlmBackend for OllamaBackend {
         })
     }
 
-    async fn generate_stream(&self, model: &str, prompt: &str) -> Result<LlmStream> {
+    async fn generate_stream(&self, model: &str, request: &LlmRequest) -> Result<LlmStream> {
         let client = reqwest::Client::new();
         let payload = GenerateRequest {
             model: model.to_string(),
-            prompt: prompt.to_string(),
+            prompt: request.prompt.clone(),
             stream: true,
+            images: request
+                .images
+                .iter()
+                .map(|image| image.data_base64.clone())
+                .collect(),
         };
         let response = client
             .post(self.generate_url())

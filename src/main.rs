@@ -6,6 +6,7 @@ mod cli;
 mod config;
 mod llm;
 mod mcp;
+mod review;
 mod session;
 mod tools;
 mod tui;

@@ -241,7 +241,7 @@ fn build_status_lines(state: &AppState, width: usize) -> Vec<String> {
     let (bullet, bullet_color) = if state.status_state == "running" {
         let frames = ["●", "◐", "◓", "◑", "◒"];
         let bullet = frames[(state.tick / 4) as usize % frames.len()];
-        let color = if (state.tick / 4) % 2 == 0 {
+        let color = if (state.tick / 4).is_multiple_of(2) {
             THEME.status_pulse
         } else {
             THEME.status
@@ -274,7 +274,7 @@ fn render_log_lines(lines: &[crate::tui::state::LogLine], width: usize) -> Vec<S
                 }
                 let styled = colorize_line(&line.text, width, ansi::set_fg(THEME.user));
                 output.extend(wrap_ansi_line(&styled, width));
-                let next_blank = lines.get(idx + 1).map_or(false, |next| {
+                let next_blank = lines.get(idx + 1).is_some_and(|next| {
                     next.text.is_empty()
                         && matches!(next.role, LogRole::System | LogRole::Assistant)
                 });
@@ -314,7 +314,7 @@ fn visible_width(text: &str) -> usize {
         if ch == '\x1b' {
             if let Some('[') = chars.peek().copied() {
                 chars.next();
-                while let Some(next) = chars.next() {
+                for next in chars.by_ref() {
                     if ('@'..='~').contains(&next) {
                         break;
                     }
@@ -566,7 +566,7 @@ fn wrap_ansi_line(text: &str, width: usize) -> Vec<String> {
             if let Some('[') = chars.peek().copied() {
                 esc.push('[');
                 chars.next();
-                while let Some(next) = chars.next() {
+                for next in chars.by_ref() {
                     esc.push(next);
                     if ('@'..='~').contains(&next) {
                         if next == 'm' {

@@ -1,19 +1,24 @@
-use crate::agent::{AgentOutput, AgentRunner};
+use crate::agent::{AgentOutput, AgentRunner, AgentStore, StoredAgent};
 use crate::config::Config;
 use crate::llm::{
-    AnthropicBackend, GoogleBackend, LlmBackend, LlmClient, LlmProvider, OllamaBackend,
+    AnthropicBackend, GoogleBackend, LlmBackend, LlmClient, LlmImage, LlmProvider, LlmRequest,
+    OllamaBackend,
     OpenAiBackend,
 };
 use crate::mcp::{list_tools_http, list_tools_stdio, McpServerConfig, McpStore};
+use crate::review::{build_review_prompt, ReviewOptions};
 use crate::session::{Session, SessionStore};
 use crate::tools::{ToolExecutor, ToolInput, ToolPolicy, ToolResult};
 use crate::tui::App;
 use anyhow::{anyhow, Result};
+use base64::Engine;
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -30,6 +35,10 @@ pub struct Cli {
     /// 使用するモデル
     #[arg(long)]
     pub model: Option<String>,
+
+    /// 画像入力（カンマ区切りまたは複数指定）
+    #[arg(long, value_delimiter = ',')]
+    pub image: Vec<PathBuf>,
 
     /// OllamaベースURL（例: http://localhost:11434）
     #[arg(long)]
@@ -112,6 +121,17 @@ pub enum Commands {
 
     /// 新規セッション開始
     New,
+
+    /// Git diff review
+    Review {
+        /// Base ref for diff range (<base>...HEAD)
+        #[arg(long)]
+        base: Option<String>,
+
+        /// Review preset (general/security/performance/correctness)
+        #[arg(long)]
+        preset: Option<String>,
+    },
 
     /// 認証管理
     Auth {
@@ -260,6 +280,9 @@ impl Cli {
             Commands::Sessions { command } => self.execute_session_command(command).await,
             Commands::Tool { command } => self.execute_tool_command(command).await,
             Commands::Tui => self.execute_tui().await,
+            Commands::Review { base, preset } => {
+                self.execute_review_command(base.clone(), preset.clone()).await
+            }
             Commands::Resume { session_id, last } => {
                 let store = SessionStore::new(SessionStore::default_root()?);
                 if *last {
@@ -374,22 +397,35 @@ impl Cli {
     }
 
     async fn execute_agent_command(&self, command: &AgentCommands) -> Result<()> {
+        let store = AgentStore::new();
         match command {
             AgentCommands::List => {
-                println!("List agents");
+                let agents = store.list()?;
+                if agents.is_empty() {
+                    println!("no agents");
+                } else {
+                    for agent in agents {
+                        println!("{} {}", agent.name, agent.description);
+                    }
+                }
                 Ok(())
             }
             AgentCommands::Create { name } => {
-                println!("Create agent: {}", name);
+                let agent = StoredAgent::scaffold(name);
+                let path = store.save_local(&agent)?;
+                println!("agent created: {}", path.display());
                 Ok(())
             }
             AgentCommands::Remove { name } => {
-                println!("Remove agent: {}", name);
+                if store.remove(name)? {
+                    println!("agent removed: {}", name);
+                } else {
+                    println!("agent not found: {}", name);
+                }
                 Ok(())
             }
             AgentCommands::Generate => {
-                println!("Generate agent with AI assistance");
-                Ok(())
+                self.generate_agent_with_llm(&store).await
             }
         }
     }
@@ -422,17 +458,52 @@ impl Cli {
     }
 
     async fn execute_auth_command(&self, command: &AuthCommands) -> Result<()> {
+        let config = load_config().unwrap_or_default();
+        let provider_name = if !config.model.provider.trim().is_empty() {
+            config.model.provider.as_str()
+        } else {
+            "anthropic"
+        };
+        let required_env = auth_env_var_for_provider(provider_name);
         match command {
             AuthCommands::Login => {
-                println!("Login");
+                let Some(env_name) = required_env else {
+                    return Err(anyhow!("auth login is unsupported for provider: {}", provider_name));
+                };
+                if std::env::var(env_name).is_err() {
+                    return Err(anyhow!("{} is not set", env_name));
+                }
+                save_auth_session(provider_name, env_name)?;
+                println!("auth ready: provider={} via {}", provider_name, env_name);
                 Ok(())
             }
             AuthCommands::Logout => {
-                println!("Logout");
+                clear_auth_session()?;
+                println!("auth session cleared");
                 Ok(())
             }
             AuthCommands::Status => {
-                println!("Auth status");
+                let env_status = required_env
+                    .map(|env_name| {
+                        if std::env::var(env_name).is_ok() {
+                            format!("{}=set", env_name)
+                        } else {
+                            format!("{}=missing", env_name)
+                        }
+                    })
+                    .unwrap_or_else(|| "env=unsupported".to_string());
+                let session_status = load_auth_session()
+                    .map(|session| {
+                        format!(
+                            "session=ready provider={} updated_at={}",
+                            session.provider, session.updated_at
+                        )
+                    })
+                    .unwrap_or_else(|| "session=none".to_string());
+                println!(
+                    "provider: {}\n{}\n{}",
+                    provider_name, env_status, session_status
+                );
                 Ok(())
             }
         }
@@ -473,6 +544,50 @@ impl Cli {
         Ok(())
     }
 
+    async fn execute_review_command(
+        &self,
+        base: Option<String>,
+        preset: Option<String>,
+    ) -> Result<()> {
+        let options = ReviewOptions { base, preset };
+        let Some(prompt) = build_review_prompt(&options)? else {
+            println!("no diff to review");
+            return Ok(());
+        };
+
+        let config = load_config().unwrap_or_default();
+        let (client, model_name) = self.resolve_llm_with_config(&config)?;
+        let policy = ToolPolicy::from_config(&config);
+        let runner = AgentRunner::new(client, model_name, policy);
+
+        if self.output_format == "stream-json" {
+            let (mut stream, _tool_result) =
+                runner.handle_prompt_stream_with_tool_context(&prompt, "").await?;
+            println!("{}", json!({ "type": "start", "mode": "review" }));
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(text) => {
+                        println!("{}", json!({ "type": "chunk", "mode": "review", "delta": text }));
+                    }
+                    Err(err) => {
+                        println!(
+                            "{}",
+                            json!({ "type": "error", "mode": "review", "message": err.to_string() })
+                        );
+                        println!("{}", json!({ "type": "end", "mode": "review" }));
+                        return Err(err);
+                    }
+                }
+            }
+            println!("{}", json!({ "type": "end", "mode": "review" }));
+            return Ok(());
+        }
+
+        let output = runner.handle_prompt(&prompt).await?;
+        self.print_output("review", &output.response.content, None);
+        Ok(())
+    }
+
     async fn execute_tui(&self) -> Result<()> {
         let banner = "👺 Tengu - Interactive mode".to_string();
         let config = load_config().unwrap_or_default();
@@ -502,13 +617,40 @@ impl Cli {
         let (system_prompt, sources) = self.resolve_system_prompt()?;
         self.log_system_prompt_sources(&sources, system_prompt.as_deref());
         if let Some(prompt) = self.prompt.as_deref() {
+            let request = build_headless_request(prompt, system_prompt.as_deref(), &self.image)?;
             if self.output_format == "stream-json" {
                 let config = load_config().unwrap_or_default();
                 let (client, model_name) = self.resolve_llm_with_config(&config)?;
+                if !request.images.is_empty() {
+                    let mut stream = client.generate_stream(&model_name, &request).await?;
+                    println!("{}", json!({ "type": "start", "mode": "llm" }));
+                    while let Some(chunk) = stream.next().await {
+                        match chunk {
+                            Ok(text) => {
+                                println!(
+                                    "{}",
+                                    json!({ "type": "chunk", "mode": "llm", "delta": text })
+                                );
+                            }
+                            Err(err) => {
+                                println!(
+                                    "{}",
+                                    json!({ "type": "error", "mode": "llm", "message": err.to_string() })
+                                );
+                                println!("{}", json!({ "type": "end", "mode": "llm" }));
+                                return Err(err);
+                            }
+                        }
+                    }
+                    println!("{}", json!({ "type": "end", "mode": "llm" }));
+                    return Ok(());
+                }
                 let policy = ToolPolicy::from_config(&config);
                 let runner = AgentRunner::new(client, model_name, policy);
                 let (mut stream, tool_result) =
-                    runner.handle_prompt_stream_with_tool_context(prompt, "").await?;
+                    runner
+                        .handle_prompt_stream_with_tool_context(&request.prompt, "")
+                        .await?;
 
                 println!("{}", json!({ "type": "start", "mode": "llm" }));
                 while let Some(chunk) = stream.next().await {
@@ -557,11 +699,17 @@ impl Cli {
         let message = format!("Headless mode with prompt: {:?}", self.prompt);
         self.print_output("headless", &message, self.prompt.as_deref());
         if let Some(prompt) = self.prompt.as_deref() {
+            let request = build_headless_request(prompt, system_prompt.as_deref(), &self.image)?;
             let config = load_config().unwrap_or_default();
             let (client, model_name) = self.resolve_llm_with_config(&config)?;
+            if !request.images.is_empty() {
+                let output = client.generate(&model_name, &request).await?;
+                self.print_output("llm", &output.content, Some(prompt));
+                return Ok(());
+            }
             let policy = ToolPolicy::from_config(&config);
             let runner = AgentRunner::new(client, model_name, policy);
-            let output = runner.handle_prompt(prompt).await?;
+            let output = runner.handle_prompt(&request.prompt).await?;
             self.print_output("llm", &output.response.content, Some(prompt));
             self.print_tool_result(&output);
         }
@@ -640,6 +788,13 @@ impl Cli {
             parts.push(prompt.clone());
         }
 
+        if let Some(agent_name) = &self.agent {
+            let store = AgentStore::new();
+            let agent = store.load(agent_name)?;
+            sources.push(format!("agent:{}", agent.name));
+            parts.push(agent.prompt);
+        }
+
         if parts.is_empty() {
             Ok((None, sources))
         } else {
@@ -694,7 +849,7 @@ impl Cli {
             Some(value) => LlmProvider::from_str(value).unwrap_or(configured_provider),
             None => configured_provider,
         };
-        let backend = build_backend(&provider, &config, self.ollama_base_url.clone());
+        let backend = build_backend(&provider, config, self.ollama_base_url.clone());
         Ok((LlmClient::new(backend), model_name))
     }
 }
@@ -743,6 +898,26 @@ fn build_backend(
 }
 
 impl Cli {
+    async fn generate_agent_with_llm(&self, store: &AgentStore) -> Result<()> {
+        let config = load_config().unwrap_or_default();
+        let (client, model_name) = self.resolve_llm_with_config(&config)?;
+        let request = LlmRequest::text(
+            "Create a practical coding assistant agent configuration.\n\
+             Return JSON only with keys: name, description, prompt.\n\
+             Requirements:\n\
+             - name must be lowercase kebab-case\n\
+             - description must be one short sentence\n\
+             - prompt must instruct concise, pragmatic coding assistance\n\
+             - do not include markdown fences or extra commentary",
+        );
+        let response = client.generate(&model_name, &request).await?;
+        let agent = parse_generated_agent(&response.content)
+            .unwrap_or_else(|_| fallback_generated_agent());
+        let path = store.save_local(&agent)?;
+        println!("agent generated: {}", path.display());
+        Ok(())
+    }
+
     fn print_tool_result(&self, output: &AgentOutput) {
         let Some(result) = output.tool_result.as_ref() else {
             return;
@@ -792,14 +967,254 @@ fn apply_preview_write_with_config(result: &ToolResult) -> Result<Option<ToolRes
     apply_preview_write(&executor, result)
 }
 
-fn read_required_file(path: &PathBuf) -> Result<String> {
+#[derive(Debug, Serialize, Deserialize)]
+struct AuthSession {
+    provider: String,
+    env_var: String,
+    updated_at: String,
+}
+
+fn auth_env_var_for_provider(provider: &str) -> Option<&'static str> {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "openai" => Some("OPENAI_API_KEY"),
+        "google" | "gemini" => Some("GOOGLE_API_KEY"),
+        _ => None,
+    }
+}
+
+fn auth_session_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME").map_err(|_| anyhow!("HOME not set"))?;
+    Ok(auth_session_path_from_home(Path::new(&home)))
+}
+
+fn save_auth_session(provider: &str, env_var: &str) -> Result<()> {
+    let path = auth_session_path()?;
+    save_auth_session_at(&path, provider, env_var)
+}
+
+fn auth_session_path_from_home(home: &Path) -> PathBuf {
+    home.join(".tengu").join("auth").join("session.json")
+}
+
+fn save_auth_session_at(path: &Path, provider: &str, env_var: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let session = AuthSession {
+        provider: provider.to_string(),
+        env_var: env_var.to_string(),
+        updated_at: Utc::now().to_rfc3339(),
+    };
+    fs::write(path, serde_json::to_string_pretty(&session)?)?;
+    Ok(())
+}
+
+fn load_auth_session() -> Option<AuthSession> {
+    let path = auth_session_path().ok()?;
+    load_auth_session_from_path(&path)
+}
+
+fn load_auth_session_from_path(path: &Path) -> Option<AuthSession> {
+    let data = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn clear_auth_session() -> Result<()> {
+    let path = auth_session_path()?;
+    clear_auth_session_at(&path)
+}
+
+fn clear_auth_session_at(path: &Path) -> Result<()> {
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn parse_generated_agent(raw: &str) -> Result<StoredAgent> {
+    let trimmed = raw.trim();
+    let candidate = if let Some(stripped) = trimmed.strip_prefix("```") {
+        let body = stripped
+            .split_once('\n')
+            .map(|(_, rest)| rest)
+            .unwrap_or(stripped);
+        body.rsplit_once("```")
+            .map(|(content, _)| content.trim())
+            .unwrap_or(body.trim())
+    } else {
+        trimmed
+    };
+    let json_slice = if candidate.starts_with('{') {
+        candidate
+    } else {
+        let start = candidate
+            .find('{')
+            .ok_or_else(|| anyhow!("generated agent JSON start not found"))?;
+        let end = candidate
+            .rfind('}')
+            .ok_or_else(|| anyhow!("generated agent JSON end not found"))?;
+        &candidate[start..=end]
+    };
+    let agent: StoredAgent = serde_json::from_str(json_slice)?;
+    if agent.name.trim().is_empty() {
+        return Err(anyhow!("generated agent name is empty"));
+    }
+    if agent.description.trim().is_empty() {
+        return Err(anyhow!("generated agent description is empty"));
+    }
+    if agent.prompt.trim().is_empty() {
+        return Err(anyhow!("generated agent prompt is empty"));
+    }
+    Ok(agent)
+}
+
+fn fallback_generated_agent() -> StoredAgent {
+    let name = format!("generated-{}", Utc::now().format("%Y%m%d%H%M%S"));
+    StoredAgent {
+        name: name.clone(),
+        description: "LLM-generated fallback coding assistant".to_string(),
+        prompt: format!(
+            "You are the `{name}` agent. Provide concise, pragmatic coding help, \
+             prioritize correctness, explain tradeoffs briefly, and propose concrete next steps."
+        ),
+    }
+}
+
+fn build_headless_request(
+    prompt: &str,
+    system_prompt: Option<&str>,
+    image_paths: &[PathBuf],
+) -> Result<LlmRequest> {
+    let prompt = match system_prompt {
+        Some(system_prompt) if !system_prompt.trim().is_empty() => format!(
+            "System instructions:\n{}\n\nUser request:\n{}",
+            system_prompt, prompt
+        ),
+        _ => prompt.to_string(),
+    };
+
+    let images = image_paths
+        .iter()
+        .map(|path| load_llm_image(path))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(LlmRequest { prompt, images })
+}
+
+fn load_llm_image(path: &Path) -> Result<LlmImage> {
+    let media_type = image_media_type(path)
+        .ok_or_else(|| anyhow!("unsupported image type: {}", path.display()))?;
+    let bytes = fs::read(path)?;
+    let data_base64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(LlmImage {
+        media_type: media_type.to_string(),
+        data_base64,
+    })
+}
+
+fn image_media_type(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn read_required_file(path: &Path) -> Result<String> {
     Ok(fs::read_to_string(path)?)
 }
 
-fn read_optional_file(path: &PathBuf) -> Result<Option<String>> {
+fn read_optional_file(path: &Path) -> Result<Option<String>> {
     if path.exists() {
         Ok(Some(fs::read_to_string(path)?))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("tengu-{name}-{nanos}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn maps_provider_to_expected_auth_env_var() {
+        assert_eq!(auth_env_var_for_provider("anthropic"), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(auth_env_var_for_provider("openai"), Some("OPENAI_API_KEY"));
+        assert_eq!(auth_env_var_for_provider("gemini"), Some("GOOGLE_API_KEY"));
+        assert_eq!(auth_env_var_for_provider("local"), None);
+    }
+
+    #[test]
+    fn detects_supported_image_media_types() {
+        assert_eq!(image_media_type(Path::new("a.png")), Some("image/png"));
+        assert_eq!(image_media_type(Path::new("a.jpeg")), Some("image/jpeg"));
+        assert_eq!(image_media_type(Path::new("a.gif")), Some("image/gif"));
+        assert_eq!(image_media_type(Path::new("a.webp")), Some("image/webp"));
+        assert_eq!(image_media_type(Path::new("a.txt")), None);
+    }
+
+    #[test]
+    fn builds_headless_request_with_system_prompt() {
+        let request = build_headless_request("hello", Some("system"), &[]).unwrap();
+        assert!(request.prompt.contains("System instructions:"));
+        assert!(request.prompt.contains("User request:"));
+        assert!(request.images.is_empty());
+    }
+
+    #[test]
+    fn saves_loads_and_clears_auth_session_file() {
+        let root = unique_temp_dir("auth-session");
+        let path = auth_session_path_from_home(&root);
+
+        save_auth_session_at(&path, "anthropic", "ANTHROPIC_API_KEY").unwrap();
+        let session = load_auth_session_from_path(&path).unwrap();
+        assert_eq!(session.provider, "anthropic");
+        assert_eq!(session.env_var, "ANTHROPIC_API_KEY");
+
+        clear_auth_session_at(&path).unwrap();
+        assert!(load_auth_session_from_path(&path).is_none());
+    }
+
+    #[test]
+    fn loads_image_as_base64_payload() {
+        let root = unique_temp_dir("image-load");
+        let path = root.join("sample.png");
+        fs::write(&path, [0_u8, 1, 2, 3]).unwrap();
+
+        let image = load_llm_image(&path).unwrap();
+        assert_eq!(image.media_type, "image/png");
+        assert_eq!(image.data_base64, "AAECAw==");
+    }
+
+    #[test]
+    fn parses_generated_agent_from_json_fence() {
+        let raw = "```json\n{\"name\":\"reviewer\",\"description\":\"Reviews diffs.\",\"prompt\":\"Review code carefully.\"}\n```";
+        let agent = parse_generated_agent(raw).unwrap();
+        assert_eq!(agent.name, "reviewer");
+        assert_eq!(agent.description, "Reviews diffs.");
+        assert_eq!(agent.prompt, "Review code carefully.");
+    }
+
+    #[test]
+    fn falls_back_when_generated_agent_payload_is_invalid() {
+        assert!(parse_generated_agent("not json").is_err());
+        let agent = fallback_generated_agent();
+        assert!(agent.name.starts_with("generated-"));
+        assert!(!agent.prompt.is_empty());
     }
 }
