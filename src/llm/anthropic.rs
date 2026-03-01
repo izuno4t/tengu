@@ -355,4 +355,20 @@ mod tests {
         let parsed = AnthropicBackend::parse_stream_event(payload).unwrap();
         assert!(matches!(parsed, Some(LlmStreamEvent::Text(text)) if text == "hello"));
     }
+
+    #[test]
+    fn parses_usage_from_stream_payload() {
+        let payload = r#"{"type":"message_delta","usage":{"input_tokens":10,"output_tokens":4,"cache_creation_input_tokens":2,"cache_read_input_tokens":1}}"#;
+        let parsed = AnthropicBackend::parse_stream_event(payload).unwrap();
+        assert!(matches!(
+            parsed,
+            Some(LlmStreamEvent::Usage(usage))
+                if usage.provider == "anthropic"
+                    && usage.input_tokens == Some(10)
+                    && usage.output_tokens == Some(4)
+                    && usage.total_tokens == Some(14)
+                    && usage.cache_creation_input_tokens == Some(2)
+                    && usage.cache_read_input_tokens == Some(1)
+        ));
+    }
 }

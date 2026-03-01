@@ -1256,6 +1256,28 @@ mod tests {
     }
 
     #[test]
+    fn serializes_usage_json_payload() {
+        let value = usage_to_json(&LlmUsage {
+            provider: "openai".to_string(),
+            input_tokens: Some(12),
+            output_tokens: Some(5),
+            total_tokens: Some(17),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: Some(3),
+            reasoning_tokens: Some(2),
+            raw: Some(serde_json::json!({"prompt_tokens": 12})),
+        });
+
+        assert_eq!(value["provider"], "openai");
+        assert_eq!(value["input_tokens"], 12);
+        assert_eq!(value["output_tokens"], 5);
+        assert_eq!(value["total_tokens"], 17);
+        assert_eq!(value["cache_read_input_tokens"], 3);
+        assert_eq!(value["reasoning_tokens"], 2);
+        assert_eq!(value["raw"]["prompt_tokens"], 12);
+    }
+
+    #[test]
     fn parses_generated_agent_from_json_fence() {
         let raw = "```json\n{\"name\":\"reviewer\",\"description\":\"Reviews diffs.\",\"prompt\":\"Review code carefully.\"}\n```";
         let agent = parse_generated_agent(raw).unwrap();

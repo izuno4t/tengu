@@ -369,4 +369,20 @@ mod tests {
         let parsed = OpenAiBackend::parse_stream_data(payload).unwrap();
         assert!(matches!(parsed, Some(LlmStreamEvent::Text(text)) if text == "hello"));
     }
+
+    #[test]
+    fn parses_usage_from_stream_payload() {
+        let payload = r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":2}}}"#;
+        let parsed = OpenAiBackend::parse_stream_data(payload).unwrap();
+        assert!(matches!(
+            parsed,
+            Some(LlmStreamEvent::Usage(usage))
+                if usage.provider == "openai"
+                    && usage.input_tokens == Some(12)
+                    && usage.output_tokens == Some(5)
+                    && usage.total_tokens == Some(17)
+                    && usage.cache_read_input_tokens == Some(3)
+                    && usage.reasoning_tokens == Some(2)
+        ));
+    }
 }

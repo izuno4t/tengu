@@ -63,14 +63,18 @@
 | ALT-007 | completed | 主要導線の統合テストを追加する | ALT-003,ALT-004,ALT-005,ALT-006 |
 | ALT-008 | completed | README / REQUIREMENTS / TASK の整合を最終化する | ALT-007 |
 | ALT-009 | completed | `/config` を実用コマンド化し、ローカル設定の確認・更新を TUI から行えるようにする | ALT-008 |
+| ALT-010 | completed | プロバイダ別 usage を取得・記録し、`/usage` と `stream-json` に反映する | ALT-009 |
+| ALT-011 | completed | `usage` イベント仕様と解析テストを追加し、文書と実装を整合させる | ALT-010 |
+| ALT-012 | completed | `json` / `stream-json` の usage 出力契約を文書化し、補助テストを追加する | ALT-011 |
+| ALT-013 | completed | `/usage export <path>` を追加し、usage 集計を JSON で書き出せるようにする | ALT-012 |
 
 ## Residual Backlog
 
 - 実APIキーを使ったプロバイダごとの運用疎通確認
 - 実行中だった LLM ストリームそのものの再開
 - Claude Code の本格的な vim モード（挿入/コマンドの完全切替）
-- 厳密なトークン/コスト集計
-- `/cost` の推定使用量永続化と、プロバイダ別課金テーブルを持たない前提の明文化
+- プロバイダ別の価格テーブル管理と、usage から料金への best-effort 変換
+- 課金 API や請求ダッシュボードとの最終照合導線
 
 ## TUI Image Input Design
 

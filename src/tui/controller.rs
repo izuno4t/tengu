@@ -319,8 +319,8 @@ impl App {
                     self.state.append_blank_line();
                     return;
                 }
-                SlashCommandOutcome::ShowCost => {
-                    let response = self.show_cost_status();
+                SlashCommandOutcome::UsageCommand(args) => {
+                    let response = self.handle_usage_command(&args);
                     self.state.append_message(&response);
                     self.state.append_blank_line();
                     return;
@@ -1316,7 +1316,7 @@ impl App {
         lines.join("\n")
     }
 
-    fn show_cost_status(&self) -> String {
+    fn show_usage_status(&self) -> String {
         if self.state.provider_usage.is_empty() {
             return [
                 "no provider-reported usage recorded yet.".to_string(),
@@ -1357,6 +1357,59 @@ impl App {
             lines.pop();
         }
         lines.join("\n")
+    }
+
+    fn handle_usage_command(&self, args: &[String]) -> String {
+        if args.is_empty() {
+            return self.show_usage_status();
+        }
+
+        match args[0].as_str() {
+            "show" | "list" => self.show_usage_status(),
+            "export" => {
+                let Some(path) = args.get(1) else {
+                    return "usage: /usage export <path>".to_string();
+                };
+                self.export_usage_to_path(Path::new(path))
+            }
+            _ => "usage: /usage [show|list|export <path>]".to_string(),
+        }
+    }
+
+    fn export_usage_to_path(&self, path: &Path) -> String {
+        let payload = serde_json::json!({
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "records": self
+                .state
+                .provider_usage
+                .iter()
+                .map(|record| serde_json::json!({
+                    "provider": record.provider,
+                    "requests": record.requests,
+                    "input_tokens": record.input_tokens,
+                    "output_tokens": record.output_tokens,
+                    "total_tokens": record.total_tokens,
+                    "cache_creation_input_tokens": record.cache_creation_input_tokens,
+                    "cache_read_input_tokens": record.cache_read_input_tokens,
+                    "reasoning_tokens": record.reasoning_tokens,
+                    "last_raw_usage": record.last_raw,
+                }))
+                .collect::<Vec<_>>(),
+        });
+
+        if let Some(parent) = path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                return format!("usage export failed: {}", err);
+            }
+        }
+
+        match serde_json::to_string_pretty(&payload) {
+            Ok(content) => match fs::write(path, content) {
+                Ok(()) => format!("usage exported: {}", path.display()),
+                Err(err) => format!("usage export failed: {}", err),
+            },
+            Err(err) => format!("usage export failed: {}", err),
+        }
     }
 
     fn set_model(&mut self, model: Option<&str>) -> String {
@@ -1608,7 +1661,7 @@ enum SlashCommandOutcome {
     InitMemory,
     ConfigCommand(Vec<String>),
     ShowBackground,
-    ShowCost,
+    UsageCommand(Vec<String>),
     SetStrategy(Option<String>),
     SetModel(Option<String>),
     AddDir(Vec<PathBuf>),
@@ -1713,7 +1766,9 @@ fn handle_slash_command(input: &str) -> Option<SlashCommandOutcome> {
         "/terminal-setup" => Some(SlashCommandOutcome::TerminalSetup),
         "/vim" => Some(SlashCommandOutcome::ToggleVim),
         "/bg" => Some(SlashCommandOutcome::ShowBackground),
-        "/cost" => Some(SlashCommandOutcome::ShowCost),
+        "/usage" => Some(SlashCommandOutcome::UsageCommand(
+            args.iter().map(|arg| (*arg).to_string()).collect(),
+        )),
         "/strategy" => Some(SlashCommandOutcome::SetStrategy(
             (!args.is_empty()).then(|| args.join(" ")),
         )),
@@ -2028,8 +2083,8 @@ fn slash_help_items() -> Vec<SlashCommandHelp> {
             desc_en: "Show running and queued tasks",
         },
         SlashCommandHelp {
-            cmd: "/cost",
-            desc_en: "Show estimated session usage",
+            cmd: "/usage",
+            desc_en: "Show provider usage",
         },
         SlashCommandHelp {
             cmd: "/compact [note]",
@@ -2726,8 +2781,13 @@ mod tests {
             Some(SlashCommandOutcome::ShowBackground)
         ));
         assert!(matches!(
-            handle_slash_command("/cost"),
-            Some(SlashCommandOutcome::ShowCost)
+            handle_slash_command("/usage"),
+            Some(SlashCommandOutcome::UsageCommand(args)) if args.is_empty()
+        ));
+        assert!(matches!(
+            handle_slash_command("/usage export ./usage.json"),
+            Some(SlashCommandOutcome::UsageCommand(args))
+                if args == vec!["export".to_string(), "./usage.json".to_string()]
         ));
     }
 

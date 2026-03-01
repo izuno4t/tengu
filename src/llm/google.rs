@@ -349,4 +349,20 @@ mod tests {
         let parsed = GoogleBackend::parse_stream_data(payload).unwrap();
         assert!(matches!(parsed, Some(LlmStreamEvent::Text(text)) if text == "hello"));
     }
+
+    #[test]
+    fn parses_usage_from_stream_payload() {
+        let payload = r#"{"usageMetadata":{"promptTokenCount":21,"candidatesTokenCount":8,"totalTokenCount":29,"cachedContentTokenCount":5,"thoughtsTokenCount":3}}"#;
+        let parsed = GoogleBackend::parse_stream_data(payload).unwrap();
+        assert!(matches!(
+            parsed,
+            Some(LlmStreamEvent::Usage(usage))
+                if usage.provider == "google"
+                    && usage.input_tokens == Some(21)
+                    && usage.output_tokens == Some(8)
+                    && usage.total_tokens == Some(29)
+                    && usage.cache_read_input_tokens == Some(5)
+                    && usage.reasoning_tokens == Some(3)
+        ));
+    }
 }

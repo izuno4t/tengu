@@ -1,6 +1,6 @@
 # 👺 Tengu
 
-**A powerful AI coding agent CLI that unifies multiple LLMs**
+A powerful AI coding agent CLI that unifies multiple LLMs.
 
 Tengu is a flexible, multi-LLM coding agent that integrates with MCP servers, supports custom agents, and provides fine-grained permission control for your development workflow.
 
@@ -10,7 +10,7 @@ Tengu is a flexible, multi-LLM coding agent that integrates with MCP servers, su
 - **MCP Integration**: Connect to Model Context Protocol servers
 - **Custom Agents**: Define specialized agents with custom prompts and tools
 - **Permission Control**: Fine-grained tool permissions with glob patterns
-- **Streaming JSON**: `start` / `chunk` / `tool` / `error` / `end` events for automation
+- **Streaming JSON**: `start` / `chunk` / `usage` / `tool` / `error` / `end` events for automation
 - **Project Configuration**: Hierarchical `.tengu/TENGU.md` files for project context
 
 ## 🚀 Quick Start
@@ -73,8 +73,11 @@ Expected behavior:
 
 - A `start` event is printed first
 - One or more `chunk` events follow
+- A `usage` event may appear if the provider returns usage metadata
 - An `end` event is printed last
 - If a backend fails, an `error` event is emitted before exit
+
+For `--output-format json`, Tengu prints a `{"type":"usage", ...}` object before the final `{"type":"response", ...}` object when the provider returns usage metadata.
 
 You can also inspect provider auth readiness with `tengu auth status`.
 
@@ -109,9 +112,9 @@ Use `/image <path> [more_paths...]` to attach images to the next TUI prompt.
 Dragging image file paths into the TUI input also auto-attaches them for the next prompt.
 For local git actions, `/commit <message>` and `/pr [args]` ask for `y/n` confirmation before running `git commit` or `gh pr create`, and `/editor [path]` opens your `$VISUAL` or `$EDITOR`.
 Saved sessions now restore conversation history, visible logs, queued prompts, pending image attachments, and approval prompts that can be acknowledged again after restore.
-Additional TUI workflow commands now include `/plan`, `/taskwriter`, `/apply-plan`, `/compact`, `/memory`, `/init`, `/config`, `/doctor`, `/add-dir`, `/agents`, `/login`, `/logout`, `/pr_comments`, `/terminal-setup`, `/strategy`, `/bg`, `/cost`, `/model`, and `/vim`.
+Additional TUI workflow commands now include `/plan`, `/taskwriter`, `/apply-plan`, `/compact`, `/memory`, `/init`, `/config`, `/doctor`, `/add-dir`, `/agents`, `/login`, `/logout`, `/pr_comments`, `/terminal-setup`, `/strategy`, `/bg`, `/usage`, `/model`, and `/vim`.
 `/config` supports `list`, `get <key>`, and `set <key> <value>` for common local settings such as `model.default`, `model.provider`, and `plan_mode`.
-`/cost` shows provider-agnostic session usage estimates only; exact billing still depends on each provider dashboard and pricing model.
+`/usage` shows provider-reported usage metadata when the selected provider returns it, aggregates it per provider, and preserves it in saved TUI sessions. `/usage export <path>` writes the current aggregated usage snapshot as JSON. Exact billing still depends on each provider pricing model and billing surfaces.
 
 ### Image Input
 
@@ -218,6 +221,7 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## 🙏 Acknowledgments
 
 Inspired by:
+
 - [Claude Code](https://code.claude.com) - Anthropic
 - [Codex CLI](https://github.com/openai/codex) - OpenAI
 - [Aider](https://aider.chat/)
@@ -225,4 +229,4 @@ Inspired by:
 
 ---
 
-**Soar high like a Tengu, command AI with ease 👺**
+Soar high like a Tengu, command AI with ease 👺
