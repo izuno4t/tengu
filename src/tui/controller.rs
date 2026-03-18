@@ -557,6 +557,42 @@ impl App {
         let pending_mode = pending.mode;
         self.state.push_user_conversation(&pending_text);
         let result_tx = self.state.result_tx.clone();
+
+        // Set up tool event handler BEFORE spawning async task to avoid race
+        let tx_for_events = result_tx.clone();
+        runner.set_tool_event_handler(Arc::new(move |event| {
+            let tx = tx_for_events.clone();
+            Box::pin(async move {
+                match event {
+                    crate::agent::ToolEvent::Text(text) => {
+                        let _ = tx.send(Ok(TuiEvent::Chunk(text)));
+                    }
+                    crate::agent::ToolEvent::ToolCall { name, input } => {
+                        let input_str = serde_json::to_string(&input)
+                            .unwrap_or_else(|_| format!("{:?}", input));
+                        let _ = tx.send(Ok(TuiEvent::AgentToolCall {
+                            name,
+                            input: input_str,
+                        }));
+                    }
+                    crate::agent::ToolEvent::ToolResult {
+                        name,
+                        result,
+                        is_error,
+                    } => {
+                        let _ = tx.send(Ok(TuiEvent::AgentToolResult {
+                            name,
+                            result,
+                            is_error,
+                        }));
+                    }
+                    crate::agent::ToolEvent::Usage(usage) => {
+                        let _ = tx.send(Ok(TuiEvent::Usage(usage)));
+                    }
+                }
+            })
+        }));
+
         let handle = self.handle.spawn(async move {
             if pending_mode == PendingMode::Plan {
                 match runner
@@ -575,43 +611,54 @@ impl App {
                 }
                 return;
             }
-            let stream_result = runner
-                .handle_request_stream_with_context(request.clone(), &context)
-                .await;
-            match stream_result {
-                Ok((mut stream, _tool_result)) => {
-                    while let Some(chunk) = stream.next().await {
-                        match chunk {
-                            Ok(LlmStreamEvent::Text(text)) => {
-                                if result_tx.send(Ok(TuiEvent::Chunk(text))).is_err() {
+
+            // Use persisted conversation messages from AgentRunner
+            // This preserves tool_use/tool_result blocks across turns
+            let mut messages = runner.get_conversation_messages();
+
+            if request.images.is_empty() {
+                messages.push(crate::llm::Message::user_text(&pending_text));
+            } else {
+                // For image requests, fall back to legacy API
+                let stream_result = runner
+                    .handle_request_stream_with_context(request.clone(), &context)
+                    .await;
+                match stream_result {
+                    Ok((mut stream, _)) => {
+                        while let Some(chunk) = stream.next().await {
+                            match chunk {
+                                Ok(LlmStreamEvent::Text(text)) => {
+                                    if result_tx.send(Ok(TuiEvent::Chunk(text))).is_err() {
+                                        return;
+                                    }
+                                }
+                                Ok(LlmStreamEvent::Usage(usage)) => {
+                                    if result_tx.send(Ok(TuiEvent::Usage(usage))).is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(err) => {
+                                    let _ = result_tx.send(Err(err));
                                     return;
                                 }
                             }
-                            Ok(LlmStreamEvent::Usage(usage)) => {
-                                if result_tx.send(Ok(TuiEvent::Usage(usage))).is_err() {
-                                    return;
-                                }
-                            }
-                            Err(err) => {
-                                let _ = result_tx.send(Err(err));
-                                return;
-                            }
                         }
-                    }
-                    let _ = result_tx.send(Ok(TuiEvent::Done));
-                }
-                Err(_) => match runner.handle_request_with_context(request, &context).await {
-                    Ok(output) => {
-                        if let Some(usage) = output.response.usage {
-                            let _ = result_tx.send(Ok(TuiEvent::Usage(usage)));
-                        }
-                        let _ = result_tx.send(Ok(TuiEvent::Chunk(output.response.content)));
                         let _ = result_tx.send(Ok(TuiEvent::Done));
                     }
                     Err(err) => {
                         let _ = result_tx.send(Err(err));
                     }
-                },
+                }
+                return;
+            }
+
+            match runner.run_agent_loop(messages).await {
+                Ok(_result) => {
+                    let _ = result_tx.send(Ok(TuiEvent::Done));
+                }
+                Err(err) => {
+                    let _ = result_tx.send(Err(err));
+                }
             }
         });
         self.current_task = Some(handle);
@@ -643,6 +690,31 @@ impl App {
                         self.touch_current_session();
                         self.state.set_idle();
                         self.current_task = None;
+                    }
+                    TuiEvent::AgentToolCall { name, input } => {
+                        self.state.append_message(&format!(
+                            "🔧 {} {}",
+                            name,
+                            if input.len() > 200 {
+                                format!("{}...", &input[..200])
+                            } else {
+                                input
+                            }
+                        ));
+                    }
+                    TuiEvent::AgentToolResult {
+                        name,
+                        result,
+                        is_error,
+                    } => {
+                        let prefix = if is_error { "❌" } else { "✅" };
+                        let truncated = if result.len() > 500 {
+                            format!("{}...", &result[..500])
+                        } else {
+                            result
+                        };
+                        self.state
+                            .append_message(&format!("{} {} → {}", prefix, name, truncated));
                     }
                     TuiEvent::ApprovalRequest {
                         request,
@@ -2019,7 +2091,9 @@ fn format_approval_prompt(request: &ToolApprovalRequest) -> String {
 fn tool_name_label(tool: Tool) -> &'static str {
     match tool {
         Tool::Read => "Read",
+        Tool::Edit => "Edit",
         Tool::Write => "Write",
+        Tool::Bash => "Bash",
         Tool::Shell => "Shell",
         Tool::Grep => "Grep",
         Tool::Glob => "Glob",

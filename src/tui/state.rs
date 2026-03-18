@@ -23,6 +23,15 @@ pub enum TuiEvent {
         request: ToolApprovalRequest,
         respond_to: oneshot::Sender<ToolApprovalDecision>,
     },
+    AgentToolCall {
+        name: String,
+        input: String,
+    },
+    AgentToolResult {
+        name: String,
+        result: String,
+        is_error: bool,
+    },
 }
 
 #[derive(Debug, Clone, Default)]

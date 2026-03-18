@@ -4,7 +4,8 @@ use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 
 use crate::llm::{
-    LlmBackend, LlmProvider, LlmRequest, LlmResponse, LlmStream, LlmStreamEvent, LlmUsage,
+    ChatRequest, ChatResponse, ContentBlock, LlmBackend, LlmProvider, LlmRequest, LlmResponse,
+    LlmStream, LlmStreamEvent, LlmUsage, StopReason,
 };
 
 #[derive(Debug, Clone)]
@@ -19,6 +20,8 @@ struct GenerateRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     images: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +97,7 @@ impl LlmBackend for OllamaBackend {
                 .iter()
                 .map(|image| image.data_base64.clone())
                 .collect(),
+            system: None,
         };
         let response = client
             .post(self.generate_url())
@@ -123,6 +127,7 @@ impl LlmBackend for OllamaBackend {
                 .iter()
                 .map(|image| image.data_base64.clone())
                 .collect(),
+            system: None,
         };
         let response = client
             .post(self.generate_url())
@@ -235,5 +240,38 @@ impl LlmBackend for OllamaBackend {
         });
 
         Ok(Box::pin(output) as BoxStream<'static, Result<LlmStreamEvent>>)
+    }
+
+    /// Ollama の /api/generate は tool_use をネイティブにサポートしないため、
+    /// プロンプトにツール定義を埋め込み、テキスト応答のみ返すフォールバック実装。
+    async fn chat(&self, model: &str, request: &ChatRequest) -> Result<ChatResponse> {
+        // Build a plain-text prompt from messages
+        let mut prompt = String::new();
+        if let Some(system) = &request.system {
+            prompt.push_str("System: ");
+            prompt.push_str(system);
+            prompt.push_str("\n\n");
+        }
+        for msg in &request.messages {
+            let role = match msg.role {
+                crate::llm::MessageRole::User => "User",
+                crate::llm::MessageRole::Assistant => "Assistant",
+            };
+            prompt.push_str(role);
+            prompt.push_str(": ");
+            prompt.push_str(&msg.text_content());
+            prompt.push('\n');
+        }
+
+        let gen_request = LlmRequest::text(prompt);
+        let response = self.generate(model, &gen_request).await?;
+
+        Ok(ChatResponse {
+            content: vec![ContentBlock::Text {
+                text: response.content,
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: response.usage,
+        })
     }
 }

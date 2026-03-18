@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::llm::{
-    LlmBackend, LlmProvider, LlmRequest, LlmResponse, LlmStream, LlmStreamEvent, LlmUsage,
+    ChatRequest, ChatResponse, ContentBlock, LlmBackend, LlmProvider, LlmRequest, LlmResponse,
+    LlmStream, LlmStreamEvent, LlmUsage, StopReason,
 };
 
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -36,6 +37,40 @@ struct StreamOptions {
 struct ChatMessage {
     role: String,
     content: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCallObject>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ToolCallObject {
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    function: FunctionCallObject,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct FunctionCallObject {
+    name: String,
+    arguments: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+struct ToolObject {
+    #[serde(rename = "type")]
+    kind: String,
+    function: FunctionDefinition,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+struct FunctionDefinition {
+    name: String,
+    description: String,
+    parameters: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,11 +109,15 @@ struct OpenAiCompletionTokensDetails {
 #[derive(Debug, Deserialize)]
 struct ChatChoice {
     message: Option<ChatMessageResponse>,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatMessageResponse {
-    content: Value,
+    content: Option<Value>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCallObject>>,
 }
 
 impl OpenAiBackend {
@@ -130,6 +169,8 @@ impl OpenAiBackend {
             messages: vec![ChatMessage {
                 role: "user".to_string(),
                 content,
+                tool_call_id: None,
+                tool_calls: None,
             }],
             stream,
             max_tokens: self.max_tokens,
@@ -205,6 +246,165 @@ impl OpenAiBackend {
 
         Ok(None)
     }
+
+    fn build_chat_body(&self, model: &str, request: &ChatRequest) -> Value {
+        let mut messages = Vec::new();
+
+        if let Some(system) = &request.system {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": system,
+            }));
+        }
+
+        for msg in &request.messages {
+            match msg.role {
+                crate::llm::MessageRole::User => {
+                    // Check if this is a tool_result message
+                    let tool_results: Vec<_> = msg
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                ..
+                            } => Some((tool_use_id, content)),
+                            _ => None,
+                        })
+                        .collect();
+
+                    if !tool_results.is_empty() {
+                        for (tool_use_id, content) in tool_results {
+                            messages.push(serde_json::json!({
+                                "role": "tool",
+                                "tool_call_id": tool_use_id,
+                                "content": content,
+                            }));
+                        }
+                    } else {
+                        let text = msg.text_content();
+                        messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": text,
+                        }));
+                    }
+                }
+                crate::llm::MessageRole::Assistant => {
+                    let tool_uses = msg.tool_uses();
+                    if tool_uses.is_empty() {
+                        messages.push(serde_json::json!({
+                            "role": "assistant",
+                            "content": msg.text_content(),
+                        }));
+                    } else {
+                        let tool_calls: Vec<Value> = tool_uses
+                            .iter()
+                            .map(|(id, name, input)| {
+                                serde_json::json!({
+                                    "id": id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": serde_json::to_string(input).unwrap_or_default(),
+                                    }
+                                })
+                            })
+                            .collect();
+                        let mut msg_obj = serde_json::json!({
+                            "role": "assistant",
+                            "tool_calls": tool_calls,
+                        });
+                        let text = msg.text_content();
+                        if !text.is_empty() {
+                            msg_obj["content"] = Value::String(text);
+                        }
+                        messages.push(msg_obj);
+                    }
+                }
+            }
+        }
+
+        let tools: Vec<Value> = request
+            .tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.input_schema,
+                    }
+                })
+            })
+            .collect();
+
+        let mut body = serde_json::json!({
+            "model": model,
+            "messages": messages,
+        });
+
+        if let Some(max) = self.max_tokens.or(Some(request.max_tokens)) {
+            body["max_tokens"] = Value::Number(max.into());
+        }
+
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools);
+        }
+
+        body
+    }
+
+    fn parse_chat_completion(body: ChatCompletionResponse) -> ChatResponse {
+        let choice = body.choices.into_iter().next();
+        let (finish_reason, message) = match choice {
+            Some(c) => (c.finish_reason, c.message),
+            None => (None, None),
+        };
+
+        let mut content = Vec::new();
+        if let Some(msg) = &message {
+            if let Some(text_val) = &msg.content {
+                let text = match text_val {
+                    Value::String(s) => s.clone(),
+                    _ => text_val.to_string(),
+                };
+                if !text.is_empty() {
+                    content.push(ContentBlock::Text { text });
+                }
+            }
+            if let Some(tool_calls) = &msg.tool_calls {
+                for tc in tool_calls {
+                    let input: Value =
+                        serde_json::from_str(&tc.function.arguments).unwrap_or(Value::Object(Default::default()));
+                    content.push(ContentBlock::ToolUse {
+                        id: tc.id.clone(),
+                        name: tc.function.name.clone(),
+                        input,
+                    });
+                }
+            }
+        }
+
+        let stop_reason = match finish_reason.as_deref() {
+            Some("tool_calls") => StopReason::ToolUse,
+            Some("length") => StopReason::MaxTokens,
+            _ => {
+                if content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. })) {
+                    StopReason::ToolUse
+                } else {
+                    StopReason::EndTurn
+                }
+            }
+        };
+
+        ChatResponse {
+            content,
+            stop_reason,
+            usage: body.usage.map(|u| Self::normalize_usage(u, None)),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -234,12 +434,14 @@ impl LlmBackend for OpenAiBackend {
         let content = body
             .choices
             .into_iter()
-            .find_map(|choice| choice.message.map(|message| message.content))
+            .find_map(|choice| choice.message.and_then(|m| m.content))
             .map(|content| match content {
                 Value::String(text) => text,
                 Value::Array(items) => items
                     .into_iter()
-                    .filter_map(|item| item.get("text").and_then(Value::as_str).map(str::to_string))
+                    .filter_map(|item| {
+                        item.get("text").and_then(Value::as_str).map(str::to_string)
+                    })
                     .collect::<Vec<_>>()
                     .join(""),
                 _ => String::new(),
@@ -347,6 +549,29 @@ impl LlmBackend for OpenAiBackend {
         });
 
         Ok(Box::pin(output) as BoxStream<'static, Result<LlmStreamEvent>>)
+    }
+
+    async fn chat(&self, model: &str, request: &ChatRequest) -> Result<ChatResponse> {
+        let api_key = self.api_key()?;
+        let client = reqwest::Client::new();
+        let body = self.build_chat_body(model, request);
+
+        let response = client
+            .post(self.chat_completions_url())
+            .bearer_auth(&api_key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let resp_body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("openai error: {} {}", status, resp_body.trim()));
+        }
+
+        let completion: ChatCompletionResponse = response.json().await?;
+        Ok(Self::parse_chat_completion(completion))
     }
 }
 

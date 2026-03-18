@@ -1,17 +1,24 @@
 // Agent module
-// エージェント実行ループ（最小）
+// 自律的エージェント実行ループ
 
 use anyhow::Result;
 use futures_util::future::BoxFuture;
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::llm::{LlmClient, LlmRequest, LlmResponse, LlmStream};
-use crate::tools::{
-    ApprovalOverride, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequired,
-    ToolExecutor, ToolInput, ToolPolicy, ToolResult,
+use crate::llm::{
+    ChatRequest, ChatStreamEvent, ContentBlock, LlmClient, LlmRequest, LlmResponse, LlmStream,
+    LlmUsage, Message, StopReason,
 };
+use futures_util::StreamExt;
+use crate::tools::{
+    builtin_tool_definitions, ToolApprovalDecision, ToolApprovalRequest, ToolExecutor, ToolPolicy,
+    ToolResult,
+};
+
+const MAX_AGENT_TURNS: usize = 50;
+/// Maximum number of messages to send in a single request.
+/// Older messages are trimmed to prevent context overflow.
+const MAX_CONTEXT_MESSAGES: usize = 100;
 
 #[allow(dead_code)]
 pub struct Agent {
@@ -31,41 +38,54 @@ impl Agent {
     }
 }
 
+/// Callback type for reporting tool executions to the UI.
+pub type ToolEventHandler = Arc<
+    dyn Fn(ToolEvent) -> BoxFuture<'static, ()> + Send + Sync,
+>;
+
+/// Events emitted during the agent loop for UI display.
+#[derive(Debug, Clone)]
+pub enum ToolEvent {
+    /// LLM produced text output
+    Text(String),
+    /// A tool is about to be called
+    ToolCall {
+        name: String,
+        input: serde_json::Value,
+    },
+    /// A tool completed
+    ToolResult {
+        name: String,
+        result: String,
+        is_error: bool,
+    },
+    /// LLM usage statistics for this turn
+    Usage(LlmUsage),
+}
+
 pub struct AgentRunner {
     client: LlmClient,
     model_name: String,
     tool_policy: ToolPolicy,
     approval_handler: Mutex<Option<ApprovalHandler>>,
+    tool_event_handler: Mutex<Option<ToolEventHandler>>,
+    system_prompt: Mutex<Option<String>>,
+    /// Persistent conversation history across agent loop invocations
+    conversation_messages: Mutex<Vec<Message>>,
 }
 
+#[allow(dead_code)]
 pub struct AgentOutput {
     pub response: LlmResponse,
     pub tool_result: Option<ToolResult>,
+    pub messages: Vec<Message>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(tag = "tool", rename_all = "lowercase")]
-enum ToolCall {
-    Read {
-        path: String,
-    },
-    Write {
-        path: String,
-        content: String,
-    },
-    Shell {
-        command: String,
-        #[serde(default)]
-        args: Vec<String>,
-    },
-    Grep {
-        pattern: String,
-        paths: Vec<String>,
-    },
-    Glob {
-        pattern: String,
-        root: Option<String>,
-    },
+#[allow(dead_code)]
+pub struct AgentLoopResult {
+    pub final_text: String,
+    pub messages: Vec<Message>,
+    pub total_turns: usize,
 }
 
 impl AgentRunner {
@@ -75,6 +95,9 @@ impl AgentRunner {
             model_name,
             tool_policy,
             approval_handler: Mutex::new(None),
+            tool_event_handler: Mutex::new(None),
+            system_prompt: Mutex::new(None),
+            conversation_messages: Mutex::new(Vec::new()),
         }
     }
 
@@ -84,10 +107,261 @@ impl AgentRunner {
         }
     }
 
+    pub fn set_tool_event_handler(&self, handler: ToolEventHandler) {
+        if let Ok(mut guard) = self.tool_event_handler.lock() {
+            *guard = Some(handler);
+        }
+    }
+
+    pub fn set_system_prompt(&self, prompt: String) {
+        if let Ok(mut guard) = self.system_prompt.lock() {
+            *guard = Some(prompt);
+        }
+    }
+
+    fn get_system_prompt(&self) -> Option<String> {
+        self.system_prompt
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    /// Get a copy of the persistent conversation messages.
+    pub fn get_conversation_messages(&self) -> Vec<Message> {
+        self.conversation_messages
+            .lock()
+            .ok()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    /// Replace the persistent conversation messages.
+    fn save_conversation_messages(&self, messages: &[Message]) {
+        if let Ok(mut guard) = self.conversation_messages.lock() {
+            *guard = messages.to_vec();
+        }
+    }
+
+    /// Clear the persistent conversation messages.
+    #[allow(dead_code)]
+    pub fn clear_conversation(&self) {
+        if let Ok(mut guard) = self.conversation_messages.lock() {
+            guard.clear();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Agentic loop (new): LLM → tool_use → result → LLM → ... until end_turn
+    // -----------------------------------------------------------------------
+
+    /// Run the full agentic loop with tool use support.
+    /// Uses streaming for real-time text output.
+    pub async fn run_agent_loop(
+        &self,
+        mut messages: Vec<Message>,
+    ) -> Result<AgentLoopResult> {
+        let tools = builtin_tool_definitions();
+        let system = self.get_system_prompt();
+        let executor = ToolExecutor::with_policy(self.tool_policy.clone());
+        let mut total_turns = 0;
+
+        loop {
+            if total_turns >= MAX_AGENT_TURNS {
+                break;
+            }
+            total_turns += 1;
+
+            // Trim old messages to prevent context overflow
+            let trimmed_messages = if messages.len() > MAX_CONTEXT_MESSAGES {
+                let skip = messages.len() - MAX_CONTEXT_MESSAGES;
+                messages[skip..].to_vec()
+            } else {
+                messages.clone()
+            };
+
+            let request = ChatRequest {
+                system: system.clone(),
+                messages: trimmed_messages,
+                tools: tools.clone(),
+                max_tokens: 16384,
+            };
+
+            // Retry on transient errors
+            let mut stream = {
+                let mut attempt = 0u32;
+                loop {
+                    match self.client.chat_stream(&self.model_name, &request).await {
+                        Ok(s) => break s,
+                        Err(e) => {
+                            attempt += 1;
+                            let err_str = e.to_string();
+                            let is_retryable = err_str.contains("429")
+                                || err_str.contains("529")
+                                || err_str.contains("rate")
+                                || err_str.contains("overloaded")
+                                || err_str.contains("500")
+                                || err_str.contains("502")
+                                || err_str.contains("503");
+                            if attempt >= 3 || !is_retryable {
+                                return Err(e);
+                            }
+                            let delay = std::time::Duration::from_secs(2u64.pow(attempt));
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
+                }
+            };
+
+            // Collect response from stream
+            let mut response_content: Vec<ContentBlock> = Vec::new();
+            let mut text_buffer = String::new();
+            let mut stop_reason = StopReason::EndTurn;
+
+            while let Some(event_result) = stream.next().await {
+                match event_result? {
+                    ChatStreamEvent::TextDelta(delta) => {
+                        // Emit text incrementally for real-time display
+                        self.emit_tool_event(ToolEvent::Text(delta.clone())).await;
+                        text_buffer.push_str(&delta);
+                    }
+                    ChatStreamEvent::ToolUse { id, name, input } => {
+                        // Flush accumulated text as a content block
+                        if !text_buffer.is_empty() {
+                            response_content.push(ContentBlock::Text {
+                                text: std::mem::take(&mut text_buffer),
+                            });
+                        }
+                        response_content.push(ContentBlock::ToolUse {
+                            id,
+                            name,
+                            input,
+                        });
+                    }
+                    ChatStreamEvent::Usage(usage) => {
+                        self.emit_tool_event(ToolEvent::Usage(usage)).await;
+                    }
+                    ChatStreamEvent::Done(reason) => {
+                        stop_reason = reason;
+                    }
+                }
+            }
+
+            // Flush remaining text
+            if !text_buffer.is_empty() {
+                response_content.push(ContentBlock::Text {
+                    text: text_buffer,
+                });
+            }
+
+            // Add assistant response to messages
+            messages.push(Message {
+                role: crate::llm::MessageRole::Assistant,
+                content: response_content.clone(),
+            });
+
+            // If no tool_use, we're done
+            if stop_reason != StopReason::ToolUse {
+                break;
+            }
+
+            // Execute each tool call
+            let tool_uses: Vec<(String, String, serde_json::Value)> = response_content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolUse { id, name, input } => {
+                        Some((id.clone(), name.clone(), input.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            if tool_uses.is_empty() {
+                break;
+            }
+
+            let mut tool_results = Vec::new();
+            for (id, name, input) in &tool_uses {
+                self.emit_tool_event(ToolEvent::ToolCall {
+                    name: name.clone(),
+                    input: input.clone(),
+                })
+                .await;
+
+                let (result_text, is_error) = executor.execute_from_json(name, input);
+
+                self.emit_tool_event(ToolEvent::ToolResult {
+                    name: name.clone(),
+                    result: result_text.clone(),
+                    is_error,
+                })
+                .await;
+
+                tool_results.push(ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: result_text,
+                    is_error,
+                });
+            }
+
+            // Add tool results as user message
+            messages.push(Message::tool_results(tool_results));
+        }
+
+        // Extract final text from the last assistant message
+        let final_text = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::MessageRole::Assistant)
+            .map(|m| m.text_content())
+            .unwrap_or_default();
+
+        // Persist messages for multi-turn conversation
+        self.save_conversation_messages(&messages);
+
+        Ok(AgentLoopResult {
+            final_text,
+            messages,
+            total_turns,
+        })
+    }
+
+    /// Convenience: start a new agent loop from a single user prompt.
+    pub async fn run_prompt(&self, input: &str) -> Result<AgentLoopResult> {
+        let messages = vec![Message::user_text(input)];
+        self.run_agent_loop(messages).await
+    }
+
+    /// Convenience: continue an existing conversation with a new user message.
+    #[allow(dead_code)]
+    pub async fn continue_conversation(
+        &self,
+        mut messages: Vec<Message>,
+        input: &str,
+    ) -> Result<AgentLoopResult> {
+        messages.push(Message::user_text(input));
+        self.run_agent_loop(messages).await
+    }
+
+    async fn emit_tool_event(&self, event: ToolEvent) {
+        let handler = self
+            .tool_event_handler
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(handler) = handler {
+            handler(event).await;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Legacy API (kept for backward compatibility with TUI/CLI)
+    // -----------------------------------------------------------------------
+
     pub async fn handle_prompt(&self, input: &str) -> Result<AgentOutput> {
         self.handle_prompt_with_context(input, "").await
     }
 
+    #[allow(dead_code)]
     pub async fn handle_request_with_context(
         &self,
         request: LlmRequest,
@@ -122,6 +396,7 @@ impl AgentRunner {
                 usage: final_response.usage,
             },
             tool_result: None,
+            messages: Vec::new(),
         })
     }
 
@@ -130,20 +405,28 @@ impl AgentRunner {
         input: &str,
         context: &str,
     ) -> Result<AgentOutput> {
-        let (_plan, final_prompt, tool_result) = self
-            .resolve_final_prompt_with_context(input, context)
-            .await?;
-        let final_response = self
-            .client
-            .generate(&self.model_name, &LlmRequest::text(final_prompt))
-            .await?;
-        let response = LlmResponse {
-            content: final_response.content.trim().to_string(),
-            usage: final_response.usage,
-        };
+        // Use the new agentic loop
+        let mut messages = Vec::new();
+        if !context.trim().is_empty() {
+            // Add context as a prior user/assistant exchange
+            messages.push(Message::user_text(format!(
+                "Previous conversation context:\n{}",
+                context
+            )));
+            messages.push(Message::assistant_text(
+                "Understood. I have the context.",
+            ));
+        }
+        messages.push(Message::user_text(input));
+
+        let result = self.run_agent_loop(messages).await?;
         Ok(AgentOutput {
-            response,
-            tool_result,
+            response: LlmResponse {
+                content: result.final_text,
+                usage: None,
+            },
+            tool_result: None,
+            messages: result.messages,
         })
     }
 
@@ -195,445 +478,44 @@ impl AgentRunner {
         input: &str,
         context: &str,
     ) -> Result<(LlmStream, Option<ToolResult>)> {
-        let (_plan, final_prompt, tool_result) = self
-            .resolve_final_prompt_with_context(input, context)
-            .await?;
+        let final_prompt = if context.trim().is_empty() {
+            input.to_string()
+        } else {
+            format!(
+                "Conversation context:\n{}\n\nUser request:\n{}",
+                context, input
+            )
+        };
         let stream = self
             .client
             .generate_stream(&self.model_name, &LlmRequest::text(final_prompt))
             .await?;
-        Ok((stream, tool_result))
+        Ok((stream, None))
     }
 
-    fn execute_tool_call(&self, call: ToolCall) -> Result<ToolResult> {
-        let executor = ToolExecutor::with_policy(self.tool_policy.clone());
-        match call {
-            ToolCall::Read { path } => executor.execute(ToolInput::Read {
-                path: PathBuf::from(path),
-            }),
-            ToolCall::Write { path, content } => {
-                executor.preview_write(PathBuf::from(path), content)
-            }
-            ToolCall::Shell { command, args } => {
-                executor.execute(ToolInput::Shell { command, args })
-            }
-            ToolCall::Grep { pattern, paths } => executor.execute(ToolInput::Grep {
-                pattern,
-                paths: paths.into_iter().map(PathBuf::from).collect(),
-            }),
-            ToolCall::Glob { pattern, root } => executor.execute(ToolInput::Glob {
-                pattern,
-                root: root.map(PathBuf::from),
-            }),
-        }
-    }
-}
-
-impl AgentRunner {
     pub async fn generate_plan_text_with_context(
         &self,
         input: &str,
         context: &str,
     ) -> Result<String> {
-        self.generate_plan_with_context(input, context).await
-    }
-
-    async fn generate_plan_with_context(&self, input: &str, context: &str) -> Result<String> {
-        let prompt = build_plan_prompt_with_context(input, context);
+        let prompt = if context.trim().is_empty() {
+            format!(
+                "次の指示に対して、最小の計画を1-3項目で日本語の箇条書きで作成してください。\n\n指示:\n{}",
+                input
+            )
+        } else {
+            format!(
+                "次の過去の会話を踏まえて、指示に対する最小の計画を1-3項目で日本語の箇条書きで作成してください。\n\n過去の会話:\n{}\n\n指示:\n{}",
+                context, input
+            )
+        };
         let response = self
             .client
             .generate(&self.model_name, &LlmRequest::text(prompt))
             .await?;
         Ok(response.content)
     }
-
-    async fn resolve_final_prompt_with_context(
-        &self,
-        input: &str,
-        context: &str,
-    ) -> Result<(String, String, Option<ToolResult>)> {
-        let plan = self.generate_plan_with_context(input, context).await?;
-        let mut last_error: Option<String> = None;
-        let mut last_call: Option<ToolCall> = None;
-        let mut tool_result: Option<ToolResult> = None;
-
-        for attempt in 0..=MAX_TOOL_RETRIES {
-            if let Some(path) = detect_direct_read_path(input) {
-                let call = ToolCall::Read { path };
-                match self.execute_tool_call(call.clone()) {
-                    Ok(result) => {
-                        let follow_prompt = build_followup_prompt_with_context(
-                            input,
-                            context,
-                            &plan,
-                            &format_tool_result(&result),
-                        );
-                        tool_result = Some(result);
-                        return Ok((plan, follow_prompt, tool_result));
-                    }
-                    Err(err) => {
-                        if let Some(required) = err.downcast_ref::<ToolApprovalRequired>() {
-                            let request = ToolApprovalRequest {
-                                tool: required.tool,
-                                paths: required.paths.clone(),
-                            };
-                            match self.request_approval(request).await {
-                                Ok(decision) => match decision {
-                                    ToolApprovalDecision::AllowOnce => {
-                                        self.tool_policy.set_approval_override(
-                                            ApprovalOverride::AllowOnce(required.tool),
-                                        );
-                                        continue;
-                                    }
-                                    ToolApprovalDecision::AllowAll => {
-                                        self.tool_policy
-                                            .set_approval_override(ApprovalOverride::AllowAll);
-                                        continue;
-                                    }
-                                    ToolApprovalDecision::DenyOnce => {
-                                        return Err(anyhow::anyhow!(
-                                            "permission denied by user for tool: {:?}",
-                                            required.tool
-                                        ));
-                                    }
-                                    ToolApprovalDecision::DenyAll => {
-                                        self.tool_policy
-                                            .set_approval_override(ApprovalOverride::DenyAll);
-                                        return Err(anyhow::anyhow!(
-                                            "permission denied by user for tool: {:?}",
-                                            required.tool
-                                        ));
-                                    }
-                                },
-                                Err(_) => {
-                                    return Err(err);
-                                }
-                            }
-                        }
-                        last_error = Some(err.to_string());
-                        last_call = Some(call);
-                        if attempt >= MAX_TOOL_RETRIES {
-                            let fallback_prompt = build_failed_followup_prompt_with_context(
-                                input,
-                                context,
-                                &plan,
-                                last_error.as_deref(),
-                            );
-                            return Ok((plan, fallback_prompt, tool_result));
-                        }
-                    }
-                }
-            }
-            let selection = self
-                .select_tool_with_context(
-                    input,
-                    context,
-                    &plan,
-                    last_error.as_deref(),
-                    last_call.as_ref(),
-                )
-                .await?;
-            let Some(call) = selection else {
-                let execute_prompt = build_execute_prompt_with_context(input, context, &plan);
-                return Ok((plan, execute_prompt, tool_result));
-            };
-
-            match self.execute_tool_call(call.clone()) {
-                Ok(result) => {
-                    let follow_prompt = build_followup_prompt_with_context(
-                        input,
-                        context,
-                        &plan,
-                        &format_tool_result(&result),
-                    );
-                    tool_result = Some(result);
-                    return Ok((plan, follow_prompt, tool_result));
-                }
-                Err(err) => {
-                    if let Some(required) = err.downcast_ref::<ToolApprovalRequired>() {
-                        let request = ToolApprovalRequest {
-                            tool: required.tool,
-                            paths: required.paths.clone(),
-                        };
-                        match self.request_approval(request).await {
-                            Ok(decision) => match decision {
-                                ToolApprovalDecision::AllowOnce => {
-                                    self.tool_policy.set_approval_override(
-                                        ApprovalOverride::AllowOnce(required.tool),
-                                    );
-                                    continue;
-                                }
-                                ToolApprovalDecision::AllowAll => {
-                                    self.tool_policy
-                                        .set_approval_override(ApprovalOverride::AllowAll);
-                                    continue;
-                                }
-                                ToolApprovalDecision::DenyOnce => {
-                                    return Err(anyhow::anyhow!(
-                                        "permission denied by user for tool: {:?}",
-                                        required.tool
-                                    ));
-                                }
-                                ToolApprovalDecision::DenyAll => {
-                                    self.tool_policy
-                                        .set_approval_override(ApprovalOverride::DenyAll);
-                                    return Err(anyhow::anyhow!(
-                                        "permission denied by user for tool: {:?}",
-                                        required.tool
-                                    ));
-                                }
-                            },
-                            Err(_) => {
-                                return Err(err);
-                            }
-                        }
-                    }
-                    last_error = Some(err.to_string());
-                    last_call = Some(call);
-                    if attempt >= MAX_TOOL_RETRIES {
-                        let fallback_prompt = build_failed_followup_prompt_with_context(
-                            input,
-                            context,
-                            &plan,
-                            last_error.as_deref(),
-                        );
-                        return Ok((plan, fallback_prompt, tool_result));
-                    }
-                }
-            }
-        }
-
-        Err(anyhow::anyhow!("final prompt is missing"))
-    }
-
-    async fn request_approval(&self, request: ToolApprovalRequest) -> Result<ToolApprovalDecision> {
-        let handler = self
-            .approval_handler
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone());
-        if let Some(handler) = handler {
-            Ok(handler(request).await)
-        } else {
-            Err(anyhow::anyhow!("approval handler not configured"))
-        }
-    }
-
-    async fn select_tool_with_context(
-        &self,
-        input: &str,
-        context: &str,
-        plan: &str,
-        last_error: Option<&str>,
-        last_call: Option<&ToolCall>,
-    ) -> Result<Option<ToolCall>> {
-        let prompt =
-            build_tool_select_prompt_with_context(input, context, plan, last_error, last_call);
-        let response = self
-            .client
-            .generate(&self.model_name, &LlmRequest::text(prompt))
-            .await?;
-        Ok(parse_tool_call_loose(&response.content))
-    }
 }
 
 type ApprovalHandler =
     Arc<dyn Fn(ToolApprovalRequest) -> BoxFuture<'static, ToolApprovalDecision> + Send + Sync>;
-
-const MAX_TOOL_RETRIES: usize = 2;
-
-fn build_plan_prompt(input: &str) -> String {
-    format!(
-        "次の指示に対して、最小の計画を1-3項目で日本語の箇条書きで作成してください。\n\n指示:\n{}",
-        input
-    )
-}
-
-fn build_plan_prompt_with_context(input: &str, context: &str) -> String {
-    if context.trim().is_empty() {
-        return build_plan_prompt(input);
-    }
-    format!(
-        "次の過去の会話を踏まえて、指示に対する最小の計画を1-3項目で日本語の箇条書きで作成してください。\n\n過去の会話:\n{}\n\n指示:\n{}",
-        context, input
-    )
-}
-
-fn build_execute_prompt(input: &str, plan: &str) -> String {
-    format!(
-        "次の計画に従って実行してください。\n\n計画:\n{}\n\n指示:\n{}",
-        plan, input
-    )
-}
-
-fn build_execute_prompt_with_context(input: &str, context: &str, plan: &str) -> String {
-    if context.trim().is_empty() {
-        return build_execute_prompt(input, plan);
-    }
-    format!(
-        "次の過去の会話と計画に従って実行してください。\n\n過去の会話:\n{}\n\n計画:\n{}\n\n指示:\n{}",
-        context, plan, input
-    )
-}
-
-fn build_tool_select_prompt_with_context(
-    input: &str,
-    context: &str,
-    plan: &str,
-    last_error: Option<&str>,
-    last_call: Option<&ToolCall>,
-) -> String {
-    let mut extra = String::new();
-    if let Some(error) = last_error {
-        extra.push_str("\n前回の失敗理由:\n");
-        extra.push_str(error);
-        extra.push('\n');
-    }
-    if let Some(call) = last_call {
-        if let Ok(json) = serde_json::to_string(call) {
-            extra.push_str("前回のツール呼び出し:\n");
-            extra.push_str(&json);
-            extra.push('\n');
-        }
-    }
-    format!(
-        "次の過去の会話と計画を進めるために必要なツールがあれば、JSONのみで出力してください。\n\
-ツールが不要なら {{\"tool\":\"none\"}} とだけ出力してください。{}\n\n\
-過去の会話:\n{}\n\n計画:\n{}\n\n指示:\n{}",
-        extra, context, plan, input
-    )
-}
-
-fn build_followup_prompt(input: &str, plan: &str, tool_result: &str) -> String {
-    format!(
-        "実行結果を踏まえて最終回答を簡潔に出力してください。\n\n指示:\n{}\n\n計画:\n{}\n\nツール結果:\n{}",
-        input, plan, tool_result
-    )
-}
-
-fn build_followup_prompt_with_context(
-    input: &str,
-    context: &str,
-    plan: &str,
-    tool_result: &str,
-) -> String {
-    if context.trim().is_empty() {
-        return build_followup_prompt(input, plan, tool_result);
-    }
-    format!(
-        "実行結果を踏まえて最終回答を簡潔に出力してください。\n\n過去の会話:\n{}\n\n指示:\n{}\n\n計画:\n{}\n\nツール結果:\n{}",
-        context, input, plan, tool_result
-    )
-}
-
-fn build_failed_followup_prompt(input: &str, plan: &str, error: Option<&str>) -> String {
-    let mut prompt = format!(
-        "ツール実行に失敗したため、失敗理由を踏まえて最終回答を簡潔に出力してください。\n\n指示:\n{}\n\n計画:\n{}",
-        input, plan
-    );
-    if let Some(error) = error {
-        prompt.push_str("\n\n失敗理由:\n");
-        prompt.push_str(error);
-    }
-    prompt
-}
-
-fn build_failed_followup_prompt_with_context(
-    input: &str,
-    context: &str,
-    plan: &str,
-    error: Option<&str>,
-) -> String {
-    if context.trim().is_empty() {
-        return build_failed_followup_prompt(input, plan, error);
-    }
-    let mut prompt = format!(
-        "ツール実行に失敗したため、失敗理由を踏まえて最終回答を簡潔に出力してください。\n\n過去の会話:\n{}\n\n指示:\n{}\n\n計画:\n{}",
-        context, input, plan
-    );
-    if let Some(error) = error {
-        prompt.push_str("\n\n失敗理由:\n");
-        prompt.push_str(error);
-    }
-    prompt
-}
-fn format_tool_result(result: &ToolResult) -> String {
-    match result {
-        ToolResult::Text(text) => text.clone(),
-        ToolResult::Lines(lines) => lines.join("\n"),
-        ToolResult::Paths(paths) => paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        ToolResult::Status(code) => format!("status: {}", code),
-        ToolResult::PreviewWrite { diff, .. } => diff.clone(),
-    }
-}
-
-fn parse_tool_call_loose(content: &str) -> Option<ToolCall> {
-    let trimmed = content.trim();
-    if !trimmed.starts_with('{') {
-        return None;
-    }
-    let call: ToolCall = serde_json::from_str(trimmed).ok()?;
-    match call {
-        ToolCall::Read { .. }
-        | ToolCall::Write { .. }
-        | ToolCall::Shell { .. }
-        | ToolCall::Grep { .. }
-        | ToolCall::Glob { .. } => Some(call),
-    }
-}
-
-fn detect_direct_read_path(input: &str) -> Option<String> {
-    let lowered = input.to_ascii_lowercase();
-    if !(lowered.contains("read") || input.contains('読')) {
-        return None;
-    }
-    extract_path_like(input)
-}
-
-fn extract_path_like(input: &str) -> Option<String> {
-    let mut current = String::new();
-    let mut best = String::new();
-    for ch in input.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '/' || ch == '.' || ch == '_' || ch == '-' {
-            current.push(ch);
-        } else {
-            if is_path_candidate(&current) {
-                best = pick_longer(best, current.clone());
-            }
-            current.clear();
-        }
-    }
-    if is_path_candidate(&current) {
-        best = pick_longer(best, current);
-    }
-    if best.is_empty() {
-        None
-    } else {
-        Some(best)
-    }
-}
-
-fn is_path_candidate(value: &str) -> bool {
-    if value.is_empty() {
-        return false;
-    }
-    if value.contains('/') {
-        return true;
-    }
-    value.ends_with(".md")
-        || value.ends_with(".rs")
-        || value.ends_with(".toml")
-        || value.ends_with(".json")
-}
-
-fn pick_longer(current: String, candidate: String) -> String {
-    if candidate.len() > current.len() {
-        candidate
-    } else {
-        current
-    }
-}

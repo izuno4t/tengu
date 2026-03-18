@@ -1,20 +1,25 @@
 // Tools module
-// ビルトインツール
+// ビルトインツール: Read, Edit, Write, Bash, Grep, Glob
 
 use anyhow::{anyhow, Result};
+use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-
 use crate::config::{Config, PermissionsConfig, SandboxConfig};
+use crate::llm::ToolDefinition;
+
+const BASH_TIMEOUT_SECS: u64 = 120;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     Read,
+    Edit,
     Write,
-    Shell,
+    Bash,
+    Shell, // alias for Bash (backward compat)
     Grep,
     Glob,
 }
@@ -23,6 +28,13 @@ pub enum Tool {
 pub enum ToolInput {
     Read {
         path: PathBuf,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    },
+    Edit {
+        path: PathBuf,
+        old_string: String,
+        new_string: String,
     },
     Write {
         path: PathBuf,
@@ -33,6 +45,10 @@ pub enum ToolInput {
         command: String,
         args: Vec<String>,
     },
+    Bash {
+        command: String,
+        timeout: Option<u64>,
+    },
     Grep {
         pattern: String,
         paths: Vec<PathBuf>,
@@ -41,6 +57,9 @@ pub enum ToolInput {
         pattern: String,
         root: Option<PathBuf>,
     },
+    ListFiles {
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -48,12 +67,29 @@ pub enum ToolResult {
     Text(String),
     Lines(Vec<String>),
     Paths(Vec<PathBuf>),
+    #[allow(dead_code)]
     Status(i32),
     PreviewWrite {
         path: PathBuf,
         diff: String,
         content: String,
     },
+}
+
+impl ToolResult {
+    pub fn to_string_lossy(&self) -> String {
+        match self {
+            ToolResult::Text(text) => text.clone(),
+            ToolResult::Lines(lines) => lines.join("\n"),
+            ToolResult::Paths(paths) => paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            ToolResult::Status(code) => format!("exit code: {}", code),
+            ToolResult::PreviewWrite { diff, .. } => diff.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +123,7 @@ impl ToolPolicy {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_approval_override(&self, override_state: ApprovalOverride) {
         if let Ok(mut guard) = self.approval_override.lock() {
             *guard = override_state;
@@ -133,7 +170,13 @@ impl ToolPolicy {
                     }
                 }
                 "read-only" => {
-                    if matches!(input, ToolInput::Write { .. } | ToolInput::Shell { .. }) {
+                    if matches!(
+                        input,
+                        ToolInput::Write { .. }
+                            | ToolInput::Edit { .. }
+                            | ToolInput::Shell { .. }
+                            | ToolInput::Bash { .. }
+                    ) {
                         return Err(anyhow!(
                             "permission denied by approval_policy=read-only for tool: {}",
                             tool_name(input)
@@ -177,7 +220,13 @@ impl ToolPolicy {
             .to_ascii_lowercase();
 
         if matches!(mode.as_str(), "read-only")
-            && matches!(input, ToolInput::Write { .. } | ToolInput::Shell { .. })
+            && matches!(
+                input,
+                ToolInput::Write { .. }
+                    | ToolInput::Edit { .. }
+                    | ToolInput::Shell { .. }
+                    | ToolInput::Bash { .. }
+            )
         {
             return Err(anyhow!(
                 "sandbox denies write in read-only mode: {}",
@@ -186,10 +235,10 @@ impl ToolPolicy {
         }
 
         if matches!(mode.as_str(), "workspace-write") {
-            if matches!(input, ToolInput::Shell { .. }) {
+            if matches!(input, ToolInput::Shell { .. } | ToolInput::Bash { .. }) {
                 return Err(anyhow!("sandbox denies shell in workspace-write mode"));
             }
-            if matches!(input, ToolInput::Write { .. }) {
+            if matches!(input, ToolInput::Write { .. } | ToolInput::Edit { .. }) {
                 let paths = tool_paths(input);
                 for path in paths {
                     self.enforce_path_limits(&path, sandbox, true)?;
@@ -275,9 +324,59 @@ impl ToolExecutor {
     pub fn execute(&self, input: ToolInput) -> Result<ToolResult> {
         self.policy.check(&input)?;
         match input {
-            ToolInput::Read { path } => {
-                let content = fs::read_to_string(&path)?;
-                Ok(ToolResult::Text(content))
+            ToolInput::Read { path, offset, limit } => {
+                let content = fs::read_to_string(&path)
+                    .map_err(|e| anyhow!("failed to read {}: {}", path.display(), e))?;
+                let lines: Vec<&str> = content.lines().collect();
+                let total = lines.len();
+                let start = offset.unwrap_or(0).min(total);
+                let end = limit
+                    .map(|l| (start + l).min(total))
+                    .unwrap_or(total);
+                let numbered: Vec<String> = lines[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| format!("{:>6}\t{}", start + i + 1, line))
+                    .collect();
+                let mut result = numbered.join("\n");
+                if offset.is_some() || limit.is_some() {
+                    result = format!(
+                        "(showing lines {}-{} of {})\n{}",
+                        start + 1,
+                        end,
+                        total,
+                        result
+                    );
+                }
+                Ok(ToolResult::Text(result))
+            }
+            ToolInput::Edit {
+                path,
+                old_string,
+                new_string,
+            } => {
+                let content = fs::read_to_string(&path)
+                    .map_err(|e| anyhow!("failed to read {}: {}", path.display(), e))?;
+                let count = content.matches(&old_string).count();
+                if count == 0 {
+                    return Err(anyhow!(
+                        "old_string not found in {}",
+                        path.display()
+                    ));
+                }
+                if count > 1 {
+                    return Err(anyhow!(
+                        "old_string found {} times in {} (must be unique)",
+                        count,
+                        path.display()
+                    ));
+                }
+                let new_content = content.replacen(&old_string, &new_string, 1);
+                fs::write(&path, &new_content)?;
+                Ok(ToolResult::Text(format!(
+                    "Successfully edited {}",
+                    path.display()
+                )))
             }
             ToolInput::Write { path, content } => {
                 if let Some(parent) = path.parent() {
@@ -285,24 +384,91 @@ impl ToolExecutor {
                         fs::create_dir_all(parent)?;
                     }
                 }
-                fs::write(&path, content)?;
-                Ok(ToolResult::Status(0))
+                fs::write(&path, &content)?;
+                Ok(ToolResult::Text(format!(
+                    "Successfully wrote {} ({} bytes)",
+                    path.display(),
+                    content.len()
+                )))
             }
             ToolInput::Shell { command, args } => {
-                let output = Command::new(&command).args(args).output()?;
-                if output.status.success() {
-                    Ok(ToolResult::Text(
-                        String::from_utf8_lossy(&output.stdout).to_string(),
-                    ))
+                // Legacy: delegate to Bash
+                let full_cmd = if args.is_empty() {
+                    command
                 } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    Err(anyhow!("command failed: {} ({})", command, stderr.trim()))
+                    format!("{} {}", command, args.join(" "))
+                };
+                self.execute(ToolInput::Bash {
+                    command: full_cmd,
+                    timeout: None,
+                })
+            }
+            ToolInput::Bash { command, timeout } => {
+                let timeout_secs = timeout.unwrap_or(BASH_TIMEOUT_SECS);
+                let mut child = Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .current_dir(&self.policy.workspace_root)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .map_err(|e| anyhow!("failed to spawn command: {}", e))?;
+
+                // Apply timeout
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_status)) => break,
+                        Ok(None) => {
+                            if std::time::Instant::now() >= deadline {
+                                let _ = child.kill();
+                                return Ok(ToolResult::Text(format!(
+                                    "command timed out after {}s",
+                                    timeout_secs
+                                )));
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        Err(e) => return Err(anyhow!("error waiting for command: {}", e)),
+                    }
                 }
+
+                let output = child
+                    .wait_with_output()
+                    .map_err(|e| anyhow!("command failed: {}", e))?;
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let exit_code = output.status.code().unwrap_or(-1);
+                let mut result = String::new();
+                if !stdout.is_empty() {
+                    result.push_str(&stdout);
+                }
+                if !stderr.is_empty() {
+                    if !result.is_empty() {
+                        result.push('\n');
+                    }
+                    result.push_str("stderr:\n");
+                    result.push_str(&stderr);
+                }
+                if result.is_empty() {
+                    result = format!("(exit code: {})", exit_code);
+                } else if exit_code != 0 {
+                    result.push_str(&format!("\n(exit code: {})", exit_code));
+                }
+                Ok(ToolResult::Text(result))
             }
             ToolInput::Grep { pattern, paths } => {
+                let re = regex::Regex::new(&pattern)
+                    .map_err(|e| anyhow!("invalid regex '{}': {}", pattern, e))?;
                 let mut matches = Vec::new();
-                for path in paths {
-                    collect_grep_matches(&pattern, &path, &mut matches)?;
+                let search_paths = if paths.is_empty() {
+                    vec![PathBuf::from(".")]
+                } else {
+                    paths
+                };
+                for path in search_paths {
+                    collect_grep_matches_regex(&re, &path, &mut matches)?;
                 }
                 Ok(ToolResult::Lines(matches))
             }
@@ -312,6 +478,149 @@ impl ToolExecutor {
                 collect_glob_matches(&root, &pattern, &mut matches)?;
                 Ok(ToolResult::Paths(matches))
             }
+            ToolInput::ListFiles { path } => {
+                if !path.is_dir() {
+                    return Err(anyhow!("{} is not a directory", path.display()));
+                }
+                let mut entries = Vec::new();
+                for entry in fs::read_dir(&path)? {
+                    let entry = entry?;
+                    let meta = entry.metadata()?;
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let kind = if meta.is_dir() { "dir" } else { "file" };
+                    let size = if meta.is_file() { meta.len() } else { 0 };
+                    entries.push(format!("{}\t{}\t{}", kind, size, name));
+                }
+                entries.sort();
+                Ok(ToolResult::Text(entries.join("\n")))
+            }
+        }
+    }
+
+    /// Execute a tool from JSON input (used by the agentic loop).
+    /// Returns (result_text, is_error).
+    pub fn execute_from_json(&self, tool_name: &str, input: &Value) -> (String, bool) {
+        let result = match tool_name {
+            "Read" => {
+                let path = input
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let offset = input
+                    .get("offset")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as usize);
+                let limit = input
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as usize);
+                self.execute(ToolInput::Read {
+                    path: PathBuf::from(path),
+                    offset,
+                    limit,
+                })
+            }
+            "Edit" => {
+                let path = input
+                    .get("path")
+                    .or_else(|| input.get("file_path"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let old_string = input
+                    .get("old_string")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let new_string = input
+                    .get("new_string")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                self.execute(ToolInput::Edit {
+                    path: PathBuf::from(path),
+                    old_string: old_string.to_string(),
+                    new_string: new_string.to_string(),
+                })
+            }
+            "Write" => {
+                let path = input
+                    .get("path")
+                    .or_else(|| input.get("file_path"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let content = input
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                self.execute(ToolInput::Write {
+                    path: PathBuf::from(path),
+                    content: content.to_string(),
+                })
+            }
+            "Bash" | "Shell" => {
+                let command = input
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let timeout = input
+                    .get("timeout")
+                    .and_then(Value::as_u64);
+                self.execute(ToolInput::Bash {
+                    command: command.to_string(),
+                    timeout,
+                })
+            }
+            "Grep" => {
+                let pattern = input
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let paths: Vec<PathBuf> = input
+                    .get("paths")
+                    .or_else(|| input.get("path"))
+                    .map(|v| match v {
+                        Value::Array(arr) => arr
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(PathBuf::from)
+                            .collect(),
+                        Value::String(s) => vec![PathBuf::from(s)],
+                        _ => vec![],
+                    })
+                    .unwrap_or_default();
+                self.execute(ToolInput::Grep {
+                    pattern: pattern.to_string(),
+                    paths,
+                })
+            }
+            "Glob" => {
+                let pattern = input
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let root = input
+                    .get("root")
+                    .or_else(|| input.get("path"))
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from);
+                self.execute(ToolInput::Glob {
+                    pattern: pattern.to_string(),
+                    root,
+                })
+            }
+            "ListFiles" => {
+                let path = input
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or(".");
+                self.execute(ToolInput::ListFiles {
+                    path: PathBuf::from(path),
+                })
+            }
+            _ => Err(anyhow!("unknown tool: {}", tool_name)),
+        };
+
+        match result {
+            Ok(r) => (r.to_string_lossy(), false),
+            Err(e) => (format!("Error: {}", e), true),
         }
     }
 }
@@ -322,33 +631,182 @@ impl Default for ToolExecutor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tool definitions for LLM
+// ---------------------------------------------------------------------------
+
+pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "Read".to_string(),
+            description: "Read the contents of a file. Returns numbered lines. Use offset and limit for large files.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The absolute or relative file path to read"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Line offset to start reading from (0-based). Optional."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of lines to read. Optional."
+                    }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolDefinition {
+            name: "Edit".to_string(),
+            description: "Edit a file by replacing an exact string with a new string. The old_string must appear exactly once in the file.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The file path to edit"
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "The exact string to find and replace (must be unique in the file)"
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "The replacement string"
+                    }
+                },
+                "required": ["path", "old_string", "new_string"]
+            }),
+        },
+        ToolDefinition {
+            name: "Write".to_string(),
+            description: "Write content to a file. Creates parent directories if needed. Overwrites existing content.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The file path to write"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The content to write"
+                    }
+                },
+                "required": ["path", "content"]
+            }),
+        },
+        ToolDefinition {
+            name: "Bash".to_string(),
+            description: "Execute a shell command. Returns stdout, stderr, and exit code.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute"
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds (default: 120)"
+                    }
+                },
+                "required": ["command"]
+            }),
+        },
+        ToolDefinition {
+            name: "Grep".to_string(),
+            description: "Search file contents using a regex pattern. Returns matching lines with file paths and line numbers.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regex pattern to search for"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "File or directory to search in (default: current directory)"
+                    }
+                },
+                "required": ["pattern"]
+            }),
+        },
+        ToolDefinition {
+            name: "Glob".to_string(),
+            description: "Find files matching a glob pattern. Returns matching file paths.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern (e.g. '*.rs', 'src/**/*.ts')"
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Root directory to search from (default: current directory)"
+                    }
+                },
+                "required": ["pattern"]
+            }),
+        },
+        ToolDefinition {
+            name: "ListFiles".to_string(),
+            description: "List files and directories in a directory. Returns type, size, and name for each entry.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path to list (default: current directory)"
+                    }
+                },
+                "required": ["path"]
+            }),
+        },
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 fn tool_name(input: &ToolInput) -> &'static str {
     match input {
         ToolInput::Read { .. } => "Read",
+        ToolInput::Edit { .. } => "Edit",
         ToolInput::Write { .. } => "Write",
         ToolInput::Shell { .. } => "Shell",
+        ToolInput::Bash { .. } => "Bash",
         ToolInput::Grep { .. } => "Grep",
         ToolInput::Glob { .. } => "Glob",
+        ToolInput::ListFiles { .. } => "ListFiles",
     }
 }
 
 fn tool_kind(input: &ToolInput) -> Tool {
     match input {
         ToolInput::Read { .. } => Tool::Read,
+        ToolInput::Edit { .. } => Tool::Edit,
         ToolInput::Write { .. } => Tool::Write,
-        ToolInput::Shell { .. } => Tool::Shell,
+        ToolInput::Shell { .. } | ToolInput::Bash { .. } => Tool::Bash,
         ToolInput::Grep { .. } => Tool::Grep,
-        ToolInput::Glob { .. } => Tool::Glob,
+        ToolInput::Glob { .. } | ToolInput::ListFiles { .. } => Tool::Glob,
     }
 }
 
 fn tool_paths(input: &ToolInput) -> Vec<PathBuf> {
     match input {
-        ToolInput::Read { path } => vec![path.clone()],
+        ToolInput::Read { path, .. } => vec![path.clone()],
+        ToolInput::Edit { path, .. } => vec![path.clone()],
         ToolInput::Write { path, .. } => vec![path.clone()],
         ToolInput::Grep { paths, .. } => paths.clone(),
         ToolInput::Glob { root, .. } => root.clone().map(|p| vec![p]).unwrap_or_default(),
-        ToolInput::Shell { .. } => Vec::new(),
+        ToolInput::ListFiles { path } => vec![path.clone()],
+        ToolInput::Shell { .. } | ToolInput::Bash { .. } => Vec::new(),
     }
 }
 
@@ -367,6 +825,7 @@ pub struct ToolApprovalRequest {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ToolApprovalRequired {
     pub tool: Tool,
     pub paths: Vec<PathBuf>,
@@ -390,6 +849,7 @@ impl std::fmt::Display for ToolApprovalRequired {
 impl std::error::Error for ToolApprovalRequired {}
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum ApprovalOverride {
     None,
     AllowOnce(Tool),
@@ -440,7 +900,9 @@ fn rule_matches_tool(rule: &str, input: &ToolInput, root: Option<&Path>) -> bool
     let tool = tool_name(input);
     let name_lower = name.to_ascii_lowercase();
     let tool_lower = tool.to_ascii_lowercase();
-    let matches_name = name_lower == tool_lower || (name_lower == "bash" && tool_lower == "shell");
+    let matches_name = name_lower == tool_lower
+        || (name_lower == "bash" && tool_lower == "shell")
+        || (name_lower == "shell" && tool_lower == "bash");
     if !matches_name {
         return false;
     }
@@ -455,7 +917,10 @@ fn rule_matches_tool(rule: &str, input: &ToolInput, root: Option<&Path>) -> bool
 
 fn tool_match_targets(input: &ToolInput, root: Option<&Path>) -> Vec<String> {
     match input {
-        ToolInput::Read { path } | ToolInput::Write { path, .. } => {
+        ToolInput::Read { path, .. }
+        | ToolInput::Edit { path, .. }
+        | ToolInput::Write { path, .. }
+        | ToolInput::ListFiles { path } => {
             let abs = root
                 .map(|r| resolve_path(r, path))
                 .unwrap_or_else(|| path.clone());
@@ -471,6 +936,9 @@ fn tool_match_targets(input: &ToolInput, root: Option<&Path>) -> Vec<String> {
                 cmd.push_str(&args.join(" "));
             }
             vec![cmd]
+        }
+        ToolInput::Bash { command, .. } => {
+            vec![command.clone()]
         }
         ToolInput::Grep { pattern, paths } => {
             let mut out = Vec::new();
@@ -493,11 +961,32 @@ fn tool_match_targets(input: &ToolInput, root: Option<&Path>) -> Vec<String> {
     }
 }
 
-fn collect_grep_matches(pattern: &str, path: &Path, out: &mut Vec<String>) -> Result<()> {
+fn collect_grep_matches_regex(
+    re: &regex::Regex,
+    path: &Path,
+    out: &mut Vec<String>,
+) -> Result<()> {
+    collect_grep_matches_regex_inner(re, path, out, true)
+}
+
+fn collect_grep_matches_regex_inner(
+    re: &regex::Regex,
+    path: &Path,
+    out: &mut Vec<String>,
+    is_root: bool,
+) -> Result<()> {
     if path.is_dir() {
+        // Skip hidden dirs and common non-text dirs, but not the initial root
+        if !is_root {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with('.') || name == "node_modules" || name == "target" {
+                    return Ok(());
+                }
+            }
+        }
         for entry in fs::read_dir(path)? {
             let entry = entry?;
-            collect_grep_matches(pattern, &entry.path(), out)?;
+            collect_grep_matches_regex_inner(re, &entry.path(), out, false)?;
         }
         return Ok(());
     }
@@ -506,9 +995,13 @@ fn collect_grep_matches(pattern: &str, path: &Path, out: &mut Vec<String>) -> Re
         return Ok(());
     }
 
-    let content = fs::read_to_string(path)?;
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Ok(()), // Skip binary/unreadable files
+    };
+
     for (idx, line) in content.lines().enumerate() {
-        if line.contains(pattern) {
+        if re.is_match(line) {
             out.push(format!(
                 "{}:{}:{}",
                 path.display(),
@@ -521,10 +1014,27 @@ fn collect_grep_matches(pattern: &str, path: &Path, out: &mut Vec<String>) -> Re
 }
 
 fn collect_glob_matches(root: &Path, pattern: &str, out: &mut Vec<PathBuf>) -> Result<()> {
+    collect_glob_matches_inner(root, pattern, out, true)
+}
+
+fn collect_glob_matches_inner(
+    root: &Path,
+    pattern: &str,
+    out: &mut Vec<PathBuf>,
+    is_root: bool,
+) -> Result<()> {
     if root.is_dir() {
+        // Skip hidden/excluded directories, but never skip the initial root
+        if !is_root {
+            if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with('.') || name == "node_modules" || name == "target" {
+                    return Ok(());
+                }
+            }
+        }
         for entry in fs::read_dir(root)? {
             let entry = entry?;
-            collect_glob_matches(&entry.path(), pattern, out)?;
+            collect_glob_matches_inner(&entry.path(), pattern, out, false)?;
         }
         return Ok(());
     }
@@ -537,10 +1047,18 @@ fn collect_glob_matches(root: &Path, pattern: &str, out: &mut Vec<PathBuf>) -> R
 
 fn matches_glob(pattern: &str, path: &Path) -> bool {
     let target = path.to_string_lossy();
+    // Check just the filename for simple patterns
+    if !pattern.contains('/') {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if wildcard_match(pattern, name) {
+                return true;
+            }
+        }
+    }
     wildcard_match(pattern, &target)
 }
 
-fn build_diff(path: &Path, before: &str, after: &str) -> String {
+pub fn build_diff(path: &Path, before: &str, after: &str) -> String {
     let mut out = String::new();
     out.push_str("--- ");
     out.push_str(&path.to_string_lossy());
@@ -608,4 +1126,617 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     }
 
     p_idx == p.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn make_executor(dir: &Path) -> ToolExecutor {
+        let policy = ToolPolicy {
+            workspace_root: dir.to_path_buf(),
+            ..ToolPolicy::default()
+        };
+        ToolExecutor::with_policy(policy)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Read Tool Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn read_returns_numbered_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.txt");
+        fs::write(&path, "line one\nline two\nline three\n").unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::Read {
+                path: path.clone(),
+                offset: None,
+                limit: None,
+            })
+            .unwrap();
+        let text = result.to_string_lossy();
+        assert!(text.contains("1\tline one"));
+        assert!(text.contains("2\tline two"));
+        assert!(text.contains("3\tline three"));
+    }
+
+    #[test]
+    fn read_with_offset_and_limit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.txt");
+        fs::write(&path, "line1\nline2\nline3\nline4\nline5\n").unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::Read {
+                path: path.clone(),
+                offset: Some(1),
+                limit: Some(2),
+            })
+            .unwrap();
+        let text = result.to_string_lossy();
+        assert!(text.contains("showing lines 2-3 of 5"));
+        assert!(text.contains("line2"));
+        assert!(text.contains("line3"));
+        assert!(!text.contains("line1"));
+        assert!(!text.contains("line4"));
+    }
+
+    #[test]
+    fn read_nonexistent_file_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nonexistent.txt");
+        let exec = make_executor(dir.path());
+        let result = exec.execute(ToolInput::Read {
+            path,
+            offset: None,
+            limit: None,
+        });
+        assert!(result.is_err());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Write Tool Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn write_creates_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("new.txt");
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::Write {
+                path: path.clone(),
+                content: "hello world".to_string(),
+            })
+            .unwrap();
+        let text = result.to_string_lossy();
+        assert!(text.contains("Successfully wrote"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn write_creates_parent_directories() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sub").join("dir").join("file.txt");
+        let exec = make_executor(dir.path());
+        exec.execute(ToolInput::Write {
+            path: path.clone(),
+            content: "nested".to_string(),
+        })
+        .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "nested");
+    }
+
+    #[test]
+    fn write_overwrites_existing_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("overwrite.txt");
+        fs::write(&path, "old content").unwrap();
+        let exec = make_executor(dir.path());
+        exec.execute(ToolInput::Write {
+            path: path.clone(),
+            content: "new content".to_string(),
+        })
+        .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new content");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Edit Tool Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn edit_replaces_unique_string() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("edit.txt");
+        fs::write(&path, "hello world\nfoo bar\n").unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::Edit {
+                path: path.clone(),
+                old_string: "foo bar".to_string(),
+                new_string: "baz qux".to_string(),
+            })
+            .unwrap();
+        let text = result.to_string_lossy();
+        assert!(text.contains("Successfully edited"));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "hello world\nbaz qux\n"
+        );
+    }
+
+    #[test]
+    fn edit_fails_when_string_not_found() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("edit.txt");
+        fs::write(&path, "hello world\n").unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec.execute(ToolInput::Edit {
+            path: path.clone(),
+            old_string: "nonexistent".to_string(),
+            new_string: "replacement".to_string(),
+        });
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn edit_fails_when_string_not_unique() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("edit.txt");
+        fs::write(&path, "hello\nhello\nhello\n").unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec.execute(ToolInput::Edit {
+            path: path.clone(),
+            old_string: "hello".to_string(),
+            new_string: "world".to_string(),
+        });
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("3 times"));
+    }
+
+    #[test]
+    fn edit_preserves_surrounding_content() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("edit.txt");
+        fs::write(&path, "before\ntarget_line\nafter\n").unwrap();
+        let exec = make_executor(dir.path());
+        exec.execute(ToolInput::Edit {
+            path: path.clone(),
+            old_string: "target_line".to_string(),
+            new_string: "replaced_line".to_string(),
+        })
+        .unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("before\n"));
+        assert!(content.contains("replaced_line\n"));
+        assert!(content.contains("after\n"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Bash Tool Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn bash_simple_echo() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::Bash {
+                command: "echo hello_world".to_string(),
+                timeout: None,
+            })
+            .unwrap();
+        let text = result.to_string_lossy();
+        assert!(text.contains("hello_world"));
+    }
+
+    #[test]
+    fn bash_captures_stderr() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::Bash {
+                command: "echo err_msg >&2".to_string(),
+                timeout: None,
+            })
+            .unwrap();
+        let text = result.to_string_lossy();
+        assert!(text.contains("err_msg"));
+    }
+
+    #[test]
+    fn bash_returns_exit_code() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::Bash {
+                command: "exit 42".to_string(),
+                timeout: None,
+            })
+            .unwrap();
+        let text = result.to_string_lossy();
+        assert!(text.contains("exit code"));
+        assert!(text.contains("42"));
+    }
+
+    #[test]
+    fn bash_combined_stdout_stderr() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::Bash {
+                command: "echo OUT && echo ERR >&2".to_string(),
+                timeout: None,
+            })
+            .unwrap();
+        let text = result.to_string_lossy();
+        assert!(text.contains("OUT"));
+        assert!(text.contains("ERR"));
+    }
+
+    #[test]
+    fn bash_timeout_kills_slow_command() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::Bash {
+                command: "sleep 30".to_string(),
+                timeout: Some(1),
+            })
+            .unwrap();
+        let text = result.to_string_lossy();
+        assert!(text.contains("timed out"));
+    }
+
+    #[test]
+    fn bash_runs_in_workspace_root() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::Bash {
+                command: "pwd".to_string(),
+                timeout: None,
+            })
+            .unwrap();
+        let text = result.to_string_lossy();
+        // The output should contain the temp dir path
+        let dir_str = dir.path().to_string_lossy();
+        assert!(
+            text.contains(&*dir_str),
+            "pwd output '{}' should contain '{}'",
+            text,
+            dir_str
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Grep Tool Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn grep_finds_matching_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("search.txt");
+        fs::write(&path, "alpha beta\ngamma delta\nalpha omega\n").unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::Grep {
+                pattern: "alpha".to_string(),
+                paths: vec![path],
+            })
+            .unwrap();
+        let text = result.to_string_lossy();
+        assert!(text.contains("alpha beta"));
+        assert!(text.contains("alpha omega"));
+        assert!(!text.contains("gamma delta"));
+    }
+
+    #[test]
+    fn grep_supports_regex() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("regex.txt");
+        fs::write(&path, "foo123bar\nbaz456qux\nfoo789xyz\n").unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::Grep {
+                pattern: r"foo\d+".to_string(),
+                paths: vec![path],
+            })
+            .unwrap();
+        let text = result.to_string_lossy();
+        assert!(text.contains("foo123bar"));
+        assert!(text.contains("foo789xyz"));
+        assert!(!text.contains("baz456qux"));
+    }
+
+    #[test]
+    fn grep_invalid_regex_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec.execute(ToolInput::Grep {
+            pattern: "[invalid".to_string(),
+            paths: vec![dir.path().to_path_buf()],
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn grep_searches_directory_recursively() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.txt"), "findme here\n").unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("b.txt"), "findme nested\n").unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::Grep {
+                pattern: "findme".to_string(),
+                paths: vec![dir.path().to_path_buf()],
+            })
+            .unwrap();
+        let text = result.to_string_lossy();
+        assert!(text.contains("findme here"));
+        assert!(text.contains("findme nested"));
+    }
+
+    #[test]
+    fn grep_skips_hidden_dirs() {
+        let dir = TempDir::new().unwrap();
+        let hidden = dir.path().join(".hidden");
+        fs::create_dir(&hidden).unwrap();
+        fs::write(hidden.join("secret.txt"), "findme secret\n").unwrap();
+        fs::write(dir.path().join("visible.txt"), "findme visible\n").unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::Grep {
+                pattern: "findme".to_string(),
+                paths: vec![dir.path().to_path_buf()],
+            })
+            .unwrap();
+        let text = result.to_string_lossy();
+        assert!(text.contains("findme visible"));
+        assert!(!text.contains("findme secret"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Glob Tool Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn glob_finds_matching_files() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.rs"), "").unwrap();
+        fs::write(dir.path().join("b.rs"), "").unwrap();
+        fs::write(dir.path().join("c.txt"), "").unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::Glob {
+                pattern: "*.rs".to_string(),
+                root: Some(dir.path().to_path_buf()),
+            })
+            .unwrap();
+        // Glob returns Paths with full paths
+        match &result {
+            ToolResult::Paths(paths) => {
+                let names: Vec<String> = paths
+                    .iter()
+                    .filter_map(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().to_string())
+                    .collect();
+                assert!(names.contains(&"a.rs".to_string()), "Missing a.rs in {:?}", names);
+                assert!(names.contains(&"b.rs".to_string()), "Missing b.rs in {:?}", names);
+                assert!(!names.contains(&"c.txt".to_string()), "Should not contain c.txt");
+            }
+            other => panic!("Expected Paths, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn glob_recursive_pattern() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(dir.path().join("top.py"), "").unwrap();
+        fs::write(sub.join("nested.py"), "").unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::Glob {
+                pattern: "*.py".to_string(),
+                root: Some(dir.path().to_path_buf()),
+            })
+            .unwrap();
+        match &result {
+            ToolResult::Paths(paths) => {
+                let names: Vec<String> = paths
+                    .iter()
+                    .filter_map(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().to_string())
+                    .collect();
+                assert!(
+                    names.contains(&"top.py".to_string())
+                        || names.contains(&"nested.py".to_string()),
+                    "Should find at least one .py file, got {:?}",
+                    names
+                );
+            }
+            other => panic!("Expected Paths, got {:?}", other),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ListFiles Tool Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn list_files_shows_entries() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+        let sub = dir.path().join("subdir");
+        fs::create_dir(&sub).unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::ListFiles {
+                path: dir.path().to_path_buf(),
+            })
+            .unwrap();
+        let text = result.to_string_lossy();
+        assert!(text.contains("file.txt"));
+        assert!(text.contains("subdir"));
+        assert!(text.contains("dir"));
+        assert!(text.contains("file"));
+    }
+
+    #[test]
+    fn list_files_error_on_nonexistent() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec.execute(ToolInput::ListFiles {
+            path: dir.path().join("nonexistent"),
+        });
+        assert!(result.is_err());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // execute_from_json Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn execute_from_json_read() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.txt");
+        fs::write(&path, "hello\n").unwrap();
+        let exec = make_executor(dir.path());
+        let (result, is_error) = exec.execute_from_json(
+            "Read",
+            &serde_json::json!({"path": path.to_str().unwrap()}),
+        );
+        assert!(!is_error);
+        assert!(result.contains("hello"));
+    }
+
+    #[test]
+    fn execute_from_json_write() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("out.txt");
+        let exec = make_executor(dir.path());
+        let (result, is_error) = exec.execute_from_json(
+            "Write",
+            &serde_json::json!({"path": path.to_str().unwrap(), "content": "written"}),
+        );
+        assert!(!is_error);
+        assert!(result.contains("Successfully wrote"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "written");
+    }
+
+    #[test]
+    fn execute_from_json_edit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("edit.txt");
+        fs::write(&path, "old_content\n").unwrap();
+        let exec = make_executor(dir.path());
+        let (result, is_error) = exec.execute_from_json(
+            "Edit",
+            &serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "old_content",
+                "new_string": "new_content"
+            }),
+        );
+        assert!(!is_error);
+        assert!(result.contains("Successfully edited"));
+    }
+
+    #[test]
+    fn execute_from_json_bash() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let (result, is_error) = exec.execute_from_json(
+            "Bash",
+            &serde_json::json!({"command": "echo from_json"}),
+        );
+        assert!(!is_error);
+        assert!(result.contains("from_json"));
+    }
+
+    #[test]
+    fn execute_from_json_unknown_tool() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let (result, is_error) =
+            exec.execute_from_json("UnknownTool", &serde_json::json!({}));
+        assert!(is_error);
+        assert!(result.contains("unknown tool"));
+    }
+
+    #[test]
+    fn execute_from_json_list_files() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("x.txt"), "").unwrap();
+        let exec = make_executor(dir.path());
+        let (result, is_error) = exec.execute_from_json(
+            "ListFiles",
+            &serde_json::json!({"path": dir.path().to_str().unwrap()}),
+        );
+        assert!(!is_error);
+        assert!(result.contains("x.txt"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Tool Definitions Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn builtin_definitions_has_all_tools() {
+        let defs = builtin_tool_definitions();
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"Read"));
+        assert!(names.contains(&"Edit"));
+        assert!(names.contains(&"Write"));
+        assert!(names.contains(&"Bash"));
+        assert!(names.contains(&"Grep"));
+        assert!(names.contains(&"Glob"));
+        assert!(names.contains(&"ListFiles"));
+    }
+
+    #[test]
+    fn tool_definitions_have_required_fields() {
+        let defs = builtin_tool_definitions();
+        for def in &defs {
+            assert!(!def.name.is_empty());
+            assert!(!def.description.is_empty());
+            assert!(def.input_schema.is_object());
+            let schema = def.input_schema.as_object().unwrap();
+            assert_eq!(schema.get("type").unwrap(), "object");
+            assert!(schema.contains_key("properties"));
+            assert!(schema.contains_key("required"));
+        }
+    }
+
+    #[test]
+    fn tool_definitions_required_fields_exist_in_properties() {
+        let defs = builtin_tool_definitions();
+        for def in &defs {
+            let schema = def.input_schema.as_object().unwrap();
+            let properties = schema.get("properties").unwrap().as_object().unwrap();
+            let required = schema.get("required").unwrap().as_array().unwrap();
+            for req in required {
+                let field = req.as_str().unwrap();
+                assert!(
+                    properties.contains_key(field),
+                    "Tool '{}' has required field '{}' not in properties",
+                    def.name,
+                    field
+                );
+            }
+        }
+    }
 }

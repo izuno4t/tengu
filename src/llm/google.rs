@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::llm::{
-    LlmBackend, LlmProvider, LlmRequest, LlmResponse, LlmStream, LlmStreamEvent, LlmUsage,
+    ChatRequest, ChatResponse, ContentBlock, LlmBackend, LlmProvider, LlmRequest, LlmResponse,
+    LlmStream, LlmStreamEvent, LlmUsage, StopReason,
 };
 
 const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -64,6 +65,8 @@ struct GoogleUsageMetadata {
 #[derive(Debug, Deserialize)]
 struct GoogleCandidate {
     content: Option<GoogleContentResponse>,
+    #[serde(rename = "finishReason", default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,7 +76,17 @@ struct GoogleContentResponse {
 
 #[derive(Debug, Deserialize)]
 struct GooglePartResponse {
+    #[serde(default)]
     text: Option<String>,
+    #[serde(rename = "functionCall", default)]
+    function_call: Option<GoogleFunctionCall>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleFunctionCall {
+    name: String,
+    #[serde(default)]
+    args: Option<Value>,
 }
 
 impl GoogleBackend {
@@ -185,6 +198,129 @@ impl GoogleBackend {
             Ok(None)
         } else {
             Ok(Some(LlmStreamEvent::Text(text)))
+        }
+    }
+
+    fn build_chat_body(&self, model: &str, request: &ChatRequest) -> Value {
+        let mut contents = Vec::new();
+
+        for msg in &request.messages {
+            let role = match msg.role {
+                crate::llm::MessageRole::User => "user",
+                crate::llm::MessageRole::Assistant => "model",
+            };
+
+            let mut parts = Vec::new();
+            for block in &msg.content {
+                match block {
+                    ContentBlock::Text { text } => {
+                        parts.push(serde_json::json!({"text": text}));
+                    }
+                    ContentBlock::ToolUse { name, input, .. } => {
+                        parts.push(serde_json::json!({
+                            "functionCall": {
+                                "name": name,
+                                "args": input,
+                            }
+                        }));
+                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id: _,
+                        content,
+                        ..
+                    } => {
+                        parts.push(serde_json::json!({
+                            "functionResponse": {
+                                "name": "tool",
+                                "response": {"result": content},
+                            }
+                        }));
+                    }
+                }
+            }
+
+            contents.push(serde_json::json!({"role": role, "parts": parts}));
+        }
+
+        let tools: Vec<Value> = request
+            .tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                })
+            })
+            .collect();
+
+        let mut body = serde_json::json!({
+            "contents": contents,
+        });
+
+        if !tools.is_empty() {
+            body["tools"] = serde_json::json!([{
+                "functionDeclarations": tools,
+            }]);
+        }
+
+        if let Some(system) = &request.system {
+            body["systemInstruction"] = serde_json::json!({
+                "parts": [{"text": system}],
+            });
+        }
+
+        let _ = model; // model is in the URL, not the body
+        body
+    }
+
+    fn parse_generate_content_response(body: GenerateContentResponse) -> ChatResponse {
+        let mut content = Vec::new();
+        let mut finish_reason = None;
+
+        if let Some(candidates) = body.candidates {
+            for candidate in candidates {
+                finish_reason = candidate.finish_reason;
+                if let Some(resp_content) = candidate.content {
+                    if let Some(parts) = resp_content.parts {
+                        for part in parts {
+                            if let Some(text) = part.text {
+                                content.push(ContentBlock::Text { text });
+                            }
+                            if let Some(fc) = part.function_call {
+                                let id = uuid::Uuid::new_v4().to_string();
+                                content.push(ContentBlock::ToolUse {
+                                    id,
+                                    name: fc.name,
+                                    input: fc
+                                        .args
+                                        .unwrap_or(Value::Object(Default::default())),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let has_tool_use = content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+        let stop_reason = if has_tool_use {
+            StopReason::ToolUse
+        } else {
+            match finish_reason.as_deref() {
+                Some("MAX_TOKENS") => StopReason::MaxTokens,
+                _ => StopReason::EndTurn,
+            }
+        };
+
+        ChatResponse {
+            content,
+            stop_reason,
+            usage: body
+                .usage_metadata
+                .map(|u| Self::normalize_usage(u, None)),
         }
     }
 }
@@ -326,6 +462,28 @@ impl LlmBackend for GoogleBackend {
         });
 
         Ok(Box::pin(output) as BoxStream<'static, Result<LlmStreamEvent>>)
+    }
+
+    async fn chat(&self, model: &str, request: &ChatRequest) -> Result<ChatResponse> {
+        let api_key = self.api_key()?;
+        let client = reqwest::Client::new();
+        let body = self.build_chat_body(model, request);
+
+        let response = client
+            .post(self.generate_url(model, false, &api_key))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let resp_body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("google error: {} {}", status, resp_body.trim()));
+        }
+
+        let gen_response: GenerateContentResponse = response.json().await?;
+        Ok(Self::parse_generate_content_response(gen_response))
     }
 }
 

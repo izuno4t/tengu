@@ -516,7 +516,7 @@ impl Cli {
         let executor = ToolExecutor::with_policy(policy);
         let result = match command {
             ToolCommands::Read { path } => {
-                executor.execute(ToolInput::Read { path: path.clone() })?
+                executor.execute(ToolInput::Read { path: path.clone(), offset: None, limit: None })?
             }
             ToolCommands::Write { path, content } => {
                 let preview = executor.preview_write(path.clone(), content.clone())?;
@@ -606,6 +606,12 @@ impl Cli {
         let policy = ToolPolicy::from_config(&config);
         let status_model = model_name.clone();
         let runner = std::sync::Arc::new(AgentRunner::new(client, model_name, policy));
+
+        // Set system prompt for TUI mode
+        let (system_prompt, _sources) = self.resolve_system_prompt()?;
+        let effective_prompt = system_prompt.unwrap_or_else(default_system_prompt);
+        runner.set_system_prompt(effective_prompt);
+
         let handle = tokio::runtime::Handle::current();
         let status_build = option_env!("BUILD_TIMESTAMP")
             .unwrap_or("unknown")
@@ -664,57 +670,89 @@ impl Cli {
                 }
                 let policy = ToolPolicy::from_config(&config);
                 let runner = AgentRunner::new(client, model_name, policy);
-                let (mut stream, tool_result) = runner
-                    .handle_prompt_stream_with_tool_context(&request.prompt, "")
-                    .await?;
+                let effective_prompt = system_prompt
+                    .clone()
+                    .unwrap_or_else(default_system_prompt);
+                runner.set_system_prompt(effective_prompt);
 
-                println!("{}", json!({ "type": "start", "mode": "llm" }));
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(LlmStreamEvent::Text(text)) => {
-                            println!(
-                                "{}",
-                                json!({ "type": "chunk", "mode": "llm", "delta": text })
-                            );
+                // Set up tool event handler for stream-json output
+                let tx_json = std::sync::Arc::new(std::sync::Mutex::new(()));
+                let _lock = tx_json; // ensure serialization
+                runner.set_tool_event_handler(std::sync::Arc::new(move |event| {
+                    Box::pin(async move {
+                        match event {
+                            crate::agent::ToolEvent::Text(text) => {
+                                println!(
+                                    "{}",
+                                    json!({ "type": "chunk", "mode": "llm", "delta": text })
+                                );
+                            }
+                            crate::agent::ToolEvent::ToolCall { name, input } => {
+                                println!(
+                                    "{}",
+                                    json!({
+                                        "type": "tool_call",
+                                        "mode": "tool",
+                                        "name": name,
+                                        "input": input
+                                    })
+                                );
+                            }
+                            crate::agent::ToolEvent::ToolResult {
+                                name,
+                                result,
+                                is_error,
+                            } => {
+                                println!(
+                                    "{}",
+                                    json!({
+                                        "type": "tool_result",
+                                        "mode": "tool",
+                                        "name": name,
+                                        "result": result,
+                                        "is_error": is_error
+                                    })
+                                );
+                            }
+                            crate::agent::ToolEvent::Usage(usage) => {
+                                println!(
+                                    "{}",
+                                    json!({
+                                        "type": "usage",
+                                        "mode": "llm",
+                                        "usage": {
+                                            "provider": &usage.provider,
+                                            "input_tokens": usage.input_tokens,
+                                            "output_tokens": usage.output_tokens,
+                                        }
+                                    })
+                                );
+                            }
                         }
-                        Ok(LlmStreamEvent::Usage(usage)) => {
-                            println!(
-                                "{}",
-                                json!({ "type": "usage", "mode": "llm", "usage": usage_to_json(&usage) })
-                            );
-                        }
-                        Err(err) => {
-                            println!(
-                                "{}",
-                                json!({ "type": "error", "mode": "llm", "message": err.to_string() })
-                            );
-                            println!("{}", json!({ "type": "end", "mode": "llm" }));
-                            return Err(err);
-                        }
-                    }
-                }
+                    })
+                }));
 
-                if let Some(result) = tool_result.as_ref() {
-                    println!(
-                        "{}",
-                        json!({
-                            "type": "tool",
-                            "mode": "tool",
-                            "content": format_tool_result(result)
-                        })
-                    );
-                    if let Some(applied) = apply_preview_write_with_config(result)? {
+                println!("{}", json!({ "type": "start", "mode": "agent" }));
+                match runner.run_prompt(&request.prompt).await {
+                    Ok(result) => {
                         println!(
                             "{}",
                             json!({
-                                "type": "tool",
-                                "mode": "tool",
-                                "content": format_tool_result(&applied)
+                                "type": "result",
+                                "mode": "agent",
+                                "text": result.final_text,
+                                "turns": result.total_turns
                             })
                         );
                     }
+                    Err(err) => {
+                        println!(
+                            "{}",
+                            json!({ "type": "error", "mode": "agent", "message": err.to_string() })
+                        );
+                    }
                 }
-                println!("{}", json!({ "type": "end", "mode": "llm" }));
+                println!("{}", json!({ "type": "end", "mode": "agent" }));
                 return Ok(());
             }
         }
@@ -739,17 +777,50 @@ impl Cli {
             }
             let policy = ToolPolicy::from_config(&config);
             let runner = AgentRunner::new(client, model_name, policy);
-            let output = runner.handle_prompt(&request.prompt).await?;
-            if self.output_format == "json" {
-                if let Some(usage) = output.response.usage.as_ref() {
-                    println!(
-                        "{}",
-                        json!({ "type": "usage", "usage": usage_to_json(usage) })
-                    );
-                }
-            }
-            self.print_output("llm", &output.response.content, Some(prompt));
-            self.print_tool_result(&output);
+            let effective_prompt = system_prompt
+                .clone()
+                .unwrap_or_else(default_system_prompt);
+            runner.set_system_prompt(effective_prompt);
+
+            // Show tool events in headless text mode
+            let verbose = self.verbose;
+            runner.set_tool_event_handler(std::sync::Arc::new(move |event| {
+                Box::pin(async move {
+                    match event {
+                        crate::agent::ToolEvent::Text(_) => {
+                            // Text will be printed at the end via final_text
+                        }
+                        crate::agent::ToolEvent::ToolCall { name, input } => {
+                            if verbose {
+                                let input_str = serde_json::to_string_pretty(&input)
+                                    .unwrap_or_else(|_| format!("{:?}", input));
+                                eprintln!("[tool:{}] {}", name, input_str);
+                            }
+                        }
+                        crate::agent::ToolEvent::ToolResult {
+                            name,
+                            is_error,
+                            ..
+                        } => {
+                            if verbose {
+                                let status = if is_error { "ERROR" } else { "OK" };
+                                eprintln!("[tool:{}] {}", name, status);
+                            }
+                        }
+                        crate::agent::ToolEvent::Usage(usage) => {
+                            if verbose {
+                                eprintln!(
+                                    "[usage] in={} out={}",
+                                    usage.input_tokens.unwrap_or(0),
+                                    usage.output_tokens.unwrap_or(0),
+                                );
+                            }
+                        }
+                    }
+                })
+            }));
+            let result = runner.run_prompt(&request.prompt).await?;
+            self.print_output("llm", &result.final_text, Some(prompt));
         }
         Ok(())
     }
@@ -956,6 +1027,7 @@ impl Cli {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn print_tool_result(&self, output: &AgentOutput) {
         let Some(result) = output.tool_result.as_ref() else {
             return;
@@ -1068,6 +1140,48 @@ fn clear_auth_session_at(path: &Path) -> Result<()> {
         fs::remove_file(path)?;
     }
     Ok(())
+}
+
+fn default_system_prompt() -> String {
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
+    format!(
+r#"You are Tengu (天狗), an expert autonomous coding agent. You solve software engineering tasks by reading, writing, and executing code.
+
+# Environment
+- Working directory: {cwd}
+- Platform: {platform}
+- You can execute any shell command via the Bash tool.
+
+# Available Tools
+1. **Read** - Read file contents (supports offset/limit for large files)
+2. **Edit** - Replace exact strings in files (old_string must be unique)
+3. **Write** - Create new files or completely overwrite existing ones
+4. **Bash** - Execute shell commands (sh -c). Use for builds, tests, git, package management.
+5. **Grep** - Search file contents using regex patterns
+6. **Glob** - Find files matching glob patterns (e.g., "**/*.rs")
+7. **ListFiles** - List directory contents with file types and sizes
+
+# Guidelines
+- **Read before editing**: Always read a file before modifying it.
+- **Edit over Write**: Use Edit for partial changes. Use Write only for new files.
+- **Verify changes**: After making changes, verify by reading the file or running tests.
+- **Iterative approach**: If a build/test fails, read the error, fix the issue, and retry.
+- **Be concise**: Focus on solving the task. Explain only when asked.
+- **Path handling**: Use absolute paths when possible. The Edit tool requires old_string to appear exactly once.
+- **Error handling**: If a tool returns an error, analyze the error and try a different approach.
+- **Multi-step tasks**: Break complex tasks into steps. Use Bash for builds and tests between steps.
+
+# Important Rules
+- Never guess file contents. Always read first.
+- When editing, provide enough context in old_string to uniquely identify the target.
+- For shell commands, prefer single commands. Use && to chain dependent commands.
+- If you're unsure about the project structure, use ListFiles and Glob to explore first."#,
+        cwd = cwd,
+        platform = std::env::consts::OS,
+    )
 }
 
 fn usage_to_json(usage: &LlmUsage) -> serde_json::Value {

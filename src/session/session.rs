@@ -4,6 +4,7 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -101,6 +102,9 @@ pub struct Session {
     pub usage_records: Vec<SessionUsageRecord>,
     #[serde(default)]
     pub pending_approval: Option<SessionPendingApproval>,
+    /// Structured message history for agentic loop (Message[] serialized as JSON)
+    #[serde(default)]
+    pub messages: Vec<Value>,
 }
 
 impl Session {
@@ -120,6 +124,7 @@ impl Session {
             pending_images: Vec::new(),
             usage_records: Vec::new(),
             pending_approval: None,
+            messages: Vec::new(),
         }
     }
 
@@ -131,6 +136,7 @@ impl Session {
         forked.pending_images = self.pending_images.clone();
         forked.usage_records = self.usage_records.clone();
         forked.pending_approval = self.pending_approval.clone();
+        forked.messages = self.messages.clone();
         forked
     }
 }
