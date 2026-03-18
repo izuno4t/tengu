@@ -11,14 +11,18 @@ use crate::llm::{
 };
 use futures_util::StreamExt;
 use crate::tools::{
-    builtin_tool_definitions, ToolApprovalDecision, ToolApprovalRequest, ToolExecutor, ToolPolicy,
-    ToolResult,
+    builtin_tool_definitions, estimate_tokens, ToolApprovalDecision, ToolApprovalRequest,
+    ToolExecutor, ToolPolicy, ToolResult,
 };
 
 const MAX_AGENT_TURNS: usize = 50;
 /// Maximum number of messages to send in a single request.
 /// Older messages are trimmed to prevent context overflow.
 const MAX_CONTEXT_MESSAGES: usize = 100;
+/// Number of recent messages to preserve during compaction.
+const COMPACT_PRESERVE_MESSAGES: usize = 30;
+/// Force compaction when message count exceeds this threshold.
+const FORCE_COMPACT_THRESHOLD: usize = 300;
 
 #[allow(dead_code)]
 pub struct Agent {
@@ -86,6 +90,7 @@ pub struct AgentLoopResult {
     pub final_text: String,
     pub messages: Vec<Message>,
     pub total_turns: usize,
+    pub estimated_tokens: usize,
 }
 
 impl AgentRunner {
@@ -150,6 +155,38 @@ impl AgentRunner {
         }
     }
 
+    /// Compact messages by dropping older messages while preserving recent context.
+    /// Keeps the last COMPACT_PRESERVE_MESSAGES messages.
+    /// Returns the compacted message list.
+    fn compact_messages(messages: &[Message]) -> Vec<Message> {
+        if messages.len() <= COMPACT_PRESERVE_MESSAGES {
+            return messages.to_vec();
+        }
+        let skip = messages.len() - COMPACT_PRESERVE_MESSAGES;
+        let mut compacted = messages[skip..].to_vec();
+        // Ensure we don't start with an orphaned tool_result
+        while !compacted.is_empty() {
+            let first = &compacted[0];
+            let is_orphaned_tool_result = first.content.iter().any(|b| {
+                matches!(b, ContentBlock::ToolResult { .. })
+            }) && first.role == crate::llm::MessageRole::User;
+            if is_orphaned_tool_result {
+                compacted.remove(0);
+            } else {
+                break;
+            }
+        }
+        // Ensure conversation starts with a user message
+        while !compacted.is_empty() && compacted[0].role != crate::llm::MessageRole::User {
+            compacted.remove(0);
+        }
+        // Safety: never return empty
+        if compacted.is_empty() && !messages.is_empty() {
+            return vec![messages.last().unwrap().clone()];
+        }
+        compacted
+    }
+
     // -----------------------------------------------------------------------
     // Agentic loop (new): LLM → tool_use → result → LLM → ... until end_turn
     // -----------------------------------------------------------------------
@@ -171,10 +208,11 @@ impl AgentRunner {
             }
             total_turns += 1;
 
-            // Trim old messages to prevent context overflow
-            let trimmed_messages = if messages.len() > MAX_CONTEXT_MESSAGES {
-                let skip = messages.len() - MAX_CONTEXT_MESSAGES;
-                messages[skip..].to_vec()
+            // Compact messages to prevent context overflow
+            let trimmed_messages = if messages.len() > FORCE_COMPACT_THRESHOLD
+                || messages.len() > MAX_CONTEXT_MESSAGES
+            {
+                Self::compact_messages(&messages)
             } else {
                 messages.clone()
             };
@@ -315,6 +353,15 @@ impl AgentRunner {
             .map(|m| m.text_content())
             .unwrap_or_default();
 
+        // Estimate token usage from messages
+        let estimated_tokens = messages.iter().map(|m| {
+            m.content.iter().map(|b| match b {
+                ContentBlock::Text { text } => estimate_tokens(text),
+                ContentBlock::ToolUse { input, .. } => estimate_tokens(&input.to_string()),
+                ContentBlock::ToolResult { content, .. } => estimate_tokens(content),
+            }).sum::<usize>()
+        }).sum();
+
         // Persist messages for multi-turn conversation
         self.save_conversation_messages(&messages);
 
@@ -322,6 +369,7 @@ impl AgentRunner {
             final_text,
             messages,
             total_turns,
+            estimated_tokens,
         })
     }
 
@@ -519,3 +567,326 @@ impl AgentRunner {
 
 type ApprovalHandler =
     Arc<dyn Fn(ToolApprovalRequest) -> BoxFuture<'static, ToolApprovalDecision> + Send + Sync>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::{
+        ChatRequest, ChatResponse, ContentBlock, LlmBackend, LlmClient,
+        LlmProvider, LlmRequest, LlmResponse, LlmStream, LlmUsage, StopReason,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Mock backend that returns a fixed text response.
+    struct MockBackend {
+        response_text: String,
+        call_count: AtomicUsize,
+    }
+
+    impl MockBackend {
+        fn new(text: &str) -> Self {
+            Self {
+                response_text: text.to_string(),
+                call_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmBackend for MockBackend {
+        fn provider(&self) -> LlmProvider {
+            LlmProvider::Anthropic
+        }
+
+        async fn generate(&self, _model: &str, _request: &LlmRequest) -> Result<LlmResponse> {
+            Ok(LlmResponse {
+                content: self.response_text.clone(),
+                usage: None,
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _model: &str,
+            _request: &LlmRequest,
+        ) -> Result<LlmStream> {
+            let text = self.response_text.clone();
+            let events = vec![Ok(crate::llm::LlmStreamEvent::Text(text))];
+            Ok(Box::pin(futures_util::stream::iter(events)))
+        }
+
+        async fn chat(&self, _model: &str, _request: &ChatRequest) -> Result<ChatResponse> {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                content: vec![ContentBlock::Text {
+                    text: self.response_text.clone(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: Some(LlmUsage {
+                    provider: "mock".to_string(),
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    total_tokens: Some(15),
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                    reasoning_tokens: None,
+                    raw: None,
+                }),
+            })
+        }
+    }
+
+    /// Mock backend that returns a tool_use followed by end_turn.
+    struct MockToolBackend {
+        call_count: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmBackend for MockToolBackend {
+        fn provider(&self) -> LlmProvider {
+            LlmProvider::Anthropic
+        }
+
+        async fn generate(&self, _model: &str, _request: &LlmRequest) -> Result<LlmResponse> {
+            Ok(LlmResponse {
+                content: String::new(),
+                usage: None,
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _model: &str,
+            _request: &LlmRequest,
+        ) -> Result<LlmStream> {
+            Ok(Box::pin(futures_util::stream::iter(vec![])))
+        }
+
+        async fn chat(&self, _model: &str, _request: &ChatRequest) -> Result<ChatResponse> {
+            let count = self.call_count.fetch_add(1, Ordering::Relaxed);
+            if count == 0 {
+                // First call: return tool_use for Read
+                Ok(ChatResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "Read".to_string(),
+                        input: serde_json::json!({"file_path": "/nonexistent-test-file.txt"}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: None,
+                })
+            } else {
+                // Second call: return text
+                Ok(ChatResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "File not found, as expected.".to_string(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: None,
+                })
+            }
+        }
+    }
+
+    fn make_runner(backend: impl LlmBackend + Send + Sync + 'static) -> AgentRunner {
+        let client = LlmClient::new(Box::new(backend));
+        AgentRunner::new(client, "test-model".to_string(), ToolPolicy::default())
+    }
+
+    #[tokio::test]
+    async fn agent_runner_simple_text_response() {
+        let runner = make_runner(MockBackend::new("Hello from mock!"));
+        let result = runner.run_prompt("hi").await.unwrap();
+        assert_eq!(result.final_text, "Hello from mock!");
+        assert_eq!(result.total_turns, 1);
+    }
+
+    #[tokio::test]
+    async fn agent_runner_preserves_conversation() {
+        let runner = make_runner(MockBackend::new("Response 1"));
+        runner.run_prompt("first").await.unwrap();
+
+        let messages = runner.get_conversation_messages();
+        assert!(messages.len() >= 2); // user + assistant
+        assert_eq!(messages[0].text_content(), "first");
+    }
+
+    #[tokio::test]
+    async fn agent_runner_clear_conversation() {
+        let runner = make_runner(MockBackend::new("test"));
+        runner.run_prompt("hello").await.unwrap();
+        assert!(!runner.get_conversation_messages().is_empty());
+
+        runner.clear_conversation();
+        assert!(runner.get_conversation_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_runner_system_prompt() {
+        let runner = make_runner(MockBackend::new("ok"));
+        assert!(runner.get_system_prompt().is_none());
+
+        runner.set_system_prompt("You are a test agent.".to_string());
+        assert_eq!(
+            runner.get_system_prompt().unwrap(),
+            "You are a test agent."
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_runner_tool_use_loop() {
+        let runner = make_runner(MockToolBackend {
+            call_count: AtomicUsize::new(0),
+        });
+        let result = runner.run_prompt("read a file").await.unwrap();
+        // Should have made 2 turns: tool_use + end_turn
+        assert_eq!(result.total_turns, 2);
+        assert_eq!(result.final_text, "File not found, as expected.");
+    }
+
+    #[tokio::test]
+    async fn agent_runner_collects_tool_events() {
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+
+        let runner = make_runner(MockBackend::new("hi"));
+        runner.set_tool_event_handler(Arc::new(move |event| {
+            let events = events_clone.clone();
+            Box::pin(async move {
+                let label = match &event {
+                    ToolEvent::Text(_) => "text",
+                    ToolEvent::ToolCall { .. } => "tool_call",
+                    ToolEvent::ToolResult { .. } => "tool_result",
+                    ToolEvent::Usage(_) => "usage",
+                };
+                events.lock().unwrap().push(label.to_string());
+            })
+        }));
+
+        runner.run_prompt("hello").await.unwrap();
+
+        let collected = events.lock().unwrap();
+        assert!(collected.contains(&"text".to_string()));
+        assert!(collected.contains(&"usage".to_string()));
+    }
+
+    #[tokio::test]
+    async fn agent_runner_handle_prompt_uses_agent_loop() {
+        let runner = make_runner(MockBackend::new("agent loop response"));
+        let output = runner.handle_prompt("test").await.unwrap();
+        assert_eq!(output.response.content, "agent loop response");
+    }
+
+    #[tokio::test]
+    async fn agent_runner_with_context() {
+        let runner = make_runner(MockBackend::new("contextual response"));
+        let output = runner
+            .handle_prompt_with_context("question", "prior context")
+            .await
+            .unwrap();
+        assert_eq!(output.response.content, "contextual response");
+        // Should have context message + acknowledgment + user message = 3 input messages
+        // + 1 assistant response
+        assert!(output.messages.len() >= 4);
+    }
+
+    #[test]
+    fn tool_event_debug() {
+        let event = ToolEvent::Text("hello".to_string());
+        let debug = format!("{:?}", event);
+        assert!(debug.contains("Text"));
+    }
+
+    #[test]
+    fn agent_loop_result_fields() {
+        let result = AgentLoopResult {
+            final_text: "done".to_string(),
+            messages: vec![],
+            total_turns: 3,
+            estimated_tokens: 0,
+        };
+        assert_eq!(result.final_text, "done");
+        assert_eq!(result.total_turns, 3);
+        assert!(result.messages.is_empty());
+    }
+
+    #[test]
+    fn compact_messages_no_op_when_small() {
+        let messages = vec![
+            Message::user_text("hello"),
+            Message::assistant_text("hi"),
+        ];
+        let compacted = AgentRunner::compact_messages(&messages);
+        assert_eq!(compacted.len(), 2);
+    }
+
+    #[test]
+    fn compact_messages_trims_old() {
+        let mut messages = Vec::new();
+        for i in 0..50 {
+            messages.push(Message::user_text(format!("msg {}", i)));
+            messages.push(Message::assistant_text(format!("reply {}", i)));
+        }
+        assert_eq!(messages.len(), 100);
+        let compacted = AgentRunner::compact_messages(&messages);
+        assert!(compacted.len() <= COMPACT_PRESERVE_MESSAGES);
+        assert!(compacted.len() > 0);
+    }
+
+    #[test]
+    fn compact_messages_starts_with_user() {
+        let mut messages = Vec::new();
+        messages.push(Message::user_text("first"));
+        // Simulate many assistant then user messages
+        for i in 0..40 {
+            messages.push(Message::assistant_text(format!("reply {}", i)));
+            messages.push(Message::user_text(format!("msg {}", i)));
+        }
+        let compacted = AgentRunner::compact_messages(&messages);
+        assert_eq!(compacted[0].role, crate::llm::MessageRole::User);
+    }
+
+    #[test]
+    fn compact_messages_drops_orphaned_tool_results() {
+        use crate::llm::ContentBlock;
+        let mut messages = Vec::new();
+        for i in 0..40 {
+            messages.push(Message::user_text(format!("msg {}", i)));
+            messages.push(Message::assistant_text(format!("reply {}", i)));
+        }
+        // Add a tool_result at a position that would be the first after trim
+        let tool_result_msg = Message::tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "test-id".to_string(),
+            content: "result".to_string(),
+            is_error: false,
+        }]);
+        // Insert at position that will be first after compaction
+        let insert_pos = messages.len() - COMPACT_PRESERVE_MESSAGES;
+        messages.insert(insert_pos, tool_result_msg);
+
+        let compacted = AgentRunner::compact_messages(&messages);
+        // Should not start with a tool_result
+        let first_has_tool_result = compacted[0].content.iter().any(|b| {
+            matches!(b, ContentBlock::ToolResult { .. })
+        });
+        assert!(!first_has_tool_result);
+    }
+
+    #[test]
+    fn compact_messages_never_returns_empty() {
+        let messages = vec![Message::assistant_text("only assistant")];
+        let compacted = AgentRunner::compact_messages(&messages);
+        assert!(!compacted.is_empty());
+    }
+
+    #[test]
+    fn agent_struct() {
+        let mut agent = Agent::new("test-agent".to_string());
+        assert_eq!(agent.name, "test-agent");
+        assert!(agent.description.is_empty());
+        assert!(agent.prompt.is_empty());
+        agent.description = "A test agent".to_string();
+        agent.prompt = "Do things".to_string();
+        assert_eq!(agent.description, "A test agent");
+    }
+}
