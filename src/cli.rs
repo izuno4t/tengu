@@ -728,6 +728,12 @@ impl Cli {
                                     })
                                 );
                             }
+                            crate::agent::ToolEvent::Thinking(text) => {
+                                println!(
+                                    "{}",
+                                    json!({ "type": "thinking", "mode": "llm", "delta": text })
+                                );
+                            }
                         }
                     })
                 }));
@@ -814,6 +820,11 @@ impl Cli {
                                     usage.input_tokens.unwrap_or(0),
                                     usage.output_tokens.unwrap_or(0),
                                 );
+                            }
+                        }
+                        crate::agent::ToolEvent::Thinking(text) => {
+                            if verbose {
+                                eprintln!("[thinking] {}", text);
                             }
                         }
                     }

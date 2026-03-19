@@ -243,6 +243,12 @@ impl AnthropicBackend {
                             "is_error": is_error,
                         })
                     }
+                    ContentBlock::Thinking { thinking } => {
+                        serde_json::json!({
+                            "type": "thinking",
+                            "thinking": thinking,
+                        })
+                    }
                 })
                 .collect::<Vec<_>>();
             messages.push(serde_json::json!({"role": role, "content": content}));
@@ -567,6 +573,13 @@ impl LlmBackend for AnthropicBackend {
                                 if let Some(text) = delta.get("text").and_then(Value::as_str) {
                                     return Ok(Some(ChatStreamEvent::TextDelta(
                                         text.to_string(),
+                                    )));
+                                }
+                            }
+                            "thinking_delta" => {
+                                if let Some(thinking) = delta.get("thinking").and_then(Value::as_str) {
+                                    return Ok(Some(ChatStreamEvent::ThinkingDelta(
+                                        thinking.to_string(),
                                     )));
                                 }
                             }

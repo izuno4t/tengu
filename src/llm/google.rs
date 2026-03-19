@@ -236,6 +236,10 @@ impl GoogleBackend {
                             }
                         }));
                     }
+                    ContentBlock::Thinking { thinking } => {
+                        // Google doesn't natively support thinking blocks; include as text
+                        parts.push(serde_json::json!({"text": format!("[thinking] {}", thinking)}));
+                    }
                 }
             }
 

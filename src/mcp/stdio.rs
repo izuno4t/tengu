@@ -25,6 +25,52 @@ struct JsonRpcNotification<'a> {
     params: Option<Value>,
 }
 
+/// Call a tool on an MCP server via stdio transport.
+pub fn call_tool_stdio(
+    server: &McpServerConfig,
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<Value> {
+    let command = server
+        .command
+        .as_ref()
+        .ok_or_else(|| anyhow!("mcp server command is required for stdio"))?;
+    let args = server.args.as_ref().cloned().unwrap_or_default();
+    let mut child = spawn_stdio_server(command, &args, server.env.as_ref())?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("failed to open stdin for mcp server"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to open stdout for mcp server"))?;
+    let mut reader = BufReader::new(stdout);
+
+    let mut next_id = 1u64;
+    send_initialize(&mut stdin, next_id)?;
+    read_response(&mut reader, next_id)?;
+    next_id += 1;
+
+    send_initialized(&mut stdin)?;
+
+    let call_request = JsonRpcRequest {
+        jsonrpc: "2.0",
+        id: next_id,
+        method: "tools/call",
+        params: Some(serde_json::json!({
+            "name": tool_name,
+            "arguments": arguments,
+        })),
+    };
+    send_message(&mut stdin, &call_request)?;
+    let result = read_response(&mut reader, next_id)?;
+
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(result)
+}
+
 pub fn list_tools_stdio(server: &McpServerConfig) -> Result<Vec<McpTool>> {
     let command = server
         .command

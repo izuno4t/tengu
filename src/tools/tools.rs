@@ -1,5 +1,5 @@
 // Tools module
-// ビルトインツール: Read, Edit, Write, Bash, Grep, Glob
+// ビルトインツール: Read, Edit, Write, Bash, Grep, Glob, WebFetch, WebSearch
 
 use anyhow::{anyhow, Result};
 use serde_json::Value;
@@ -14,6 +14,7 @@ const BASH_TIMEOUT_SECS: u64 = 120;
 const BASH_MAX_OUTPUT_BYTES: usize = 30 * 1024; // 30 KB
 const WRITE_MAX_BYTES: usize = 5 * 1024 * 1024; // 5 MB
 const READ_MAX_LINE_CHARS: usize = 2000;
+const WEBFETCH_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024; // 2 MB
 
 /// Patterns that indicate dangerous shell commands.
 const DANGEROUS_PATTERNS: &[&str] = &[
@@ -124,6 +125,10 @@ pub enum Tool {
     Shell, // alias for Bash (backward compat)
     Grep,
     Glob,
+    WebFetch,
+    WebSearch,
+    SubAgent,
+    ParallelAgents,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +166,23 @@ pub enum ToolInput {
     },
     ListFiles {
         path: PathBuf,
+    },
+    WebFetch {
+        url: String,
+        method: String,
+        headers: Vec<(String, String)>,
+        body: Option<String>,
+    },
+    WebSearch {
+        query: String,
+    },
+    SubAgent {
+        prompt: String,
+        #[allow(dead_code)]
+        max_turns: Option<usize>,
+    },
+    ParallelAgents {
+        tasks: Vec<String>,
     },
 }
 
@@ -220,6 +242,21 @@ impl ToolPolicy {
         Self {
             permissions: config.permissions.clone(),
             sandbox: config.sandbox.clone(),
+            workspace_root,
+            approval_override: Arc::new(Mutex::new(ApprovalOverride::None)),
+        }
+    }
+
+    /// Create a read-only policy for sub-agents (blocks Write, Edit, Bash, Shell).
+    pub fn read_only() -> Self {
+        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self {
+            permissions: Some(PermissionsConfig {
+                approval_policy: Some("read-only".to_string()),
+                allowed_tools: None,
+                deny: None,
+            }),
+            sandbox: None,
             workspace_root,
             approval_override: Arc::new(Mutex::new(ApprovalOverride::None)),
         }
@@ -388,6 +425,46 @@ impl ToolPolicy {
 
         Ok(())
     }
+}
+
+/// Check if a URL targets a private/local IP address (SSRF protection).
+fn is_private_url(url: &str) -> bool {
+    let host = if let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")) {
+        let host_port = rest.split('/').next().unwrap_or(rest);
+        if host_port.starts_with('[') {
+            host_port.split(']').next().unwrap_or(host_port).trim_start_matches('[')
+        } else {
+            host_port.split(':').next().unwrap_or(host_port)
+        }
+    } else {
+        return true; // Non-HTTP schemes are blocked
+    };
+
+    let host_lower = host.to_ascii_lowercase();
+
+    if host_lower == "localhost" || host_lower == "localhost." {
+        return true;
+    }
+
+    if let Ok(addr) = host.parse::<std::net::Ipv4Addr>() {
+        let octets = addr.octets();
+        if octets[0] == 127 { return true; }
+        if octets[0] == 10 { return true; }
+        if octets[0] == 172 && (16..=31).contains(&octets[1]) { return true; }
+        if octets[0] == 192 && octets[1] == 168 { return true; }
+        if octets == [0, 0, 0, 0] { return true; }
+        if octets[0] == 169 && octets[1] == 254 { return true; }
+    }
+
+    if let Ok(addr) = host.parse::<std::net::Ipv6Addr>() {
+        if addr.is_loopback() || addr.is_unspecified() { return true; }
+        let segments = addr.segments();
+        if segments[0] & 0xffc0 == 0xfe80 { return true; }
+    }
+
+    if host == "::1" || host == "0.0.0.0" { return true; }
+
+    false
 }
 
 pub struct ToolExecutor {
@@ -655,6 +732,130 @@ impl ToolExecutor {
                 entries.sort();
                 Ok(ToolResult::Text(entries.join("\n")))
             }
+            ToolInput::WebFetch {
+                url,
+                method,
+                headers,
+                body,
+            } => {
+                if is_private_url(&url) {
+                    return Err(anyhow!(
+                        "SSRF protection: access to private/local addresses is blocked: {}",
+                        url
+                    ));
+                }
+
+                let method_upper = method.to_ascii_uppercase();
+                if !["GET", "POST", "PUT", "DELETE"].contains(&method_upper.as_str()) {
+                    return Err(anyhow!(
+                        "unsupported HTTP method: {} (supported: GET, POST, PUT, DELETE)",
+                        method
+                    ));
+                }
+
+                let mut cmd = Command::new("curl");
+                cmd.arg("-s")
+                    .arg("-S")
+                    .arg("-L")
+                    .arg("--max-time")
+                    .arg("30")
+                    .arg("--max-filesize")
+                    .arg(WEBFETCH_MAX_RESPONSE_BYTES.to_string())
+                    .arg("-X")
+                    .arg(&method_upper);
+
+                for (key, value) in &headers {
+                    cmd.arg("-H").arg(format!("{}: {}", key, value));
+                }
+
+                if let Some(body_content) = &body {
+                    cmd.arg("-d").arg(body_content);
+                }
+
+                cmd.arg(&url);
+
+                let output = cmd
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .output()
+                    .map_err(|e| anyhow!("failed to execute curl: {}", e))?;
+
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                if !output.status.success() {
+                    let mut msg = format!("HTTP request failed (exit code: {})", output.status.code().unwrap_or(-1));
+                    if !stderr.is_empty() {
+                        msg.push_str(&format!("\nstderr: {}", stderr));
+                    }
+                    return Err(anyhow!("{}", msg));
+                }
+
+                let mut result = stdout.to_string();
+                if result.len() > WEBFETCH_MAX_RESPONSE_BYTES {
+                    result.truncate(WEBFETCH_MAX_RESPONSE_BYTES);
+                    result.push_str("\n... (response truncated at 2MB)");
+                }
+
+                Ok(ToolResult::Text(result))
+            }
+            ToolInput::WebSearch { query } => {
+                if query.trim().is_empty() {
+                    return Err(anyhow!("search query cannot be empty"));
+                }
+
+                let encoded_query: String = query
+                    .chars()
+                    .map(|c| match c {
+                        ' ' => '+'.to_string(),
+                        c if c.is_ascii_alphanumeric() || "-_.~".contains(c) => c.to_string(),
+                        c => format!("%{:02X}", c as u32),
+                    })
+                    .collect();
+
+                let url = format!("https://lite.duckduckgo.com/lite/?q={}", encoded_query);
+
+                let output = Command::new("curl")
+                    .arg("-s")
+                    .arg("-S")
+                    .arg("-L")
+                    .arg("--max-time")
+                    .arg("15")
+                    .arg("-A")
+                    .arg("Mozilla/5.0 (compatible; Tengu/1.0)")
+                    .arg(&url)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .output()
+                    .map_err(|e| anyhow!("failed to execute curl for web search: {}", e))?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(anyhow!("web search failed: {}", stderr));
+                }
+
+                let html = String::from_utf8_lossy(&output.stdout);
+                let results = parse_duckduckgo_lite(&html);
+
+                if results.is_empty() {
+                    Ok(ToolResult::Text(format!(
+                        "No results found for: {}",
+                        query
+                    )))
+                } else {
+                    Ok(ToolResult::Text(results.join("\n\n")))
+                }
+            }
+            ToolInput::SubAgent { .. } => {
+                Ok(ToolResult::Text(
+                    "SubAgent tool must be executed in async agent loop context".to_string(),
+                ))
+            }
+            ToolInput::ParallelAgents { .. } => {
+                Ok(ToolResult::Text(
+                    "ParallelAgents tool must be executed in async agent loop context".to_string(),
+                ))
+            }
         }
     }
 
@@ -775,6 +976,69 @@ impl ToolExecutor {
                 self.execute(ToolInput::ListFiles {
                     path: PathBuf::from(path),
                 })
+            }
+            "WebFetch" => {
+                let url = input
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let method = input
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("GET");
+                let headers: Vec<(String, String)> = input
+                    .get("headers")
+                    .and_then(Value::as_object)
+                    .map(|obj| {
+                        obj.iter()
+                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let body = input
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                self.execute(ToolInput::WebFetch {
+                    url: url.to_string(),
+                    method: method.to_string(),
+                    headers,
+                    body,
+                })
+            }
+            "WebSearch" => {
+                let query = input
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                self.execute(ToolInput::WebSearch {
+                    query: query.to_string(),
+                })
+            }
+            "SubAgent" => {
+                let prompt = input
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let max_turns = input
+                    .get("max_turns")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as usize);
+                self.execute(ToolInput::SubAgent { prompt, max_turns })
+            }
+            "ParallelAgents" => {
+                let tasks = input
+                    .get("tasks")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(String::from)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.execute(ToolInput::ParallelAgents { tasks })
             }
             _ => Err(anyhow!("unknown tool: {}", tool_name)),
         };
@@ -928,6 +1192,83 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["path"]
             }),
         },
+        ToolDefinition {
+            name: "WebFetch".to_string(),
+            description: "Fetch content from a URL via HTTP. Supports GET, POST, PUT, DELETE methods. Returns response body as text. Blocks access to private/local IP addresses for security.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to fetch (must be http:// or https://)"
+                    },
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method: GET, POST, PUT, or DELETE (default: GET)",
+                        "enum": ["GET", "POST", "PUT", "DELETE"]
+                    },
+                    "headers": {
+                        "type": "object",
+                        "description": "Optional HTTP headers as key-value pairs",
+                        "additionalProperties": { "type": "string" }
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional request body (for POST/PUT)"
+                    }
+                },
+                "required": ["url"]
+            }),
+        },
+        ToolDefinition {
+            name: "WebSearch".to_string(),
+            description: "Search the internet using DuckDuckGo. Returns top search results with titles, URLs, and snippets.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query"
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolDefinition {
+            name: "SubAgent".to_string(),
+            description: "Launch a sub-agent to handle a complex, self-contained task autonomously. The sub-agent has read-only access to the codebase and runs up to 20 turns. Use this for research, analysis, or exploration tasks that don't require writing files.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The task description for the sub-agent"
+                    },
+                    "max_turns": {
+                        "type": "integer",
+                        "description": "Maximum number of turns (default: 20, max: 20)"
+                    }
+                },
+                "required": ["prompt"]
+            }),
+        },
+        ToolDefinition {
+            name: "ParallelAgents".to_string(),
+            description: "Launch multiple sub-agents concurrently to handle independent tasks in parallel. Each sub-agent has read-only access and runs up to 20 turns. Requires 2-6 tasks.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Array of task descriptions for each sub-agent (2-6 tasks)",
+                        "minItems": 2,
+                        "maxItems": 6
+                    }
+                },
+                "required": ["tasks"]
+            }),
+        },
     ]
 }
 
@@ -945,6 +1286,10 @@ fn tool_name(input: &ToolInput) -> &'static str {
         ToolInput::Grep { .. } => "Grep",
         ToolInput::Glob { .. } => "Glob",
         ToolInput::ListFiles { .. } => "ListFiles",
+        ToolInput::WebFetch { .. } => "WebFetch",
+        ToolInput::WebSearch { .. } => "WebSearch",
+        ToolInput::SubAgent { .. } => "SubAgent",
+        ToolInput::ParallelAgents { .. } => "ParallelAgents",
     }
 }
 
@@ -956,6 +1301,10 @@ fn tool_kind(input: &ToolInput) -> Tool {
         ToolInput::Shell { .. } | ToolInput::Bash { .. } => Tool::Bash,
         ToolInput::Grep { .. } => Tool::Grep,
         ToolInput::Glob { .. } | ToolInput::ListFiles { .. } => Tool::Glob,
+        ToolInput::WebFetch { .. } => Tool::WebFetch,
+        ToolInput::WebSearch { .. } => Tool::WebSearch,
+        ToolInput::SubAgent { .. } => Tool::SubAgent,
+        ToolInput::ParallelAgents { .. } => Tool::ParallelAgents,
     }
 }
 
@@ -968,6 +1317,8 @@ fn tool_paths(input: &ToolInput) -> Vec<PathBuf> {
         ToolInput::Glob { root, .. } => root.clone().map(|p| vec![p]).unwrap_or_default(),
         ToolInput::ListFiles { path } => vec![path.clone()],
         ToolInput::Shell { .. } | ToolInput::Bash { .. } => Vec::new(),
+        ToolInput::WebFetch { .. } | ToolInput::WebSearch { .. } => Vec::new(),
+        ToolInput::SubAgent { .. } | ToolInput::ParallelAgents { .. } => Vec::new(),
     }
 }
 
@@ -1119,6 +1470,10 @@ fn tool_match_targets(input: &ToolInput, root: Option<&Path>) -> Vec<String> {
             }
             out
         }
+        ToolInput::WebFetch { url, .. } => vec![url.clone()],
+        ToolInput::WebSearch { query } => vec![query.clone()],
+        ToolInput::SubAgent { prompt, .. } => vec![prompt.clone()],
+        ToolInput::ParallelAgents { tasks } => tasks.clone(),
     }
 }
 
@@ -1217,6 +1572,76 @@ fn matches_glob(pattern: &str, path: &Path) -> bool {
         }
     }
     wildcard_match(pattern, &target)
+}
+
+/// Parse DuckDuckGo lite HTML results into a list of text entries.
+fn parse_duckduckgo_lite(html: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let mut current_url: Option<String> = None;
+
+    for line in html.lines() {
+        let trimmed = line.trim();
+
+        // Look for result links
+        if (trimmed.contains("result-link") || (trimmed.contains("rel=\"nofollow\"") && trimmed.contains("href=")))
+            && trimmed.contains("<a")
+        {
+            if let Some(href_start) = trimmed.find("href=\"") {
+                let rest = &trimmed[href_start + 6..];
+                if let Some(href_end) = rest.find('"') {
+                    let url = &rest[..href_end];
+                    if url.starts_with("http") && !url.contains("duckduckgo.com") {
+                        let title = strip_html_tags(trimmed).trim().to_string();
+                        if !title.is_empty() {
+                            results.push(format!("{}\nURL: {}", title, url));
+                        } else {
+                            results.push(format!("URL: {}", url));
+                        }
+                        current_url = Some(url.to_string());
+                        if results.len() >= 10 {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Look for snippet text following a result
+        if current_url.is_some() && (trimmed.starts_with("<td") || trimmed.contains("result-snippet")) {
+            let snippet = strip_html_tags(trimmed).trim().to_string();
+            if !snippet.is_empty() && snippet.len() > 10 {
+                if let Some(last) = results.last_mut() {
+                    last.push('\n');
+                    last.push_str(&snippet);
+                }
+                current_url = None;
+            }
+        }
+    }
+
+    results
+}
+
+/// Strip HTML tags from a string.
+fn strip_html_tags(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => result.push(ch),
+            _ => {}
+        }
+    }
+    result
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
 }
 
 pub fn build_diff(path: &Path, before: &str, after: &str) -> String {
@@ -1866,6 +2291,8 @@ mod tests {
         assert!(names.contains(&"Grep"));
         assert!(names.contains(&"Glob"));
         assert!(names.contains(&"ListFiles"));
+        assert!(names.contains(&"SubAgent"));
+        assert!(names.contains(&"ParallelAgents"));
     }
 
     #[test]
@@ -2395,5 +2822,520 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // SSRF Protection Tests (is_private_url)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn ssrf_blocks_localhost() {
+        assert!(is_private_url("http://localhost/path"));
+        assert!(is_private_url("https://localhost:8080/path"));
+        assert!(is_private_url("http://localhost./path"));
+    }
+
+    #[test]
+    fn ssrf_blocks_127_0_0_1() {
+        assert!(is_private_url("http://127.0.0.1/path"));
+        assert!(is_private_url("http://127.0.0.1:3000/path"));
+        assert!(is_private_url("https://127.0.0.1/"));
+    }
+
+    #[test]
+    fn ssrf_blocks_10_x_range() {
+        assert!(is_private_url("http://10.0.0.1/path"));
+        assert!(is_private_url("http://10.255.255.255/"));
+    }
+
+    #[test]
+    fn ssrf_blocks_172_16_range() {
+        assert!(is_private_url("http://172.16.0.1/path"));
+        assert!(is_private_url("http://172.31.255.255/path"));
+        // 172.15 and 172.32 should be allowed
+        assert!(!is_private_url("http://172.15.0.1/path"));
+        assert!(!is_private_url("http://172.32.0.1/path"));
+    }
+
+    #[test]
+    fn ssrf_blocks_192_168_range() {
+        assert!(is_private_url("http://192.168.0.1/path"));
+        assert!(is_private_url("http://192.168.1.100/path"));
+    }
+
+    #[test]
+    fn ssrf_blocks_0_0_0_0() {
+        assert!(is_private_url("http://0.0.0.0/path"));
+    }
+
+    #[test]
+    fn ssrf_blocks_link_local() {
+        assert!(is_private_url("http://169.254.0.1/path"));
+    }
+
+    #[test]
+    fn ssrf_blocks_non_http_schemes() {
+        assert!(is_private_url("ftp://example.com/file"));
+        assert!(is_private_url("file:///etc/passwd"));
+        assert!(is_private_url("gopher://example.com"));
+    }
+
+    #[test]
+    fn ssrf_allows_public_urls() {
+        assert!(!is_private_url("https://example.com/path"));
+        assert!(!is_private_url("http://8.8.8.8/"));
+        assert!(!is_private_url("https://www.google.com/"));
+        assert!(!is_private_url("http://1.2.3.4/path"));
+    }
+
+    #[test]
+    fn ssrf_blocks_ipv6_loopback() {
+        assert!(is_private_url("http://[::1]/path"));
+        assert!(is_private_url("http://[::1]:8080/path"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // WebFetch Tool Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn webfetch_blocks_private_urls() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec.execute(ToolInput::WebFetch {
+            url: "http://127.0.0.1:8080/secret".to_string(),
+            method: "GET".to_string(),
+            headers: vec![],
+            body: None,
+        });
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("SSRF protection"));
+    }
+
+    #[test]
+    fn webfetch_blocks_localhost() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec.execute(ToolInput::WebFetch {
+            url: "http://localhost/admin".to_string(),
+            method: "GET".to_string(),
+            headers: vec![],
+            body: None,
+        });
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("SSRF protection"));
+    }
+
+    #[test]
+    fn webfetch_blocks_10_x() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec.execute(ToolInput::WebFetch {
+            url: "http://10.0.0.1/internal".to_string(),
+            method: "GET".to_string(),
+            headers: vec![],
+            body: None,
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn webfetch_blocks_192_168() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec.execute(ToolInput::WebFetch {
+            url: "http://192.168.1.1/router".to_string(),
+            method: "POST".to_string(),
+            headers: vec![],
+            body: Some("data".to_string()),
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn webfetch_rejects_unsupported_method() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec.execute(ToolInput::WebFetch {
+            url: "https://example.com".to_string(),
+            method: "PATCH".to_string(),
+            headers: vec![],
+            body: None,
+        });
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsupported HTTP method"));
+    }
+
+    #[test]
+    fn webfetch_rejects_non_http_scheme() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec.execute(ToolInput::WebFetch {
+            url: "ftp://example.com/file".to_string(),
+            method: "GET".to_string(),
+            headers: vec![],
+            body: None,
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn webfetch_tool_name_and_kind() {
+        let input = ToolInput::WebFetch {
+            url: "https://example.com".to_string(),
+            method: "GET".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        assert_eq!(tool_name(&input), "WebFetch");
+        assert_eq!(tool_kind(&input), Tool::WebFetch);
+        assert!(tool_paths(&input).is_empty());
+    }
+
+    #[test]
+    fn webfetch_execute_from_json_ssrf_blocked() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let input = serde_json::json!({
+            "url": "http://127.0.0.1/secret"
+        });
+        let (result, is_error) = exec.execute_from_json("WebFetch", &input);
+        assert!(is_error);
+        assert!(result.contains("SSRF protection"));
+    }
+
+    #[test]
+    fn webfetch_execute_from_json_with_method() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let input = serde_json::json!({
+            "url": "http://10.0.0.1/api",
+            "method": "POST",
+            "headers": {"Content-Type": "application/json"},
+            "body": "{\"key\": \"value\"}"
+        });
+        let (result, is_error) = exec.execute_from_json("WebFetch", &input);
+        assert!(is_error);
+        assert!(result.contains("SSRF protection"));
+    }
+
+    #[test]
+    fn webfetch_execute_from_json_unsupported_method() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let input = serde_json::json!({
+            "url": "https://example.com",
+            "method": "OPTIONS"
+        });
+        let (result, is_error) = exec.execute_from_json("WebFetch", &input);
+        assert!(is_error);
+        assert!(result.contains("unsupported HTTP method"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // WebSearch Tool Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn websearch_rejects_empty_query() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec.execute(ToolInput::WebSearch {
+            query: "".to_string(),
+        });
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn websearch_rejects_whitespace_query() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec.execute(ToolInput::WebSearch {
+            query: "   ".to_string(),
+        });
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn websearch_tool_name_and_kind() {
+        let input = ToolInput::WebSearch {
+            query: "rust programming".to_string(),
+        };
+        assert_eq!(tool_name(&input), "WebSearch");
+        assert_eq!(tool_kind(&input), Tool::WebSearch);
+        assert!(tool_paths(&input).is_empty());
+    }
+
+    #[test]
+    fn websearch_execute_from_json_empty_query() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let input = serde_json::json!({
+            "query": ""
+        });
+        let (result, is_error) = exec.execute_from_json("WebSearch", &input);
+        assert!(is_error);
+        assert!(result.contains("empty"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // HTML Parsing Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn strip_html_tags_removes_tags() {
+        assert_eq!(strip_html_tags("<b>bold</b>"), "bold");
+        assert_eq!(strip_html_tags("<a href=\"url\">link</a>"), "link");
+        assert_eq!(strip_html_tags("no tags here"), "no tags here");
+        assert_eq!(strip_html_tags("<p>paragraph</p>"), "paragraph");
+    }
+
+    #[test]
+    fn strip_html_tags_decodes_entities() {
+        assert_eq!(strip_html_tags("&amp;"), "&");
+        assert_eq!(strip_html_tags("&lt;tag&gt;"), "<tag>");
+        assert_eq!(strip_html_tags("&quot;quoted&quot;"), "\"quoted\"");
+        assert_eq!(strip_html_tags("&#39;apos&#39;"), "'apos'");
+    }
+
+    #[test]
+    fn strip_html_tags_handles_nested() {
+        assert_eq!(strip_html_tags("<div><span>text</span></div>"), "text");
+    }
+
+    #[test]
+    fn parse_duckduckgo_lite_empty_html() {
+        let results = parse_duckduckgo_lite("");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn parse_duckduckgo_lite_no_results() {
+        let html = "<html><body><p>No results found</p></body></html>";
+        let results = parse_duckduckgo_lite(html);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn parse_duckduckgo_lite_with_results() {
+        let html = r#"<a rel="nofollow" href="https://example.com/page" class="result-link">Example Page Title</a>
+<td class="result-snippet">This is a description of the example page with enough text.</td>"#;
+        let results = parse_duckduckgo_lite(html);
+        assert!(!results.is_empty());
+        let first = &results[0];
+        assert!(first.contains("example.com"));
+    }
+
+    #[test]
+    fn parse_duckduckgo_lite_limits_to_10() {
+        let mut html = String::new();
+        for i in 0..15 {
+            html.push_str(&format!(
+                r#"<a rel="nofollow" href="https://example{}.com/page" class="result-link">Title {}</a>
+<td class="result-snippet">Description for result number {} with enough text here.</td>
+"#,
+                i, i, i
+            ));
+        }
+        let results = parse_duckduckgo_lite(&html);
+        assert!(results.len() <= 10);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Tool Definition Tests for WebFetch/WebSearch
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn tool_definitions_include_webfetch() {
+        let defs = builtin_tool_definitions();
+        let webfetch = defs.iter().find(|d| d.name == "WebFetch");
+        assert!(webfetch.is_some(), "WebFetch tool definition should exist");
+        let def = webfetch.unwrap();
+        let schema = def.input_schema.as_object().unwrap();
+        let required = schema.get("required").unwrap().as_array().unwrap();
+        assert!(required.iter().any(|r| r.as_str() == Some("url")));
+    }
+
+    #[test]
+    fn tool_definitions_include_websearch() {
+        let defs = builtin_tool_definitions();
+        let websearch = defs.iter().find(|d| d.name == "WebSearch");
+        assert!(websearch.is_some(), "WebSearch tool definition should exist");
+        let def = websearch.unwrap();
+        let schema = def.input_schema.as_object().unwrap();
+        let required = schema.get("required").unwrap().as_array().unwrap();
+        assert!(required.iter().any(|r| r.as_str() == Some("query")));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Tool Match Targets Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn webfetch_match_targets_contains_url() {
+        let input = ToolInput::WebFetch {
+            url: "https://example.com/api".to_string(),
+            method: "GET".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        let targets = tool_match_targets(&input, None);
+        assert_eq!(targets, vec!["https://example.com/api"]);
+    }
+
+    #[test]
+    fn websearch_match_targets_contains_query() {
+        let input = ToolInput::WebSearch {
+            query: "rust language".to_string(),
+        };
+        let targets = tool_match_targets(&input, None);
+        assert_eq!(targets, vec!["rust language"]);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // SubAgent Tool Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn subagent_tool_name_and_kind() {
+        let input = ToolInput::SubAgent {
+            prompt: "test task".to_string(),
+            max_turns: None,
+        };
+        assert_eq!(tool_name(&input), "SubAgent");
+        assert_eq!(tool_kind(&input), Tool::SubAgent);
+        assert!(tool_paths(&input).is_empty());
+    }
+
+    #[test]
+    fn subagent_execute_returns_placeholder() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec.execute(ToolInput::SubAgent {
+            prompt: "do something".to_string(),
+            max_turns: Some(5),
+        }).unwrap();
+        let text = result.to_string_lossy();
+        assert!(text.contains("SubAgent tool must be executed in async agent loop context"));
+    }
+
+    #[test]
+    fn subagent_execute_from_json() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let (result, is_error) = exec.execute_from_json(
+            "SubAgent",
+            &serde_json::json!({"prompt": "analyze this code", "max_turns": 10}),
+        );
+        assert!(!is_error);
+        assert!(result.contains("SubAgent tool must be executed in async agent loop context"));
+    }
+
+    #[test]
+    fn subagent_match_targets_contains_prompt() {
+        let input = ToolInput::SubAgent {
+            prompt: "analyze the code".to_string(),
+            max_turns: None,
+        };
+        let targets = tool_match_targets(&input, None);
+        assert_eq!(targets, vec!["analyze the code"]);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ParallelAgents Tool Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parallelagents_tool_name_and_kind() {
+        let input = ToolInput::ParallelAgents {
+            tasks: vec!["task1".to_string(), "task2".to_string()],
+        };
+        assert_eq!(tool_name(&input), "ParallelAgents");
+        assert_eq!(tool_kind(&input), Tool::ParallelAgents);
+        assert!(tool_paths(&input).is_empty());
+    }
+
+    #[test]
+    fn parallelagents_execute_returns_placeholder() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec.execute(ToolInput::ParallelAgents {
+            tasks: vec!["task1".to_string(), "task2".to_string()],
+        }).unwrap();
+        let text = result.to_string_lossy();
+        assert!(text.contains("ParallelAgents tool must be executed in async agent loop context"));
+    }
+
+    #[test]
+    fn parallelagents_execute_from_json() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let (result, is_error) = exec.execute_from_json(
+            "ParallelAgents",
+            &serde_json::json!({"tasks": ["task A", "task B", "task C"]}),
+        );
+        assert!(!is_error);
+        assert!(result.contains("ParallelAgents tool must be executed in async agent loop context"));
+    }
+
+    #[test]
+    fn parallelagents_match_targets_contains_tasks() {
+        let input = ToolInput::ParallelAgents {
+            tasks: vec!["task1".to_string(), "task2".to_string()],
+        };
+        let targets = tool_match_targets(&input, None);
+        assert_eq!(targets, vec!["task1", "task2"]);
+    }
+
+    #[test]
+    fn builtin_definitions_include_subagent() {
+        let defs = builtin_tool_definitions();
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"SubAgent"));
+    }
+
+    #[test]
+    fn builtin_definitions_include_parallelagents() {
+        let defs = builtin_tool_definitions();
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"ParallelAgents"));
+    }
+
+    #[test]
+    fn subagent_definition_schema() {
+        let defs = builtin_tool_definitions();
+        let def = defs.iter().find(|d| d.name == "SubAgent").unwrap();
+        let schema = def.input_schema.as_object().unwrap();
+        let props = schema.get("properties").unwrap().as_object().unwrap();
+        assert!(props.contains_key("prompt"));
+        assert!(props.contains_key("max_turns"));
+        let required = schema.get("required").unwrap().as_array().unwrap();
+        assert!(required.iter().any(|v| v.as_str() == Some("prompt")));
+    }
+
+    #[test]
+    fn parallelagents_definition_schema() {
+        let defs = builtin_tool_definitions();
+        let def = defs.iter().find(|d| d.name == "ParallelAgents").unwrap();
+        let schema = def.input_schema.as_object().unwrap();
+        let props = schema.get("properties").unwrap().as_object().unwrap();
+        assert!(props.contains_key("tasks"));
+        let required = schema.get("required").unwrap().as_array().unwrap();
+        assert!(required.iter().any(|v| v.as_str() == Some("tasks")));
+    }
+
+    #[test]
+    fn policy_read_only_constructor() {
+        let policy = ToolPolicy::read_only();
+        // read_only should allow Read
+        let result = policy.check(&ToolInput::Read {
+            path: PathBuf::from("/tmp/test.txt"),
+            offset: None,
+            limit: None,
+        });
+        assert!(result.is_ok());
     }
 }

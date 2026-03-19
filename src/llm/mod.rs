@@ -3,6 +3,8 @@ mod core;
 mod google;
 mod ollama;
 mod openai;
+#[allow(dead_code)]
+pub mod routing;
 
 pub use anthropic::*;
 pub use core::*;

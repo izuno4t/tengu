@@ -567,6 +567,10 @@ impl App {
                     crate::agent::ToolEvent::Text(text) => {
                         let _ = tx.send(Ok(TuiEvent::Chunk(text)));
                     }
+                    crate::agent::ToolEvent::Thinking(text) => {
+                        // Extended thinking: emit as chunk with thinking prefix
+                        let _ = tx.send(Ok(TuiEvent::Chunk(format!("[thinking] {}", text))));
+                    }
                     crate::agent::ToolEvent::ToolCall { name, input } => {
                         let input_str = serde_json::to_string(&input)
                             .unwrap_or_else(|_| format!("{:?}", input));
@@ -2097,6 +2101,10 @@ fn tool_name_label(tool: Tool) -> &'static str {
         Tool::Shell => "Shell",
         Tool::Grep => "Grep",
         Tool::Glob => "Glob",
+        Tool::WebFetch => "WebFetch",
+        Tool::WebSearch => "WebSearch",
+        Tool::SubAgent => "SubAgent",
+        Tool::ParallelAgents => "ParallelAgents",
     }
 }
 

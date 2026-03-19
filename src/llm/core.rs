@@ -2,12 +2,13 @@ use anyhow::{anyhow, Result};
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Provider enum
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LlmProvider {
     Anthropic,
     OpenAI,
@@ -43,6 +44,10 @@ pub enum MessageRole {
 pub enum ContentBlock {
     Text {
         text: String,
+    },
+    #[serde(alias = "thinking")]
+    Thinking {
+        thinking: String,
     },
     ToolUse {
         id: String,
@@ -235,6 +240,8 @@ pub type LlmStream = BoxStream<'static, Result<LlmStreamEvent>>;
 pub enum ChatStreamEvent {
     /// Incremental text token
     TextDelta(String),
+    /// Incremental thinking token (extended thinking)
+    ThinkingDelta(String),
     /// A tool_use block has been fully received
     ToolUse {
         id: String,
@@ -254,12 +261,22 @@ pub type ChatStream = BoxStream<'static, Result<ChatStreamEvent>>;
 // ---------------------------------------------------------------------------
 
 pub struct LlmClient {
-    backend: Box<dyn LlmBackend + Send + Sync>,
+    backend: Arc<dyn LlmBackend + Send + Sync>,
+}
+
+impl Clone for LlmClient {
+    fn clone(&self) -> Self {
+        Self {
+            backend: Arc::clone(&self.backend),
+        }
+    }
 }
 
 impl LlmClient {
     pub fn new(backend: Box<dyn LlmBackend + Send + Sync>) -> Self {
-        Self { backend }
+        Self {
+            backend: Arc::from(backend),
+        }
     }
 
     #[allow(dead_code)]
@@ -561,5 +578,18 @@ mod tests {
         assert_eq!(req.max_tokens, 8192);
         assert!(req.messages.is_empty());
         assert!(req.tools.is_empty());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // LlmClient Clone Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn llm_client_clone_shares_backend() {
+        // Verify that LlmClient can be cloned (compile-time check).
+        // We cannot easily construct one without a full backend in unit tests,
+        // but the Clone impl existing is verified by the compiler.
+        fn _assert_clone<T: Clone>() {}
+        _assert_clone::<LlmClient>();
     }
 }

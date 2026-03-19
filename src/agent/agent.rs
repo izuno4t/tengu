@@ -7,15 +7,18 @@ use std::sync::{Arc, Mutex};
 
 use crate::llm::{
     ChatRequest, ChatStreamEvent, ContentBlock, LlmClient, LlmRequest, LlmResponse, LlmStream,
-    LlmUsage, Message, StopReason,
+    LlmUsage, Message, StopReason, ToolDefinition,
 };
 use futures_util::StreamExt;
+use crate::mcp::{McpServerConfig, mcp_result_to_text};
 use crate::tools::{
     builtin_tool_definitions, estimate_tokens, ToolApprovalDecision, ToolApprovalRequest,
     ToolExecutor, ToolPolicy, ToolResult,
 };
 
 const MAX_AGENT_TURNS: usize = 50;
+/// Maximum number of turns for sub-agents.
+const MAX_SUB_AGENT_TURNS: usize = 20;
 /// Maximum number of messages to send in a single request.
 /// Older messages are trimmed to prevent context overflow.
 const MAX_CONTEXT_MESSAGES: usize = 100;
@@ -52,6 +55,8 @@ pub type ToolEventHandler = Arc<
 pub enum ToolEvent {
     /// LLM produced text output
     Text(String),
+    /// LLM extended thinking output
+    Thinking(String),
     /// A tool is about to be called
     ToolCall {
         name: String,
@@ -76,6 +81,8 @@ pub struct AgentRunner {
     system_prompt: Mutex<Option<String>>,
     /// Persistent conversation history across agent loop invocations
     conversation_messages: Mutex<Vec<Message>>,
+    /// MCP server configurations for external tool integration
+    mcp_servers: Mutex<Vec<(String, McpServerConfig)>>,
 }
 
 #[allow(dead_code)]
@@ -103,7 +110,40 @@ impl AgentRunner {
             tool_event_handler: Mutex::new(None),
             system_prompt: Mutex::new(None),
             conversation_messages: Mutex::new(Vec::new()),
+            mcp_servers: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Register MCP servers for tool integration.
+    #[allow(dead_code)]
+    pub fn set_mcp_servers(&self, servers: Vec<(String, McpServerConfig)>) {
+        if let Ok(mut guard) = self.mcp_servers.lock() {
+            *guard = servers;
+        }
+    }
+
+    /// Get MCP tool definitions for inclusion in LLM requests.
+    fn get_mcp_tool_definitions(&self) -> Vec<ToolDefinition> {
+        let servers = self.mcp_servers.lock().ok();
+        let servers = match servers {
+            Some(guard) => guard.clone(),
+            None => return Vec::new(),
+        };
+        let mut defs = Vec::new();
+        for (name, server) in &servers {
+            if server.url.is_some() {
+                // HTTP servers: try async list (skip if can't list)
+                // We can't call async from here, so skip dynamic listing
+                // MCP tools should be pre-loaded
+            } else if server.command.is_some() {
+                if let Ok(tools) = crate::mcp::list_tools_stdio(server) {
+                    for tool in tools {
+                        defs.push(tool.to_tool_definition(name));
+                    }
+                }
+            }
+        }
+        defs
     }
 
     pub fn set_approval_handler(&self, handler: ApprovalHandler) {
@@ -188,22 +228,34 @@ impl AgentRunner {
     }
 
     // -----------------------------------------------------------------------
-    // Agentic loop (new): LLM → tool_use → result → LLM → ... until end_turn
+    // Agentic loop (new): LLM -> tool_use -> result -> LLM -> ... until end_turn
     // -----------------------------------------------------------------------
 
     /// Run the full agentic loop with tool use support.
     /// Uses streaming for real-time text output.
     pub async fn run_agent_loop(
         &self,
-        mut messages: Vec<Message>,
+        messages: Vec<Message>,
     ) -> Result<AgentLoopResult> {
-        let tools = builtin_tool_definitions();
+        self.run_agent_loop_with_max_turns(messages, MAX_AGENT_TURNS).await
+    }
+
+    /// Run the agentic loop with a custom maximum number of turns.
+    pub fn run_agent_loop_with_max_turns(
+        &self,
+        mut messages: Vec<Message>,
+        max_turns: usize,
+    ) -> futures_util::future::BoxFuture<'_, Result<AgentLoopResult>> {
+        Box::pin(async move {
+        let mut tools = builtin_tool_definitions();
+        // Merge MCP tool definitions
+        tools.extend(self.get_mcp_tool_definitions());
         let system = self.get_system_prompt();
         let executor = ToolExecutor::with_policy(self.tool_policy.clone());
         let mut total_turns = 0;
 
         loop {
-            if total_turns >= MAX_AGENT_TURNS {
+            if total_turns >= max_turns {
                 break;
             }
             total_turns += 1;
@@ -253,6 +305,7 @@ impl AgentRunner {
             // Collect response from stream
             let mut response_content: Vec<ContentBlock> = Vec::new();
             let mut text_buffer = String::new();
+            let mut thinking_buffer = String::new();
             let mut stop_reason = StopReason::EndTurn;
 
             while let Some(event_result) = stream.next().await {
@@ -262,7 +315,18 @@ impl AgentRunner {
                         self.emit_tool_event(ToolEvent::Text(delta.clone())).await;
                         text_buffer.push_str(&delta);
                     }
+                    ChatStreamEvent::ThinkingDelta(delta) => {
+                        // Accumulate thinking content (extended thinking)
+                        self.emit_tool_event(ToolEvent::Thinking(delta.clone())).await;
+                        thinking_buffer.push_str(&delta);
+                    }
                     ChatStreamEvent::ToolUse { id, name, input } => {
+                        // Flush accumulated thinking
+                        if !thinking_buffer.is_empty() {
+                            response_content.push(ContentBlock::Thinking {
+                                thinking: std::mem::take(&mut thinking_buffer),
+                            });
+                        }
                         // Flush accumulated text as a content block
                         if !text_buffer.is_empty() {
                             response_content.push(ContentBlock::Text {
@@ -284,6 +348,12 @@ impl AgentRunner {
                 }
             }
 
+            // Flush remaining thinking
+            if !thinking_buffer.is_empty() {
+                response_content.push(ContentBlock::Thinking {
+                    thinking: thinking_buffer,
+                });
+            }
             // Flush remaining text
             if !text_buffer.is_empty() {
                 response_content.push(ContentBlock::Text {
@@ -325,7 +395,15 @@ impl AgentRunner {
                 })
                 .await;
 
-                let (result_text, is_error) = executor.execute_from_json(name, input);
+                let (result_text, is_error) = if name.starts_with("mcp__") {
+                    self.execute_mcp_tool(name, input).await
+                } else {
+                    match name.as_str() {
+                        "SubAgent" => self.execute_sub_agent(input).await,
+                        "ParallelAgents" => self.execute_parallel_agents(input).await,
+                        _ => executor.execute_from_json(name, input),
+                    }
+                };
 
                 self.emit_tool_event(ToolEvent::ToolResult {
                     name: name.clone(),
@@ -357,6 +435,7 @@ impl AgentRunner {
         let estimated_tokens = messages.iter().map(|m| {
             m.content.iter().map(|b| match b {
                 ContentBlock::Text { text } => estimate_tokens(text),
+                ContentBlock::Thinking { thinking } => estimate_tokens(thinking),
                 ContentBlock::ToolUse { input, .. } => estimate_tokens(&input.to_string()),
                 ContentBlock::ToolResult { content, .. } => estimate_tokens(content),
             }).sum::<usize>()
@@ -371,6 +450,7 @@ impl AgentRunner {
             total_turns,
             estimated_tokens,
         })
+        }) // end Box::pin
     }
 
     /// Convenience: start a new agent loop from a single user prompt.
@@ -388,6 +468,172 @@ impl AgentRunner {
     ) -> Result<AgentLoopResult> {
         messages.push(Message::user_text(input));
         self.run_agent_loop(messages).await
+    }
+
+    // -----------------------------------------------------------------------
+    // MCP tool execution
+    // -----------------------------------------------------------------------
+
+    /// Execute an MCP tool call by parsing the tool name and dispatching to the right server.
+    async fn execute_mcp_tool(&self, tool_name: &str, input: &serde_json::Value) -> (String, bool) {
+        // Tool name format: mcp__{server_name}_{tool_name}
+        let rest = match tool_name.strip_prefix("mcp__") {
+            Some(r) => r,
+            None => return (format!("Error: invalid MCP tool name: {}", tool_name), true),
+        };
+
+        // Find the first underscore after server name
+        let (server_name, mcp_tool_name) = match rest.find('_') {
+            Some(idx) => (&rest[..idx], &rest[idx + 1..]),
+            None => return (format!("Error: invalid MCP tool name format: {}", tool_name), true),
+        };
+
+        let server_config = {
+            let servers = self.mcp_servers.lock().ok();
+            servers.as_ref().and_then(|guard| {
+                guard.iter().find(|(name, _)| name == server_name).map(|(_, config)| config.clone())
+            })
+        };
+
+        let server = match server_config {
+            Some(s) => s,
+            None => return (format!("Error: MCP server '{}' not found", server_name), true),
+        };
+
+        if server.url.is_some() {
+            // HTTP transport
+            match crate::mcp::call_tool_http(&server, mcp_tool_name, input).await {
+                Ok(result) => (mcp_result_to_text(&result), false),
+                Err(e) => (format!("MCP error: {}", e), true),
+            }
+        } else if server.command.is_some() {
+            // Stdio transport (blocking)
+            let server_clone = server.clone();
+            let tool = mcp_tool_name.to_string();
+            let args = input.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::mcp::call_tool_stdio(&server_clone, &tool, &args)
+            })
+            .await
+            {
+                Ok(Ok(result)) => (mcp_result_to_text(&result), false),
+                Ok(Err(e)) => (format!("MCP error: {}", e), true),
+                Err(e) => (format!("MCP task error: {}", e), true),
+            }
+        } else {
+            (format!("Error: MCP server '{}' has no transport configured", server_name), true)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // SubAgent / ParallelAgents execution
+    // -----------------------------------------------------------------------
+
+    /// Execute a SubAgent tool call by launching a new agent loop.
+    async fn execute_sub_agent(&self, input: &serde_json::Value) -> (String, bool) {
+        let prompt = input
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let max_turns = input
+            .get("max_turns")
+            .and_then(serde_json::Value::as_u64)
+            .map(|v| (v as usize).min(MAX_SUB_AGENT_TURNS))
+            .unwrap_or(MAX_SUB_AGENT_TURNS);
+
+        if prompt.is_empty() {
+            return ("Error: SubAgent requires a non-empty prompt".to_string(), true);
+        }
+
+        let sub_runner = AgentRunner::new(
+            self.client.clone(),
+            self.model_name.clone(),
+            ToolPolicy::read_only(),
+        );
+        if let Some(sys) = self.get_system_prompt() {
+            sub_runner.set_system_prompt(sys);
+        }
+
+        let messages = vec![Message::user_text(&prompt)];
+        match sub_runner.run_agent_loop_with_max_turns(messages, max_turns).await {
+            Ok(result) => (result.final_text, false),
+            Err(e) => (format!("SubAgent error: {}", e), true),
+        }
+    }
+
+    /// Execute a ParallelAgents tool call by launching multiple sub-agents concurrently.
+    async fn execute_parallel_agents(&self, input: &serde_json::Value) -> (String, bool) {
+        let tasks: Vec<String> = input
+            .get("tasks")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if tasks.len() < 2 {
+            return ("Error: ParallelAgents requires at least 2 tasks".to_string(), true);
+        }
+        if tasks.len() > 6 {
+            return ("Error: ParallelAgents supports at most 6 tasks".to_string(), true);
+        }
+
+        let mut handles = Vec::new();
+        for (i, task) in tasks.into_iter().enumerate() {
+            let client = self.client.clone();
+            let model_name = self.model_name.clone();
+            let system_prompt = self.get_system_prompt();
+
+            let handle = tokio::spawn(async move {
+                let sub_runner = AgentRunner::new(
+                    client,
+                    model_name,
+                    ToolPolicy::read_only(),
+                );
+                if let Some(sys) = system_prompt {
+                    sub_runner.set_system_prompt(sys);
+                }
+                let messages = vec![Message::user_text(&task)];
+                match sub_runner.run_agent_loop_with_max_turns(messages, MAX_SUB_AGENT_TURNS).await {
+                    Ok(result) => (i, result.final_text, false),
+                    Err(e) => (i, format!("Error: {}", e), true),
+                }
+            });
+            handles.push(handle);
+        }
+
+        let mut results: Vec<(usize, String, bool)> = Vec::new();
+        let mut any_error = false;
+        for handle in handles {
+            match handle.await {
+                Ok((idx, text, is_error)) => {
+                    if is_error {
+                        any_error = true;
+                    }
+                    results.push((idx, text, is_error));
+                }
+                Err(e) => {
+                    any_error = true;
+                    results.push((results.len(), format!("Task join error: {}", e), true));
+                }
+            }
+        }
+        results.sort_by_key(|(idx, _, _)| *idx);
+
+        let combined: Vec<String> = results
+            .iter()
+            .enumerate()
+            .map(|(i, (_, text, is_error))| {
+                let status = if *is_error { " [ERROR]" } else { "" };
+                format!("--- Task {} result{} ---\n{}", i + 1, status, text)
+            })
+            .collect();
+
+        (combined.join("\n\n"), any_error)
     }
 
     async fn emit_tool_event(&self, event: ToolEvent) {
@@ -755,6 +1001,7 @@ mod tests {
             Box::pin(async move {
                 let label = match &event {
                     ToolEvent::Text(_) => "text",
+                    ToolEvent::Thinking(_) => "thinking",
                     ToolEvent::ToolCall { .. } => "tool_call",
                     ToolEvent::ToolResult { .. } => "tool_result",
                     ToolEvent::Usage(_) => "usage",
