@@ -131,6 +131,34 @@ tengu perf
 tengu perf --format json --strict
 ```
 
+### GitHub / GitLab
+
+Tengu wraps the official `gh` and `glab` CLIs for issue, PR/MR, comment, review,
+and label operations.
+
+```bash
+# GitHub issue operations
+tengu issue view 123 --comments
+tengu issue create --title "Fix parser" --body "Parser fails on empty input" --label bug
+tengu issue labels 123 --add bug --remove triage
+
+# GitLab issue operations
+tengu issue --provider gitlab view 123 --comments
+tengu issue --provider gitlab create --title "Fix parser" --body "Parser fails on empty input" --label bug
+
+# PR/MR operations
+tengu pr create --fill --draft
+tengu pr --provider gitlab create --fill --draft
+tengu pr comment 123 --body "Looks good"
+tengu pr --provider gitlab comment 123 --body "Looks good"
+tengu pr review 123 --action request-changes --body "Please add tests"
+
+# Label operations
+tengu label list
+tengu label create bug --color ff0000 --description "Broken behavior"
+tengu label --provider gitlab list
+```
+
 ### Coverage
 
 ```bash
@@ -151,7 +179,7 @@ In TUI, use `/review`, `/review --base main`, or `/review --preset security`.
 You can also use `/new`, `/clear`, `/resume`, `/resume --last`, `/resume <session-id>`, `/save`, `/save <path>`, `/load <path>`, `/fork`, and `/diff` (optionally `/diff --stat`) for local session management and quick diff inspection. From the CLI, `tengu sessions list` shows resumable session IDs, and `tengu resume --last` or `tengu resume <session-id>` opens the selected session in the TUI.
 Use `/image <path> [more_paths...]` to attach images to the next TUI prompt.
 Dragging image file paths into the TUI input also auto-attaches them for the next prompt.
-For local git actions, `/commit <message>` and `/pr [args]` ask for `y/n` confirmation before running `git commit` or `gh pr create`, and `/editor [path]` opens your `$VISUAL` or `$EDITOR`.
+For local git and hosting actions, `/commit <message>`, `/pr [args]`, `/mr [args]`, `/issue ...`, `/label ...`, `/pr_comment ...`, and `/pr_review ...` ask for `y/n` confirmation before running `git`, `gh`, or `glab`; `/editor [path]` opens your `$VISUAL` or `$EDITOR`.
 Saved sessions now restore conversation history, visible logs, queued prompts, pending image attachments, and approval prompts that can be acknowledged again after restore.
 Additional TUI workflow commands now include `/plan`, `/taskwriter`, `/apply-plan`, `/compact`, `/memory`, `/init`, `/config`, `/doctor`, `/add-dir`, `/agents`, `/login`, `/logout`, `/pr_comments`, `/terminal-setup`, `/strategy`, `/bg`, `/usage`, `/model`, and `/vim`.
 `/config` supports `list`, `get <key>`, and `set <key> <value>` for common local settings such as `model.default`, `model.provider`, and `plan_mode`.

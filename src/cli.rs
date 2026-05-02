@@ -1,5 +1,6 @@
 use crate::agent::{AgentOutput, AgentRunner, AgentStore, StoredAgent};
 use crate::config::{Config, PermissionsConfig};
+use crate::forge::{self, ForgeProvider, ReviewAction};
 use crate::llm::{
     AnthropicBackend, GoogleBackend, LlmBackend, LlmClient, LlmImage, LlmProvider, LlmRequest,
     LlmStreamEvent, LlmUsage, OllamaBackend, OpenAiBackend,
@@ -134,6 +135,48 @@ pub enum Commands {
         preset: Option<String>,
     },
 
+    /// GitHub/GitLab issue operations through gh/glab
+    Issue {
+        /// Hosting provider
+        #[arg(long, value_enum, default_value_t = ForgeProvider::Github)]
+        provider: ForgeProvider,
+
+        /// Repository selector (OWNER/REPO or GROUP/PROJECT)
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+
+        #[command(subcommand)]
+        command: IssueCommands,
+    },
+
+    /// GitHub PR / GitLab MR operations through gh/glab
+    Pr {
+        /// Hosting provider
+        #[arg(long, value_enum, default_value_t = ForgeProvider::Github)]
+        provider: ForgeProvider,
+
+        /// Repository selector (OWNER/REPO or GROUP/PROJECT)
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+
+        #[command(subcommand)]
+        command: PrCommands,
+    },
+
+    /// GitHub/GitLab label operations through gh/glab
+    Label {
+        /// Hosting provider
+        #[arg(long, value_enum, default_value_t = ForgeProvider::Github)]
+        provider: ForgeProvider,
+
+        /// Repository selector (OWNER/REPO or GROUP/PROJECT)
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+
+        #[command(subcommand)]
+        command: LabelCommands,
+    },
+
     /// ローカル性能基準を計測
     Perf {
         /// 出力形式 (text/json)
@@ -238,6 +281,119 @@ pub enum AuthCommands {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum IssueCommands {
+    /// View an issue
+    View {
+        /// Issue number/IID
+        number: String,
+        /// Include comments
+        #[arg(long)]
+        comments: bool,
+    },
+    /// Create an issue
+    Create {
+        /// Issue title
+        #[arg(short, long)]
+        title: String,
+        /// Issue body/description
+        #[arg(short, long)]
+        body: Option<String>,
+        /// Label to add; can be repeated
+        #[arg(short, long = "label")]
+        labels: Vec<String>,
+    },
+    /// Add a comment/note to an issue
+    Comment {
+        /// Issue number/IID
+        number: String,
+        /// Comment body
+        #[arg(short, long)]
+        body: String,
+    },
+    /// Add/remove issue labels
+    Labels {
+        /// Issue number/IID
+        number: String,
+        /// Label to add; can be repeated
+        #[arg(long = "add")]
+        add: Vec<String>,
+        /// Label to remove; can be repeated
+        #[arg(long = "remove")]
+        remove: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PrCommands {
+    /// Create a GitHub PR or GitLab MR; remaining args pass through to gh/glab
+    Create {
+        /// Provider-specific args passed to gh pr create / glab mr create
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Show PR/MR comments
+    Comments {
+        /// PR number, MR IID, URL, or branch
+        target: Option<String>,
+    },
+    /// Add a PR/MR comment
+    Comment {
+        /// PR number, MR IID, URL, or branch
+        target: Option<String>,
+        /// Comment body
+        #[arg(short, long)]
+        body: String,
+    },
+    /// Add a PR review or MR approval/note
+    Review {
+        /// PR number, MR IID, URL, or branch
+        target: Option<String>,
+        /// Review action
+        #[arg(long, value_enum, default_value_t = ReviewAction::Comment)]
+        action: ReviewAction,
+        /// Review body
+        #[arg(short, long)]
+        body: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LabelCommands {
+    /// List labels
+    List,
+    /// Create a label
+    Create {
+        /// Label name
+        name: String,
+        /// Label color
+        #[arg(long)]
+        color: Option<String>,
+        /// Label description
+        #[arg(short, long)]
+        description: Option<String>,
+    },
+    /// Edit a label
+    Edit {
+        /// GitHub label name or GitLab label ID
+        name: String,
+        /// New label name
+        #[arg(long)]
+        new_name: Option<String>,
+        /// Label color
+        #[arg(long)]
+        color: Option<String>,
+        /// Label description
+        #[arg(short, long)]
+        description: Option<String>,
+    },
+    /// Delete a label
+    Delete {
+        /// Label name
+        name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum ToolCommands {
     /// ファイル読み込み
     Read {
@@ -316,6 +472,21 @@ impl Cli {
                 self.execute_review_command(base.clone(), preset.clone())
                     .await
             }
+            Commands::Issue {
+                provider,
+                repo,
+                command,
+            } => self.execute_issue_command(*provider, repo.as_deref(), command),
+            Commands::Pr {
+                provider,
+                repo,
+                command,
+            } => self.execute_pr_command(*provider, repo.as_deref(), command),
+            Commands::Label {
+                provider,
+                repo,
+                command,
+            } => self.execute_label_command(*provider, repo.as_deref(), command),
             Commands::Perf { format, strict } => self.execute_perf_command(format, *strict),
             Commands::Resume { session_id, last } => {
                 self.execute_resume_command(session_id.as_deref(), *last)
@@ -475,6 +646,96 @@ impl Cli {
                 Ok(())
             }
         }
+    }
+
+    fn execute_issue_command(
+        &self,
+        provider: ForgeProvider,
+        repo: Option<&str>,
+        command: &IssueCommands,
+    ) -> Result<()> {
+        let cmd = match command {
+            IssueCommands::View { number, comments } => {
+                forge::issue_view(provider, number, *comments, repo)
+            }
+            IssueCommands::Create {
+                title,
+                body,
+                labels,
+            } => forge::issue_create(provider, title, body.as_deref(), labels, repo),
+            IssueCommands::Comment { number, body } => {
+                forge::issue_comment(provider, number, body, repo)
+            }
+            IssueCommands::Labels {
+                number,
+                add,
+                remove,
+            } => forge::issue_labels(provider, number, add, remove, repo),
+        };
+        println!("{}", cmd.run_in_dir(Path::new(".")));
+        Ok(())
+    }
+
+    fn execute_pr_command(
+        &self,
+        provider: ForgeProvider,
+        repo: Option<&str>,
+        command: &PrCommands,
+    ) -> Result<()> {
+        let cmd = match command {
+            PrCommands::Create { args } => forge::pr_create(provider, args, repo),
+            PrCommands::Comments { target } => {
+                forge::pr_comments(provider, target.as_deref(), repo)
+            }
+            PrCommands::Comment { target, body } => {
+                forge::pr_comment(provider, target.as_deref(), body, repo)
+            }
+            PrCommands::Review {
+                target,
+                action,
+                body,
+            } => forge::pr_review(provider, target.as_deref(), *action, body.as_deref(), repo),
+        };
+        println!("{}", cmd.run_in_dir(Path::new(".")));
+        Ok(())
+    }
+
+    fn execute_label_command(
+        &self,
+        provider: ForgeProvider,
+        repo: Option<&str>,
+        command: &LabelCommands,
+    ) -> Result<()> {
+        let cmd = match command {
+            LabelCommands::List => forge::label_list(provider, repo),
+            LabelCommands::Create {
+                name,
+                color,
+                description,
+            } => forge::label_create(
+                provider,
+                name,
+                color.as_deref(),
+                description.as_deref(),
+                repo,
+            ),
+            LabelCommands::Edit {
+                name,
+                new_name,
+                color,
+                description,
+            } => forge::label_edit(
+                provider,
+                name,
+                new_name.as_deref(),
+                color.as_deref(),
+                description.as_deref(),
+                repo,
+            ),
+            LabelCommands::Delete { name } => forge::label_delete(provider, name, repo),
+        };
+        println!("{}", cmd.run_in_dir(Path::new(".")));
+        Ok(())
     }
 
     async fn execute_resume_command(&self, session_id: Option<&str>, last: bool) -> Result<()> {
@@ -1728,6 +1989,63 @@ mod tests {
         assert_eq!(image_media_type(Path::new("a.gif")), Some("image/gif"));
         assert_eq!(image_media_type(Path::new("a.webp")), Some("image/webp"));
         assert_eq!(image_media_type(Path::new("a.txt")), None);
+    }
+
+    #[test]
+    fn parses_forge_pr_passthrough_args() {
+        let cli = Cli::try_parse_from([
+            "tengu",
+            "pr",
+            "--provider",
+            "gitlab",
+            "create",
+            "--fill",
+            "--draft",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Pr {
+                provider: ForgeProvider::Gitlab,
+                command: PrCommands::Create { args },
+                ..
+            }) if args == vec!["--fill".to_string(), "--draft".to_string()]
+        ));
+    }
+
+    #[test]
+    fn parses_forge_issue_and_label_commands() {
+        let issue = Cli::try_parse_from([
+            "tengu",
+            "issue",
+            "create",
+            "--title",
+            "bug",
+            "--body",
+            "broken",
+            "--label",
+            "regression",
+        ])
+        .unwrap();
+        assert!(matches!(
+            issue.command,
+            Some(Commands::Issue {
+                provider: ForgeProvider::Github,
+                command: IssueCommands::Create { title, body, labels },
+                ..
+            }) if title == "bug"
+                && body == Some("broken".to_string())
+                && labels == vec!["regression".to_string()]
+        ));
+
+        let label = Cli::try_parse_from(["tengu", "label", "delete", "obsolete"]).unwrap();
+        assert!(matches!(
+            label.command,
+            Some(Commands::Label {
+                command: LabelCommands::Delete { name },
+                ..
+            }) if name == "obsolete"
+        ));
     }
 
     #[test]

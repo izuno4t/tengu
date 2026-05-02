@@ -4,6 +4,7 @@ use clap::Parser;
 mod agent;
 mod cli;
 mod config;
+mod forge;
 mod llm;
 mod mcp;
 mod review;

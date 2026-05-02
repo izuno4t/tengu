@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 
 use crate::agent::{AgentRunner, AgentStore};
 use crate::config::Config;
+use crate::forge::{self, ForgeCommand, ForgeProvider, ReviewAction};
 use crate::llm::{LlmImage, LlmRequest, LlmStreamEvent};
 use crate::mcp::McpStore;
 use crate::review::{build_review_prompt, parse_review_args};
@@ -1432,7 +1433,8 @@ impl App {
             "- truecolor / 24-bit color enabled",
             "- enough scrollback for streaming output",
             "- set $EDITOR or $VISUAL for /editor",
-            "- install `gh` if you want /pr and /pr_comments",
+            "- install `gh` for GitHub /pr, /issue, /label helpers",
+            "- install `glab` for GitLab /mr, /issue, /label helpers",
         ]
         .join("\n")
     }
@@ -1598,6 +1600,7 @@ impl App {
         let checks = [
             ("git", command_exists("git")),
             ("gh", command_exists("gh")),
+            ("glab", command_exists("glab")),
             ("cargo", command_exists("cargo")),
         ];
         let mut lines = checks
@@ -1636,6 +1639,11 @@ impl App {
                     };
                     (prompt, "local-pr".to_string(), args.clone())
                 }
+                PendingLocalAction::Forge { command } => (
+                    format!("Run `{}`?\n[y] Yes  [n] No", command.label()),
+                    "local-forge".to_string(),
+                    command.args.clone(),
+                ),
             };
             return Some(SessionPendingApproval {
                 prompt,
@@ -1833,6 +1841,7 @@ enum ResumeTarget {
 enum PendingLocalAction {
     GitCommit { message: String },
     GhPrCreate { args: Vec<String> },
+    Forge { command: ForgeCommand },
 }
 
 struct RestoredToolApproval {
@@ -1896,7 +1905,27 @@ fn handle_slash_command(input: &str) -> Option<SlashCommandOutcome> {
         "/bug" => Some(SlashCommandOutcome::BugReport(
             (!args.is_empty()).then(|| args.join(" ")),
         )),
-        "/pr_comments" => Some(SlashCommandOutcome::ShowPrComments),
+        "/pr_comments" => match build_pr_comments_action(&args) {
+            Ok(Some(outcome)) => Some(outcome),
+            Ok(None) => Some(SlashCommandOutcome::ShowPrComments),
+            Err(message) => Some(SlashCommandOutcome::Display(message)),
+        },
+        "/issue" => match build_issue_action(&args) {
+            Ok(outcome) => Some(outcome),
+            Err(message) => Some(SlashCommandOutcome::Display(message)),
+        },
+        "/label" => match build_label_action(&args) {
+            Ok(outcome) => Some(outcome),
+            Err(message) => Some(SlashCommandOutcome::Display(message)),
+        },
+        "/pr_comment" => match build_pr_comment_action(&args) {
+            Ok(outcome) => Some(outcome),
+            Err(message) => Some(SlashCommandOutcome::Display(message)),
+        },
+        "/pr_review" => match build_pr_review_action(&args) {
+            Ok(outcome) => Some(outcome),
+            Err(message) => Some(SlashCommandOutcome::Display(message)),
+        },
         "/terminal-setup" => Some(SlashCommandOutcome::TerminalSetup),
         "/vim" => Some(SlashCommandOutcome::ToggleVim),
         "/bg" => Some(SlashCommandOutcome::ShowBackground),
@@ -1999,6 +2028,7 @@ fn handle_slash_command(input: &str) -> Option<SlashCommandOutcome> {
             Err(message) => Some(SlashCommandOutcome::Display(message)),
         },
         "/pr" => Some(build_pr_action(&args)),
+        "/mr" => Some(build_mr_action(&args)),
         "/editor" => match args.as_slice() {
             [] => Some(SlashCommandOutcome::OpenEditor(None)),
             [path] => Some(SlashCommandOutcome::OpenEditor(Some(PathBuf::from(path)))),
@@ -2248,7 +2278,27 @@ fn slash_help_items() -> Vec<SlashCommandHelp> {
         },
         SlashCommandHelp {
             cmd: "/pr_comments",
-            desc_en: "Show PR comments via gh",
+            desc_en: "Show PR/MR comments via gh/glab",
+        },
+        SlashCommandHelp {
+            cmd: "/pr_comment",
+            desc_en: "Add PR/MR comment via gh/glab",
+        },
+        SlashCommandHelp {
+            cmd: "/pr_review",
+            desc_en: "Add PR/MR review via gh/glab",
+        },
+        SlashCommandHelp {
+            cmd: "/issue",
+            desc_en: "View/create/comment/label issues",
+        },
+        SlashCommandHelp {
+            cmd: "/label",
+            desc_en: "List/create/edit/delete labels",
+        },
+        SlashCommandHelp {
+            cmd: "/mr [args]",
+            desc_en: "glab mr create (pass-through args)",
         },
         SlashCommandHelp {
             cmd: "/terminal-setup",
@@ -2332,7 +2382,7 @@ fn slash_help_items() -> Vec<SlashCommandHelp> {
         },
         SlashCommandHelp {
             cmd: "/pr [args]",
-            desc_en: "gh pr create (pass-through args)",
+            desc_en: "gh pr create or --provider gitlab",
         },
         SlashCommandHelp {
             cmd: "/review [opts]",
@@ -2483,6 +2533,13 @@ fn parse_commit_action(args: &[&str]) -> std::result::Result<SlashCommandOutcome
 }
 
 fn build_pr_action(args: &[&str]) -> SlashCommandOutcome {
+    if matches!(args.first(), Some(&"--provider")) && matches!(args.get(1), Some(&"gitlab")) {
+        let rest = args[2..]
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>();
+        return confirm_forge(forge::pr_create(ForgeProvider::Gitlab, &rest, None));
+    }
     let prompt = if args.is_empty() {
         "Run `gh pr create`?\n[y] Yes  [n] No".to_string()
     } else {
@@ -2494,6 +2551,226 @@ fn build_pr_action(args: &[&str]) -> SlashCommandOutcome {
             args: args.iter().map(|arg| (*arg).to_string()).collect(),
         },
     }
+}
+
+fn build_mr_action(args: &[&str]) -> SlashCommandOutcome {
+    let passthrough = args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
+    confirm_forge(forge::pr_create(ForgeProvider::Gitlab, &passthrough, None))
+}
+
+fn build_pr_comments_action(
+    args: &[&str],
+) -> std::result::Result<Option<SlashCommandOutcome>, String> {
+    if args.is_empty() {
+        return Ok(None);
+    }
+    let (provider, rest) = parse_provider_prefix(args)?;
+    let target = rest.first().copied();
+    Ok(Some(confirm_forge(forge::pr_comments(
+        provider, target, None,
+    ))))
+}
+
+fn build_pr_comment_action(args: &[&str]) -> std::result::Result<SlashCommandOutcome, String> {
+    let (provider, rest) = parse_provider_prefix(args)?;
+    if rest.is_empty() {
+        return Err("usage: /pr_comment [--provider github|gitlab] [target] <body>".to_string());
+    }
+    let (target, body) = if rest.len() >= 2 {
+        (Some(rest[0]), rest[1..].join(" "))
+    } else {
+        (None, rest[0].to_string())
+    };
+    Ok(confirm_forge(forge::pr_comment(
+        provider, target, &body, None,
+    )))
+}
+
+fn build_pr_review_action(args: &[&str]) -> std::result::Result<SlashCommandOutcome, String> {
+    let (provider, rest) = parse_provider_prefix(args)?;
+    let (action, rest) = parse_review_action_prefix(rest)?;
+    let (target, body) = if rest.len() >= 2 {
+        (Some(rest[0]), Some(rest[1..].join(" ")))
+    } else if action == ReviewAction::Approve {
+        (rest.first().copied(), None)
+    } else if let Some(body) = rest.first() {
+        (None, Some((*body).to_string()))
+    } else {
+        (None, None)
+    };
+    Ok(confirm_forge(forge::pr_review(
+        provider,
+        target,
+        action,
+        body.as_deref(),
+        None,
+    )))
+}
+
+fn build_issue_action(args: &[&str]) -> std::result::Result<SlashCommandOutcome, String> {
+    let (provider, rest) = parse_provider_prefix(args)?;
+    let Some(command) = rest.first() else {
+        return Err(
+            "usage: /issue [--provider github|gitlab] <view|create|comment|labels> ...".to_string(),
+        );
+    };
+    match *command {
+        "view" => {
+            let Some(number) = rest.get(1) else {
+                return Err("usage: /issue view <number> [--comments]".to_string());
+            };
+            let comments = rest.contains(&"--comments");
+            Ok(confirm_forge(forge::issue_view(
+                provider, number, comments, None,
+            )))
+        }
+        "create" => {
+            let title = parse_flag_value(&rest[1..], "--title").ok_or_else(|| {
+                "usage: /issue create --title <title> [--body <body>] [--label <label>]".to_string()
+            })?;
+            let body = parse_flag_value(&rest[1..], "--body");
+            let labels = parse_repeated_flag_values(&rest[1..], "--label");
+            Ok(confirm_forge(forge::issue_create(
+                provider,
+                &title,
+                body.as_deref(),
+                &labels,
+                None,
+            )))
+        }
+        "comment" => {
+            if rest.len() < 3 {
+                return Err("usage: /issue comment <number> <body>".to_string());
+            }
+            Ok(confirm_forge(forge::issue_comment(
+                provider,
+                rest[1],
+                &rest[2..].join(" "),
+                None,
+            )))
+        }
+        "labels" => {
+            let Some(number) = rest.get(1) else {
+                return Err(
+                    "usage: /issue labels <number> [--add <label>] [--remove <label>]".to_string(),
+                );
+            };
+            let add = parse_repeated_flag_values(&rest[2..], "--add");
+            let remove = parse_repeated_flag_values(&rest[2..], "--remove");
+            Ok(confirm_forge(forge::issue_labels(
+                provider, number, &add, &remove, None,
+            )))
+        }
+        _ => Err(
+            "usage: /issue [--provider github|gitlab] <view|create|comment|labels> ...".to_string(),
+        ),
+    }
+}
+
+fn build_label_action(args: &[&str]) -> std::result::Result<SlashCommandOutcome, String> {
+    let (provider, rest) = parse_provider_prefix(args)?;
+    let Some(command) = rest.first() else {
+        return Err(
+            "usage: /label [--provider github|gitlab] <list|create|edit|delete> ...".to_string(),
+        );
+    };
+    match *command {
+        "list" => Ok(confirm_forge(forge::label_list(provider, None))),
+        "create" => {
+            let Some(name) = rest.get(1) else {
+                return Err(
+                    "usage: /label create <name> [--color <hex>] [--description <text>]"
+                        .to_string(),
+                );
+            };
+            let color = parse_flag_value(&rest[2..], "--color");
+            let description = parse_flag_value(&rest[2..], "--description");
+            Ok(confirm_forge(forge::label_create(
+                provider,
+                name,
+                color.as_deref(),
+                description.as_deref(),
+                None,
+            )))
+        }
+        "edit" => {
+            let Some(name) = rest.get(1) else {
+                return Err("usage: /label edit <name-or-id> [--new-name <name>] [--color <hex>] [--description <text>]".to_string());
+            };
+            let new_name = parse_flag_value(&rest[2..], "--new-name");
+            let color = parse_flag_value(&rest[2..], "--color");
+            let description = parse_flag_value(&rest[2..], "--description");
+            Ok(confirm_forge(forge::label_edit(
+                provider,
+                name,
+                new_name.as_deref(),
+                color.as_deref(),
+                description.as_deref(),
+                None,
+            )))
+        }
+        "delete" => {
+            let Some(name) = rest.get(1) else {
+                return Err("usage: /label delete <name>".to_string());
+            };
+            Ok(confirm_forge(forge::label_delete(provider, name, None)))
+        }
+        _ => Err(
+            "usage: /label [--provider github|gitlab] <list|create|edit|delete> ...".to_string(),
+        ),
+    }
+}
+
+fn confirm_forge(command: ForgeCommand) -> SlashCommandOutcome {
+    SlashCommandOutcome::ConfirmLocal {
+        prompt: format!("Run `{}`?\n[y] Yes  [n] No", command.label()),
+        action: PendingLocalAction::Forge { command },
+    }
+}
+
+fn parse_provider_prefix<'a>(
+    args: &'a [&'a str],
+) -> std::result::Result<(ForgeProvider, &'a [&'a str]), String> {
+    if args.len() >= 2 && args[0] == "--provider" {
+        let provider = match args[1] {
+            "github" | "gh" => ForgeProvider::Github,
+            "gitlab" | "glab" => ForgeProvider::Gitlab,
+            other => return Err(format!("unsupported provider: {}", other)),
+        };
+        return Ok((provider, &args[2..]));
+    }
+    Ok((ForgeProvider::Github, args))
+}
+
+fn parse_review_action_prefix<'a>(
+    args: &'a [&'a str],
+) -> std::result::Result<(ReviewAction, &'a [&'a str]), String> {
+    if args.len() >= 2 && args[0] == "--action" {
+        let action = match args[1] {
+            "comment" => ReviewAction::Comment,
+            "approve" => ReviewAction::Approve,
+            "request-changes" => ReviewAction::RequestChanges,
+            other => return Err(format!("unsupported review action: {}", other)),
+        };
+        return Ok((action, &args[2..]));
+    }
+    Ok((ReviewAction::Comment, args))
+}
+
+fn parse_flag_value(args: &[&str], flag: &str) -> Option<String> {
+    args.windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].to_string())
+}
+
+fn parse_repeated_flag_values(args: &[&str], flag: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|pair| pair[0] == flag)
+        .map(|pair| pair[1].to_string())
+        .collect()
 }
 
 fn execute_pending_local_action(action: PendingLocalAction) -> String {
@@ -2520,6 +2797,7 @@ fn execute_pending_local_action_in_dir(action: PendingLocalAction, cwd: &Path) -
                 .output();
             format_command_result("gh pr create", output)
         }
+        PendingLocalAction::Forge { command } => command.run_in_dir(cwd),
     }
 }
 
@@ -2956,6 +3234,106 @@ mod tests {
                 assert!(prompt.contains("gh pr create --draft --fill"));
             }
             _ => panic!("expected confirmed PR action"),
+        }
+    }
+
+    #[test]
+    fn parses_gitlab_mr_create_as_forge_action() {
+        let outcome = handle_slash_command("/mr --fill --draft");
+
+        match outcome {
+            Some(SlashCommandOutcome::ConfirmLocal {
+                prompt,
+                action: PendingLocalAction::Forge { command },
+            }) => {
+                assert_eq!(command.program, "glab");
+                assert_eq!(command.args, vec!["mr", "create", "--fill", "--draft"]);
+                assert!(prompt.contains("glab mr create --fill --draft"));
+            }
+            _ => panic!("expected forge MR action"),
+        }
+    }
+
+    #[test]
+    fn parses_issue_and_label_forge_actions() {
+        let issue = handle_slash_command(
+            "/issue --provider gitlab create --title bug --body broken --label regression",
+        );
+        match issue {
+            Some(SlashCommandOutcome::ConfirmLocal {
+                action: PendingLocalAction::Forge { command },
+                ..
+            }) => {
+                assert_eq!(command.program, "glab");
+                assert_eq!(
+                    command.args,
+                    vec![
+                        "issue",
+                        "create",
+                        "--title",
+                        "bug",
+                        "--description",
+                        "broken",
+                        "--label",
+                        "regression"
+                    ]
+                );
+            }
+            _ => panic!("expected forge issue action"),
+        }
+
+        let label = handle_slash_command("/label create bug --color ff0000");
+        match label {
+            Some(SlashCommandOutcome::ConfirmLocal {
+                action: PendingLocalAction::Forge { command },
+                ..
+            }) => {
+                assert_eq!(command.program, "gh");
+                assert_eq!(
+                    command.args,
+                    vec!["label", "create", "bug", "--color", "ff0000"]
+                );
+            }
+            _ => panic!("expected forge label action"),
+        }
+    }
+
+    #[test]
+    fn parses_pr_comment_and_review_actions() {
+        let comment = handle_slash_command("/pr_comment 12 looks good");
+        match comment {
+            Some(SlashCommandOutcome::ConfirmLocal {
+                action: PendingLocalAction::Forge { command },
+                ..
+            }) => {
+                assert_eq!(
+                    command.args,
+                    vec!["pr", "comment", "12", "--body", "looks good"]
+                );
+            }
+            _ => panic!("expected forge comment action"),
+        }
+
+        let review = handle_slash_command(
+            "/pr_review --provider gitlab --action request-changes 12 needs tests",
+        );
+        match review {
+            Some(SlashCommandOutcome::ConfirmLocal {
+                action: PendingLocalAction::Forge { command },
+                ..
+            }) => {
+                assert_eq!(
+                    command.args,
+                    vec![
+                        "mr",
+                        "note",
+                        "12",
+                        "--message",
+                        "Request changes: needs tests"
+                    ]
+                );
+            }
+            _ => panic!("expected forge review action"),
         }
     }
 
