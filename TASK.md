@@ -92,6 +92,22 @@ Phase G は `docs/REQUIREMENTS.md` に対する不足を埋める。
 | ALT-026 | ✅ | カバレッジ計測と不足テストを追加する | ALT-022,ALT-024 |
 | ALT-027 | ✅ | REQUIREMENTS/TASK/READMEの完了判定を再整合する | ALT-025,ALT-026 |
 
+## Phase H: Claude Code / Codex Parity Closure
+
+Claude Code / Codex と同等の実用感・信頼性に近づけるため、Phase G 後に残る検証証跡、対話UX、外部連携、状態管理を補強する。
+
+| ID | Status | Summary | DependsOn |
+| ---- | ------ | ------- | --------- |
+| ALT-028 | ⏳ | 主要CLI/TUI導線のE2Eテストハーネスを追加する | ALT-027 |
+| ALT-029 | ⏳ | 80%カバレッジ実測をCIまたは固定toolchainで取得する | ALT-026,ALT-028 |
+| ALT-030 | ⏳ | ファイル参照のTAB補完・fuzzy検索・最近使用履歴を実装する | ALT-021 |
+| ALT-031 | ⏳ | GitHub/GitLabのPRコメント・Issue・Label操作を実装する | ALT-022 |
+| ALT-032 | ⏳ | OAuthまたは暗号化トークン保存を含む認証保護を追加する | ALT-023 |
+| ALT-033 | ⏳ | チェックポイント・rollback・作業差分復元を実装する | ALT-021,ALT-022 |
+| ALT-034 | ⏳ | プロジェクトknowledge baseと永続メモリー検索を実装する | ALT-019 |
+| ALT-035 | ⏳ | 長時間セッション・大規模リポジトリの回帰テストを追加する | ALT-028,ALT-029 |
+| ALT-036 | ⏳ | Claude Code / Codex parityの最終判定レポートを更新する | ALT-030,ALT-031,ALT-032,ALT-033,ALT-034,ALT-035 |
+
 ## 変更サマリ
 
 ### Phase F 変更ファイル
