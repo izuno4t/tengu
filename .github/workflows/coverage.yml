@@ -26,5 +26,16 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Use rustup LLVM tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          tools_dir="$(rustc --print sysroot)/lib/rustlib/${host}/bin"
+          echo "LLVM_COV=${tools_dir}/llvm-cov" >> "$GITHUB_ENV"
+          echo "LLVM_PROFDATA=${tools_dir}/llvm-profdata" >> "$GITHUB_ENV"
+          "${tools_dir}/llvm-cov" --version
+          "${tools_dir}/llvm-profdata" --version
+
       - name: Check core coverage
         run: scripts/coverage.sh summary
