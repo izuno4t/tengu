@@ -456,6 +456,62 @@ mod tests {
     }
 
     #[test]
+    fn session_store_roundtrips_long_session_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let mut session = Session::with_id("long-session".to_string());
+
+        for idx in 0..180 {
+            session.conversation.push(SessionConversationTurn {
+                role: if idx % 2 == 0 {
+                    SessionConversationRole::User
+                } else {
+                    SessionConversationRole::Assistant
+                },
+                content: format!("conversation turn {idx}: {}", "context ".repeat(8)),
+            });
+            session.log_lines.push(SessionLogLine {
+                role: SessionLogRole::System,
+                text: format!("log line {idx}: {}", "event ".repeat(6)),
+            });
+            session.recent_files.push(format!("src/module_{idx:03}.rs"));
+            session.messages.push(serde_json::json!({
+                "role": if idx % 2 == 0 { "user" } else { "assistant" },
+                "content": format!("message payload {idx}")
+            }));
+        }
+        for idx in 0..25 {
+            session.queue.push(SessionPendingInput {
+                text: format!("queued prompt {idx}"),
+                logged: idx % 2 == 0,
+                images: Vec::new(),
+            });
+        }
+        session.usage_records.push(SessionUsageRecord {
+            provider: "anthropic".to_string(),
+            input_tokens: 12_000,
+            output_tokens: 3_000,
+            total_tokens: 15_000,
+            cache_creation_input_tokens: 100,
+            cache_read_input_tokens: 200,
+            reasoning_tokens: 0,
+            requests: 42,
+            last_raw: Some("large session usage payload".to_string()),
+        });
+
+        store.save(&session).unwrap();
+        let loaded = store.load("long-session").unwrap();
+
+        assert_eq!(loaded.conversation.len(), 180);
+        assert_eq!(loaded.log_lines.len(), 180);
+        assert_eq!(loaded.queue.len(), 25);
+        assert_eq!(loaded.recent_files.len(), 180);
+        assert_eq!(loaded.messages.len(), 180);
+        assert_eq!(loaded.usage_records[0].total_tokens, 15_000);
+        assert!(loaded.conversation[179].content.contains("turn 179"));
+    }
+
+    #[test]
     fn session_usage_record_serialization() {
         let usage = SessionUsageRecord {
             provider: "anthropic".to_string(),

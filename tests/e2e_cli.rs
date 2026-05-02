@@ -171,6 +171,38 @@ fn e2e_tool_commands_read_write_search_and_enforce_sensitive_defaults() {
 }
 
 #[test]
+fn e2e_large_repository_file_tools_handle_many_files() {
+    let project = E2eProject::new();
+    let src = project.path().join("src");
+    fs::create_dir_all(&src).expect("create src fixture");
+
+    for idx in 0..160 {
+        let module = src.join(format!("module_{idx:03}"));
+        fs::create_dir_all(&module).expect("create module fixture");
+        fs::write(
+            module.join(format!("file_{idx:03}.rs")),
+            format!("pub fn value_{idx:03}() -> &'static str {{\n    \"needle_{idx:03}\"\n}}\n"),
+        )
+        .expect("write source fixture");
+    }
+    fs::create_dir_all(project.path().join("target")).expect("create ignored fixture dir");
+    fs::write(project.path().join("target/generated.rs"), "needle_159")
+        .expect("write generated fixture");
+
+    let glob = stdout(&project.run(&["tool", "glob", "*.rs", "src"]));
+    assert_contains(&glob, "src/module_000/file_000.rs");
+    assert_contains(&glob, "src/module_159/file_159.rs");
+
+    let grep = stdout(&project.run(&["tool", "grep", "needle_137", "src"]));
+    assert_contains(&grep, "src/module_137/file_137.rs:2:");
+    assert_contains(&grep, "needle_137");
+
+    let read = stdout(&project.run(&["tool", "read", "src/module_159/file_159.rs"]));
+    assert_contains(&read, "1\tpub fn value_159()");
+    assert_contains(&read, "2\t    \"needle_159\"");
+}
+
+#[test]
 fn e2e_perf_json_has_required_metrics_and_bad_format_fails() {
     let project = E2eProject::new();
 

@@ -26,10 +26,11 @@ Tengu is a flexible, multi-LLM coding agent that integrates with MCP servers, su
 
 Core CLI/TUI, multi-provider LLM routing, built-in tools, MCP, permissions,
 hooks, session resume, Git/review workflows, checkpoints, project memory,
-security defaults, performance checks, encrypted token storage, and required user
-documentation are implemented.
-Remaining tracked gaps are broader E2E evidence, 80% coverage proof in a matching
-LLVM environment, and advanced optional features.
+security defaults, performance checks, encrypted token storage, long-session and
+large-repository regression checks, and required user documentation are
+implemented.
+Remaining tracked gaps are full interactive terminal E2E coverage and advanced
+optional features.
 
 ## 🚀 Quick Start
 
@@ -214,6 +215,8 @@ The coverage helper prefers `cargo llvm-cov` and falls back to
 available LLVM tools, set `LLVM_COV` and `LLVM_PROFDATA` to matching binaries.
 The CI coverage job measures core non-interactive code at an 80% line threshold
 and excludes interactive TUI rendering and network transport adapters.
+Regression coverage also includes long-session persistence roundtrips and
+large-repository file tool E2E checks with many generated source files.
 
 In TUI, use `/review`, `/review --base main`, or `/review --preset security`.
 You can also use `/new`, `/clear`, `/resume`, `/resume --last`, `/resume <session-id>`, `/save`, `/save <path>`, `/load <path>`, `/fork`, and `/diff` (optionally `/diff --stat`) for local session management and quick diff inspection. From the CLI, `tengu sessions list` shows resumable session IDs, and `tengu resume --last` or `tengu resume <session-id>` opens the selected session in the TUI.
