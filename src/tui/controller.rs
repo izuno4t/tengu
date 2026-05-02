@@ -24,6 +24,9 @@ use crate::review::{build_review_prompt, parse_review_args};
 use crate::session::SessionPendingApproval;
 use crate::session::{Session, SessionStore};
 use crate::tools::{Tool, ToolApprovalDecision, ToolApprovalRequest};
+use crate::tui::file_completion::{
+    completion_context, extract_file_references, file_completions, replace_completion,
+};
 use crate::tui::render;
 use crate::tui::state::{AppState, ApprovalPending, PendingMode, TuiEvent};
 
@@ -153,6 +156,9 @@ impl App {
                         KeyCode::Down => {
                             self.history_next();
                         }
+                        KeyCode::Tab => {
+                            self.complete_file_reference();
+                        }
                         KeyCode::Backspace => {
                             self.state.input.pop();
                             self.refresh_suggestions();
@@ -216,11 +222,38 @@ impl App {
     }
 
     fn refresh_suggestions(&mut self) {
-        if self.state.input.trim().starts_with('/') {
+        if let Some(context) = completion_context(&self.state.input) {
+            let candidates =
+                file_completions(Path::new("."), &context.query, &self.state.recent_files, 5);
+            self.state.suggestions = if candidates.is_empty() {
+                String::new()
+            } else {
+                candidates
+                    .iter()
+                    .map(|candidate| format!("TAB @{}", candidate.display))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+        } else if self.state.input.trim().starts_with('/') {
             self.state.suggestions = build_slash_help_filtered(self.state.input.trim());
         } else {
             self.state.suggestions.clear();
         }
+    }
+
+    fn complete_file_reference(&mut self) {
+        let Some(context) = completion_context(&self.state.input) else {
+            return;
+        };
+        let Some(candidate) =
+            file_completions(Path::new("."), &context.query, &self.state.recent_files, 1)
+                .into_iter()
+                .next()
+        else {
+            return;
+        };
+        self.state.input = replace_completion(&self.state.input, &context, &candidate);
+        self.refresh_suggestions();
     }
 
     fn handle_input(&mut self) {
@@ -465,6 +498,7 @@ impl App {
         }
 
         if self.state.status_state == "running" {
+            self.record_recent_file_references(&input);
             let images = self.state.take_pending_images();
             self.state.queue.push_back(crate::tui::state::PendingInput {
                 text: input,
@@ -480,6 +514,7 @@ impl App {
         }
 
         let images = self.state.take_pending_images();
+        self.record_recent_file_references(&input);
         self.state.append_user_message(&format!("> {}", input));
         self.state.queue.push_back(crate::tui::state::PendingInput {
             text: input,
@@ -510,6 +545,14 @@ impl App {
         self.state.history.push(input.to_string());
         self.state.history_index = None;
         self.state.draft_input.clear();
+    }
+
+    fn record_recent_file_references(&mut self, input: &str) {
+        let refs = extract_file_references(input, Path::new("."));
+        if refs.is_empty() {
+            return;
+        }
+        self.state.record_recent_files(refs);
     }
 
     fn history_prev(&mut self) {
@@ -842,6 +885,7 @@ impl App {
         session.pending_images = self.state.export_pending_images();
         session.usage_records = self.state.export_usage_records();
         session.pending_approval = pending_approval;
+        session.recent_files = self.state.export_recent_files();
         session.updated_at = chrono::Utc::now().to_rfc3339();
         if let Some(store) = &self.session_store {
             let _ = store.save(session);
@@ -950,6 +994,7 @@ impl App {
             &session.queue,
             &session.pending_images,
             &session.usage_records,
+            &session.recent_files,
         );
         self.restore_pending_approval(session.pending_approval.clone());
     }

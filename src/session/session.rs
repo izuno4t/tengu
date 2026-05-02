@@ -102,6 +102,8 @@ pub struct Session {
     pub usage_records: Vec<SessionUsageRecord>,
     #[serde(default)]
     pub pending_approval: Option<SessionPendingApproval>,
+    #[serde(default)]
+    pub recent_files: Vec<String>,
     /// Structured message history for agentic loop (Message[] serialized as JSON)
     #[serde(default)]
     pub messages: Vec<Value>,
@@ -124,6 +126,7 @@ impl Session {
             pending_images: Vec::new(),
             usage_records: Vec::new(),
             pending_approval: None,
+            recent_files: Vec::new(),
             messages: Vec::new(),
         }
     }
@@ -136,6 +139,7 @@ impl Session {
         forked.pending_images = self.pending_images.clone();
         forked.usage_records = self.usage_records.clone();
         forked.pending_approval = self.pending_approval.clone();
+        forked.recent_files = self.recent_files.clone();
         forked.messages = self.messages.clone();
         forked
     }
@@ -282,6 +286,7 @@ mod tests {
         assert!(s.pending_images.is_empty());
         assert!(s.usage_records.is_empty());
         assert!(s.pending_approval.is_none());
+        assert!(s.recent_files.is_empty());
         assert!(s.messages.is_empty());
     }
 
@@ -308,12 +313,14 @@ mod tests {
             role: SessionLogRole::System,
             text: "system init".to_string(),
         });
+        s.recent_files.push("src/main.rs".to_string());
 
         let forked = s.fork();
         assert_ne!(forked.id, s.id);
         assert_eq!(forked.conversation.len(), 1);
         assert_eq!(forked.conversation[0].content, "hello");
         assert_eq!(forked.log_lines.len(), 1);
+        assert_eq!(forked.recent_files, vec!["src/main.rs".to_string()]);
     }
 
     #[test]
@@ -327,6 +334,7 @@ mod tests {
             role: SessionConversationRole::Assistant,
             content: "response".to_string(),
         });
+        s.recent_files.push("src/main.rs".to_string());
 
         let json = serde_json::to_string(&s).unwrap();
         let loaded: Session = serde_json::from_str(&json).unwrap();
@@ -334,6 +342,7 @@ mod tests {
         assert_eq!(loaded.conversation.len(), 2);
         assert_eq!(loaded.conversation[0].content, "test message");
         assert_eq!(loaded.conversation[1].content, "response");
+        assert_eq!(loaded.recent_files, vec!["src/main.rs".to_string()]);
     }
 
     #[test]

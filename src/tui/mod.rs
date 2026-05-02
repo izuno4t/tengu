@@ -1,5 +1,6 @@
 mod ansi;
 mod controller;
+mod file_completion;
 mod inline;
 mod render;
 mod state;

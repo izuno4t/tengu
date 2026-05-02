@@ -128,6 +128,7 @@ pub struct AppState {
     pub last_plan_text: Option<String>,
     pub last_plan_items: Vec<String>,
     pub added_dirs: Vec<PathBuf>,
+    pub recent_files: Vec<String>,
     pub vim_mode: bool,
     pub usage: UsageStats,
     pub provider_usage: Vec<ProviderUsageRecord>,
@@ -184,6 +185,7 @@ impl AppState {
             last_plan_text: None,
             last_plan_items: Vec::new(),
             added_dirs: Vec::new(),
+            recent_files: Vec::new(),
             vim_mode: false,
             usage: UsageStats::default(),
             provider_usage: Vec::new(),
@@ -400,6 +402,24 @@ impl AppState {
         self.added_dirs = paths;
     }
 
+    pub fn set_recent_files(&mut self, files: Vec<String>) {
+        self.recent_files = files;
+        self.truncate_recent_files();
+    }
+
+    pub fn record_recent_files(&mut self, files: Vec<String>) {
+        for file in files.into_iter().rev() {
+            self.recent_files.retain(|existing| existing != &file);
+            self.recent_files.insert(0, file);
+        }
+        self.truncate_recent_files();
+    }
+
+    fn truncate_recent_files(&mut self) {
+        const MAX_RECENT_FILES: usize = 50;
+        self.recent_files.truncate(MAX_RECENT_FILES);
+    }
+
     pub fn take_pending_images(&mut self) -> Vec<LlmImage> {
         std::mem::take(&mut self.pending_images)
     }
@@ -476,6 +496,10 @@ impl AppState {
             .collect()
     }
 
+    pub fn export_recent_files(&self) -> Vec<String> {
+        self.recent_files.clone()
+    }
+
     pub fn restore_from_session(
         &mut self,
         conversation: &[SessionConversationTurn],
@@ -483,6 +507,7 @@ impl AppState {
         queue: &[SessionPendingInput],
         pending_images: &[SessionImage],
         usage_records: &[SessionUsageRecord],
+        recent_files: &[String],
     ) {
         self.reset_session_view();
         if !log_lines.is_empty() {
@@ -545,6 +570,7 @@ impl AppState {
                 last_raw: record.last_raw.clone(),
             })
             .collect();
+        self.set_recent_files(recent_files.to_vec());
     }
 
     pub fn store_plan(&mut self, request: String, plan: String) {
@@ -575,6 +601,7 @@ impl AppState {
         self.approval_pending = None;
         self.pending_images.clear();
         self.added_dirs.clear();
+        self.recent_files.clear();
         self.vim_mode = false;
         self.provider_usage.clear();
         self.set_idle();
