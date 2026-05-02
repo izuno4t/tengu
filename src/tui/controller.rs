@@ -3179,20 +3179,11 @@ mod tests {
     fn setup_git_repo_with_staged_change() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         run_git(dir.path(), &["init"]);
+        run_git(dir.path(), &["config", "user.name", "Tengu Test"]);
+        run_git(dir.path(), &["config", "user.email", "tengu@example.test"]);
         fs::write(dir.path().join("notes.txt"), "before\n").unwrap();
         run_git(dir.path(), &["add", "notes.txt"]);
-        run_git(
-            dir.path(),
-            &[
-                "-c",
-                "user.name=Tengu Test",
-                "-c",
-                "user.email=tengu@example.test",
-                "commit",
-                "-m",
-                "initial",
-            ],
-        );
+        run_git(dir.path(), &["commit", "-m", "initial"]);
         fs::write(dir.path().join("notes.txt"), "before\nafter\n").unwrap();
         dir
     }
