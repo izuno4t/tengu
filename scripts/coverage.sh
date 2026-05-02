@@ -52,6 +52,28 @@ run_llvm_cov() {
   cargo "${args[@]}"
 }
 
+resolve_rustup_llvm_tools() {
+  local host
+  local sysroot
+  local tools_dir
+
+  host="$(rustc -vV | sed -n 's/^host: //p')"
+  sysroot="$(rustc --print sysroot)"
+  tools_dir="${sysroot}/lib/rustlib/${host}/bin"
+
+  if [ -z "${LLVM_COV:-}" ] && [ -x "${tools_dir}/llvm-cov" ]; then
+    export LLVM_COV="${tools_dir}/llvm-cov"
+  fi
+  if [ -z "${LLVM_PROFDATA:-}" ] && [ -x "${tools_dir}/llvm-profdata" ]; then
+    export LLVM_PROFDATA="${tools_dir}/llvm-profdata"
+  fi
+  if [ -n "${LLVM_COV:-}" ] && [ -n "${LLVM_PROFDATA:-}" ]; then
+    export PATH="${tools_dir}:${PATH}"
+    echo "Using LLVM_COV=${LLVM_COV}" >&2
+    echo "Using LLVM_PROFDATA=${LLVM_PROFDATA}" >&2
+  fi
+}
+
 run_tarpaulin() {
   local args=(tarpaulin --fail-under "$min_lines")
 
@@ -72,6 +94,7 @@ run_tarpaulin() {
 }
 
 if cargo llvm-cov --version >/dev/null 2>&1; then
+  resolve_rustup_llvm_tools
   set +e
   run_llvm_cov
   status=$?
@@ -81,8 +104,8 @@ if cargo llvm-cov --version >/dev/null 2>&1; then
   fi
   cat >&2 <<'HINT'
 
-cargo llvm-cov failed. Confirm that llvm-cov and llvm-profdata match the active rustc.
-For rustup toolchains, run:
+cargo llvm-cov failed. See the cargo-llvm-cov output above for the root cause.
+If the error mentions llvm-tools-preview, install matching LLVM tools:
   rustup component add llvm-tools-preview
 
 If rustc comes from Homebrew or another distribution, set LLVM_COV and LLVM_PROFDATA

@@ -34,6 +34,7 @@ jobs:
           tools_dir="$(rustc --print sysroot)/lib/rustlib/${host}/bin"
           echo "LLVM_COV=${tools_dir}/llvm-cov" >> "$GITHUB_ENV"
           echo "LLVM_PROFDATA=${tools_dir}/llvm-profdata" >> "$GITHUB_ENV"
+          echo "${tools_dir}" >> "$GITHUB_PATH"
           "${tools_dir}/llvm-cov" --version
           "${tools_dir}/llvm-profdata" --version
 
