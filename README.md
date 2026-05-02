@@ -112,6 +112,10 @@ tengu review --base main
 
 # Focus the review on security risks
 tengu review --base main --preset security
+
+# Check local performance baselines
+tengu perf
+tengu perf --format json --strict
 ```
 
 In TUI, use `/review`, `/review --base main`, or `/review --preset security`.
@@ -188,7 +192,13 @@ default = "claude-sonnet-4-20250514"
 [permissions]
 approval_policy = "on-request"
 allowed_tools = ["Read", "Write", "Bash(git *)"]
+
+[security]
+audit_log = ".tengu/audit.jsonl"
+blocked_paths = ["secrets/**"]
 ```
+
+`.env` and `.env.*` are blocked by default for file-oriented tools. Set `allow_env_files = true` under `[security]` only when that project intentionally permits those files.
 
 ### TUI Theme (~/.tengu/theme.toml)
 

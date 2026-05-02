@@ -17,7 +17,9 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -130,6 +132,17 @@ pub enum Commands {
         /// Review preset (general/security/performance/correctness)
         #[arg(long)]
         preset: Option<String>,
+    },
+
+    /// ローカル性能基準を計測
+    Perf {
+        /// 出力形式 (text/json)
+        #[arg(long, default_value = "text")]
+        format: String,
+
+        /// 基準未達をエラーにする
+        #[arg(long)]
+        strict: bool,
     },
 
     /// 認証管理
@@ -303,6 +316,7 @@ impl Cli {
                 self.execute_review_command(base.clone(), preset.clone())
                     .await
             }
+            Commands::Perf { format, strict } => self.execute_perf_command(format, *strict),
             Commands::Resume { session_id, last } => {
                 self.execute_resume_command(session_id.as_deref(), *last)
                     .await
@@ -639,6 +653,19 @@ impl Cli {
 
         let output = runner.handle_prompt(&prompt).await?;
         self.print_output("review", &output.response.content, None);
+        Ok(())
+    }
+
+    fn execute_perf_command(&self, format: &str, strict: bool) -> Result<()> {
+        let report = run_performance_checks()?;
+        match format {
+            "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+            "text" => println!("{}", format_performance_report(&report)),
+            other => return Err(anyhow!("unsupported perf format: {}", other)),
+        }
+        if strict && !report.passed() {
+            return Err(anyhow!("performance baseline failed"));
+        }
         Ok(())
     }
 
@@ -1098,6 +1125,158 @@ fn format_session_entry(session: &Session) -> String {
         session.log_lines.len(),
         session.queue.len()
     )
+}
+
+#[derive(Debug, Serialize)]
+struct PerformanceReport {
+    metrics: Vec<PerformanceMetric>,
+}
+
+impl PerformanceReport {
+    fn passed(&self) -> bool {
+        self.metrics.iter().all(PerformanceMetric::passed)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct PerformanceMetric {
+    name: String,
+    value: f64,
+    unit: String,
+    threshold: f64,
+    available: bool,
+}
+
+impl PerformanceMetric {
+    fn passed(&self) -> bool {
+        if !self.available {
+            return true;
+        }
+        self.value <= self.threshold
+    }
+}
+
+fn run_performance_checks() -> Result<PerformanceReport> {
+    let mut metrics = Vec::new();
+    metrics.push(measure_ms("startup_path", 500.0, || {
+        let _ = load_config();
+        let _ = system_prompt_candidate_paths();
+        Ok(())
+    })?);
+    metrics.push(measure_ms("command_dispatch", 100.0, || {
+        let mut session = Session::with_id("perf-session".to_string());
+        session.updated_at = "2026-01-01T00:00:00Z".to_string();
+        let _ = format_session_list(vec![session]);
+        Ok(())
+    })?);
+    metrics.push(measure_file_read_1mb()?);
+    metrics.push(memory_metric());
+    Ok(PerformanceReport { metrics })
+}
+
+fn measure_ms<F>(name: &str, threshold: f64, mut op: F) -> Result<PerformanceMetric>
+where
+    F: FnMut() -> Result<()>,
+{
+    let started = Instant::now();
+    op()?;
+    Ok(PerformanceMetric {
+        name: name.to_string(),
+        value: started.elapsed().as_secs_f64() * 1000.0,
+        unit: "ms".to_string(),
+        threshold,
+        available: true,
+    })
+}
+
+fn measure_file_read_1mb() -> Result<PerformanceMetric> {
+    let dir = std::env::temp_dir().join(format!(
+        "tengu-perf-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("one-mib.txt");
+    let mut file = fs::File::create(&path)?;
+    let chunk = "0123456789abcdef\n".repeat(64);
+    while file.metadata()?.len() < 1024 * 1024 {
+        file.write_all(chunk.as_bytes())?;
+    }
+    drop(file);
+
+    let metric = measure_ms("file_read_1mb", 50.0, || {
+        let _ = fs::read_to_string(&path)?;
+        Ok(())
+    });
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir(&dir);
+    metric
+}
+
+fn memory_metric() -> PerformanceMetric {
+    match current_rss_mb() {
+        Some(value) => PerformanceMetric {
+            name: "rss_memory".to_string(),
+            value,
+            unit: "MB".to_string(),
+            threshold: 200.0,
+            available: true,
+        },
+        None => PerformanceMetric {
+            name: "rss_memory".to_string(),
+            value: 0.0,
+            unit: "MB".to_string(),
+            threshold: 200.0,
+            available: false,
+        },
+    }
+}
+
+fn current_rss_mb() -> Option<f64> {
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb = rest.split_whitespace().next()?.parse::<f64>().ok()?;
+                return Some(kb / 1024.0);
+            }
+        }
+    }
+
+    let pid = std::process::id().to_string();
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let rss_kb = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<f64>()
+        .ok()?;
+    Some(rss_kb / 1024.0)
+}
+
+fn format_performance_report(report: &PerformanceReport) -> String {
+    let mut lines = vec!["performance baseline:".to_string()];
+    for metric in &report.metrics {
+        if metric.available {
+            let status = if metric.passed() { "ok" } else { "fail" };
+            lines.push(format!(
+                "{} {}={:.2}{} threshold={:.2}{}",
+                status, metric.name, metric.value, metric.unit, metric.threshold, metric.unit
+            ));
+        } else {
+            lines.push(format!(
+                "skip {} unavailable threshold={:.2}{}",
+                metric.name, metric.threshold, metric.unit
+            ));
+        }
+    }
+    lines.push(format!(
+        "overall: {}",
+        if report.passed() { "ok" } else { "fail" }
+    ));
+    lines.join("\n")
 }
 
 fn load_config() -> Option<Config> {
@@ -1772,6 +1951,66 @@ mod tests {
         assert!(output.contains("session-a updated=2026-01-01T00:00:00Z"));
         assert!(output.contains("tengu resume <session-id>"));
         assert!(output.contains("tengu resume --last"));
+    }
+
+    #[test]
+    fn performance_report_tracks_pass_fail() {
+        let report = PerformanceReport {
+            metrics: vec![
+                PerformanceMetric {
+                    name: "fast".to_string(),
+                    value: 1.0,
+                    unit: "ms".to_string(),
+                    threshold: 2.0,
+                    available: true,
+                },
+                PerformanceMetric {
+                    name: "slow".to_string(),
+                    value: 3.0,
+                    unit: "ms".to_string(),
+                    threshold: 2.0,
+                    available: true,
+                },
+            ],
+        };
+
+        assert!(!report.passed());
+        let text = format_performance_report(&report);
+        assert!(text.contains("ok fast"));
+        assert!(text.contains("fail slow"));
+        assert!(text.contains("overall: fail"));
+    }
+
+    #[test]
+    fn performance_checks_include_required_local_metrics() {
+        let report = run_performance_checks().unwrap();
+        let names = report
+            .metrics
+            .iter()
+            .map(|metric| metric.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"startup_path"));
+        assert!(names.contains(&"command_dispatch"));
+        assert!(names.contains(&"file_read_1mb"));
+        assert!(names.contains(&"rss_memory"));
+    }
+
+    #[test]
+    fn performance_report_serializes_to_json() {
+        let report = PerformanceReport {
+            metrics: vec![PerformanceMetric {
+                name: "command_dispatch".to_string(),
+                value: 1.0,
+                unit: "ms".to_string(),
+                threshold: 100.0,
+                available: true,
+            }],
+        };
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["metrics"][0]["name"], "command_dispatch");
+        assert_eq!(json["metrics"][0]["threshold"], 100.0);
     }
 
     #[test]

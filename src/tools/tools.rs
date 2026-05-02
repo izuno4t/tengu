@@ -1,7 +1,9 @@
 // Tools module
 // ビルトインツール: Read, Edit, Write, Bash, Grep, Glob, WebFetch, WebSearch
 
-use crate::config::{Config, HookConfig, HooksConfig, PermissionsConfig, SandboxConfig};
+use crate::config::{
+    Config, HookConfig, HooksConfig, PermissionsConfig, SandboxConfig, SecurityConfig,
+};
 use crate::llm::ToolDefinition;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
@@ -46,6 +48,15 @@ const SENSITIVE_ENV_PREFIXES: &[&str] = &[
     "DATABASE_URL",
     "HF_TOKEN",
     "HUGGING_FACE_HUB_TOKEN",
+];
+
+const DEFAULT_BLOCKED_PATHS: &[&str] = &[
+    ".env",
+    ".env.*",
+    "./.env",
+    "./.env.*",
+    "**/.env",
+    "**/.env.*",
 ];
 
 /// Image file extensions.
@@ -222,6 +233,7 @@ pub struct ToolPolicy {
     permissions: Option<PermissionsConfig>,
     sandbox: Option<SandboxConfig>,
     hooks: Option<HooksConfig>,
+    security: Option<SecurityConfig>,
     workspace_root: PathBuf,
     approval_override: Arc<Mutex<ApprovalOverride>>,
 }
@@ -233,6 +245,7 @@ impl Default for ToolPolicy {
             permissions: None,
             sandbox: None,
             hooks: None,
+            security: None,
             workspace_root,
             approval_override: Arc::new(Mutex::new(ApprovalOverride::None)),
         }
@@ -246,6 +259,7 @@ impl ToolPolicy {
             permissions: config.permissions.clone(),
             sandbox: config.sandbox.clone(),
             hooks: config.hooks.clone(),
+            security: config.security.clone(),
             workspace_root,
             approval_override: Arc::new(Mutex::new(ApprovalOverride::None)),
         }
@@ -262,6 +276,7 @@ impl ToolPolicy {
             }),
             sandbox: None,
             hooks: None,
+            security: None,
             workspace_root,
             approval_override: Arc::new(Mutex::new(ApprovalOverride::None)),
         }
@@ -275,9 +290,74 @@ impl ToolPolicy {
     }
 
     fn check(&self, input: &ToolInput) -> Result<()> {
+        self.check_security_defaults(input)?;
         self.check_permissions(input)?;
         self.check_sandbox(input)?;
         Ok(())
+    }
+
+    fn check_security_defaults(&self, input: &ToolInput) -> Result<()> {
+        let allow_env_files = self
+            .security
+            .as_ref()
+            .and_then(|security| security.allow_env_files)
+            .unwrap_or(false);
+
+        let paths = tool_paths(input);
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        let mut blocked = if allow_env_files {
+            Vec::new()
+        } else {
+            DEFAULT_BLOCKED_PATHS
+                .iter()
+                .map(|pattern| (*pattern).to_string())
+                .collect::<Vec<_>>()
+        };
+        if let Some(extra) = self
+            .security
+            .as_ref()
+            .and_then(|security| security.blocked_paths.clone())
+        {
+            blocked.extend(extra);
+        }
+        if blocked.is_empty() {
+            return Ok(());
+        }
+
+        for path in paths {
+            let resolved = resolve_path(&self.workspace_root, &path);
+            let resolved_str = resolved.to_string_lossy();
+            let rel_str = resolved
+                .strip_prefix(&self.workspace_root)
+                .ok()
+                .map(|path| PathBuf::from(".").join(path).to_string_lossy().to_string());
+            if path_matches_any(&resolved_str, rel_str.as_deref(), &blocked)
+                || path_matches_any(&path.to_string_lossy(), rel_str.as_deref(), &blocked)
+            {
+                return Err(anyhow!(
+                    "security policy blocked sensitive path: {}",
+                    resolved_str
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn audit_log_path(&self) -> Option<PathBuf> {
+        let security = self.security.as_ref()?;
+        if security.audit_enabled == Some(false) {
+            return None;
+        }
+        let path = security.audit_log.as_deref()?.trim();
+        if path.is_empty() {
+            None
+        } else {
+            Some(resolve_path(&self.workspace_root, Path::new(path)))
+        }
     }
 
     fn check_permissions(&self, input: &ToolInput) -> Result<()> {
@@ -517,16 +597,21 @@ impl ToolExecutor {
     }
 
     pub fn preview_write(&self, path: PathBuf, content: String) -> Result<ToolResult> {
-        self.policy.check(&ToolInput::Write {
+        let input = ToolInput::Write {
             path: path.clone(),
             content: content.clone(),
-        })?;
+        };
+        if let Err(err) = self.policy.check(&input) {
+            self.write_audit_event(&input, "denied", Some(&err.to_string()));
+            return Err(err);
+        }
         let before = if path.exists() {
             fs::read_to_string(&path)?
         } else {
             String::new()
         };
         let diff = build_diff(&path, &before, &content);
+        self.write_audit_event(&input, "previewed", None);
         Ok(ToolResult::PreviewWrite {
             path,
             diff,
@@ -535,7 +620,10 @@ impl ToolExecutor {
     }
 
     pub fn execute(&self, input: ToolInput) -> Result<ToolResult> {
-        self.policy.check(&input)?;
+        if let Err(err) = self.policy.check(&input) {
+            self.write_audit_event(&input, "denied", Some(&err.to_string()));
+            return Err(err);
+        }
         self.run_hooks(&self.pre_tool_hooks(), &input, None)?;
         let result = self.execute_checked(input.clone());
         let output = match &result {
@@ -543,7 +631,35 @@ impl ToolExecutor {
             Err(err) => format!("Error: {}", err),
         };
         self.run_hooks(&self.post_tool_hooks(), &input, Some(&output))?;
+        match &result {
+            Ok(_) => self.write_audit_event(&input, "succeeded", None),
+            Err(err) => self.write_audit_event(&input, "failed", Some(&err.to_string())),
+        }
         result
+    }
+
+    fn write_audit_event(&self, input: &ToolInput, status: &str, error: Option<&str>) {
+        let Some(path) = self.policy.audit_log_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            if fs::create_dir_all(parent).is_err() {
+                return;
+            }
+        }
+        let event = serde_json::json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "tool": tool_name(input),
+            "status": status,
+            "paths": audit_paths(input, &self.policy.workspace_root),
+            "summary": audit_summary(input),
+            "error": error.map(redact_sensitive_text),
+        });
+        if let Ok(line) = serde_json::to_string(&event) {
+            if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(file, "{line}");
+            }
+        }
     }
 
     fn execute_checked(&self, input: ToolInput) -> Result<ToolResult> {
@@ -1435,6 +1551,86 @@ fn tool_paths(input: &ToolInput) -> Vec<PathBuf> {
         ToolInput::WebFetch { .. } | ToolInput::WebSearch { .. } => Vec::new(),
         ToolInput::SubAgent { .. } | ToolInput::ParallelAgents { .. } => Vec::new(),
     }
+}
+
+fn audit_paths(input: &ToolInput, root: &Path) -> Vec<String> {
+    tool_paths(input)
+        .iter()
+        .map(|path| resolve_path(root, path).display().to_string())
+        .collect()
+}
+
+fn audit_summary(input: &ToolInput) -> Value {
+    match input {
+        ToolInput::Read { offset, limit, .. } => serde_json::json!({
+            "offset": offset,
+            "limit": limit,
+        }),
+        ToolInput::Edit { .. } => serde_json::json!({
+            "old_string": "[redacted]",
+            "new_string": "[redacted]",
+        }),
+        ToolInput::Write { content, .. } => serde_json::json!({
+            "content": "[redacted]",
+            "bytes": content.len(),
+        }),
+        ToolInput::Shell { args, .. } => serde_json::json!({
+            "command": "[redacted]",
+            "arg_count": args.len(),
+        }),
+        ToolInput::Bash { timeout, .. } => serde_json::json!({
+            "command": "[redacted]",
+            "timeout": timeout,
+        }),
+        ToolInput::Grep { pattern, paths } => serde_json::json!({
+            "pattern": redact_sensitive_text(pattern),
+            "path_count": paths.len(),
+        }),
+        ToolInput::Glob { pattern, .. } => serde_json::json!({
+            "pattern": redact_sensitive_text(pattern),
+        }),
+        ToolInput::ListFiles { .. } => serde_json::json!({}),
+        ToolInput::WebFetch {
+            url,
+            method,
+            headers,
+            body,
+        } => serde_json::json!({
+            "url": redact_sensitive_text(url),
+            "method": method,
+            "header_count": headers.len(),
+            "body": body.as_ref().map(|_| "[redacted]"),
+        }),
+        ToolInput::WebSearch { query } => serde_json::json!({
+            "query": redact_sensitive_text(query),
+        }),
+        ToolInput::SubAgent { prompt, max_turns } => serde_json::json!({
+            "prompt": redact_sensitive_text(prompt),
+            "max_turns": max_turns,
+        }),
+        ToolInput::ParallelAgents { tasks } => serde_json::json!({
+            "task_count": tasks.len(),
+        }),
+    }
+}
+
+fn redact_sensitive_text(input: &str) -> String {
+    let mut redacted = input.to_string();
+    for key in SENSITIVE_ENV_PREFIXES {
+        if redacted.contains(key) {
+            redacted = redacted.replace(key, "[redacted-env]");
+        }
+    }
+    for marker in ["sk-", "ghp_", "github_pat_", "xoxb-"] {
+        if let Some(start) = redacted.find(marker) {
+            let end = redacted[start..]
+                .find(char::is_whitespace)
+                .map(|idx| start + idx)
+                .unwrap_or(redacted.len());
+            redacted.replace_range(start..end, "[redacted-secret]");
+        }
+    }
+    redacted
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2873,6 +3069,114 @@ mod tests {
             limit: None,
         });
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn policy_default_blocks_env_files() {
+        let policy = ToolPolicy::default();
+        let result = policy.check(&ToolInput::Read {
+            path: PathBuf::from(".env"),
+            offset: None,
+            limit: None,
+        });
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("sensitive path"));
+    }
+
+    #[test]
+    fn policy_security_can_allow_env_files() {
+        let policy = ToolPolicy {
+            security: Some(SecurityConfig {
+                allow_env_files: Some(true),
+                ..SecurityConfig::default()
+            }),
+            ..ToolPolicy::default()
+        };
+        let result = policy.check(&ToolInput::Read {
+            path: PathBuf::from(".env.local"),
+            offset: None,
+            limit: None,
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn policy_security_blocks_custom_sensitive_paths() {
+        let policy = ToolPolicy {
+            security: Some(SecurityConfig {
+                blocked_paths: Some(vec!["secrets/**".to_string()]),
+                ..SecurityConfig::default()
+            }),
+            ..ToolPolicy::default()
+        };
+        let result = policy.check(&ToolInput::Read {
+            path: PathBuf::from("secrets/token.txt"),
+            offset: None,
+            limit: None,
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn audit_log_records_success_and_redacts_content() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("notes.txt");
+        let audit_path = dir.path().join("audit.jsonl");
+        fs::write(&path, "hello\n").unwrap();
+        let exec = ToolExecutor::with_policy(ToolPolicy {
+            workspace_root: dir.path().to_path_buf(),
+            security: Some(SecurityConfig {
+                audit_log: Some(audit_path.to_string_lossy().to_string()),
+                audit_enabled: Some(true),
+                ..SecurityConfig::default()
+            }),
+            ..ToolPolicy::default()
+        });
+
+        exec.execute(ToolInput::Read {
+            path: path.clone(),
+            offset: None,
+            limit: None,
+        })
+        .unwrap();
+        exec.execute(ToolInput::Write {
+            path: dir.path().join("new.txt"),
+            content: "secret content".to_string(),
+        })
+        .unwrap();
+
+        let audit = fs::read_to_string(&audit_path).unwrap();
+        assert!(audit.contains("\"tool\":\"Read\""));
+        assert!(audit.contains("\"status\":\"succeeded\""));
+        assert!(audit.contains("\"tool\":\"Write\""));
+        assert!(audit.contains("\"content\":\"[redacted]\""));
+        assert!(!audit.contains("secret content"));
+    }
+
+    #[test]
+    fn audit_log_records_denied_sensitive_path() {
+        let dir = TempDir::new().unwrap();
+        let audit_path = dir.path().join("audit.jsonl");
+        let exec = ToolExecutor::with_policy(ToolPolicy {
+            workspace_root: dir.path().to_path_buf(),
+            security: Some(SecurityConfig {
+                audit_log: Some(audit_path.to_string_lossy().to_string()),
+                audit_enabled: Some(true),
+                ..SecurityConfig::default()
+            }),
+            ..ToolPolicy::default()
+        });
+
+        let result = exec.execute(ToolInput::Read {
+            path: PathBuf::from(".env"),
+            offset: None,
+            limit: None,
+        });
+
+        assert!(result.is_err());
+        let audit = fs::read_to_string(&audit_path).unwrap();
+        assert!(audit.contains("\"status\":\"denied\""));
+        assert!(audit.contains("sensitive path"));
     }
 
     #[test]

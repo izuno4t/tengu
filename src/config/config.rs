@@ -17,6 +17,8 @@ pub struct Config {
     pub hooks: Option<HooksConfig>,
     #[serde(default)]
     pub auth: Option<AuthConfig>,
+    #[serde(default)]
+    pub security: Option<SecurityConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -70,6 +72,14 @@ pub struct PermissionsConfig {
 pub struct SandboxConfig {
     pub mode: Option<String>,
     pub allowed_paths: Option<Vec<String>>,
+    pub blocked_paths: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct SecurityConfig {
+    pub audit_log: Option<String>,
+    pub audit_enabled: Option<bool>,
+    pub allow_env_files: Option<bool>,
     pub blocked_paths: Option<Vec<String>>,
 }
 
@@ -184,6 +194,9 @@ impl Config {
         if let Some(auth) = &mut self.auth {
             auth.expand_env_vars();
         }
+        if let Some(security) = &mut self.security {
+            security.expand_env_vars();
+        }
     }
 }
 
@@ -284,6 +297,19 @@ impl AuthConfig {
         }
         if let Some(value) = &self.session_path {
             self.session_path = Some(expand_env_vars_in_string(value));
+        }
+    }
+}
+
+impl SecurityConfig {
+    fn expand_env_vars(&mut self) {
+        if let Some(value) = &self.audit_log {
+            self.audit_log = Some(expand_env_vars_in_string(value));
+        }
+        if let Some(blocked_paths) = &mut self.blocked_paths {
+            for item in blocked_paths.iter_mut() {
+                *item = expand_env_vars_in_string(item);
+            }
         }
     }
 }
@@ -568,6 +594,34 @@ blocked_paths = ["/etc"]
         assert_eq!(sb.mode.unwrap(), "strict");
         assert_eq!(sb.allowed_paths.unwrap(), vec!["/tmp", "/home"]);
         assert_eq!(sb.blocked_paths.unwrap(), vec!["/etc"]);
+    }
+
+    #[test]
+    fn loads_config_with_security() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tengu.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"
+[security]
+audit_log = "$TENGU_TEST_AUDIT_LOG"
+audit_enabled = true
+allow_env_files = false
+blocked_paths = ["secrets/**"]
+"#
+        )
+        .unwrap();
+
+        std::env::set_var("TENGU_TEST_AUDIT_LOG", "./audit.log");
+        let cfg = Config::load(&path).unwrap();
+        std::env::remove_var("TENGU_TEST_AUDIT_LOG");
+
+        let security = cfg.security.unwrap();
+        assert_eq!(security.audit_log.as_deref(), Some("./audit.log"));
+        assert_eq!(security.audit_enabled, Some(true));
+        assert_eq!(security.allow_env_files, Some(false));
+        assert_eq!(security.blocked_paths.unwrap(), vec!["secrets/**"]);
     }
 
     #[test]
