@@ -12,7 +12,7 @@ Tengu is a flexible, multi-LLM coding agent that integrates with MCP servers, su
 - **MCP Integration**: STDIO/HTTP トランスポートで外部ツールサーバーと連携
 - **Permission Control**: ツール別権限制御、サンドボックス、glob パターンマッチング
 - **Interactive TUI**: ストリーミング表示、Markdownレンダリング、ツール実行ログ表示
-- **Project Configuration**: 階層的 `.tengu/TENGU.md` でプロジェクトコンテキストを管理
+- **Project Configuration**: 階層的 `.tengu/AGENT.md`（旧 `.tengu/TENGU.md` 互換）でプロジェクトコンテキストを管理
 
 ## 🚀 Quick Start
 
@@ -200,7 +200,9 @@ divider = "grey"
 footer = "grey"
 ```
 
-### Project Context (./.tengu/TENGU.md)
+### Project Context (./.tengu/AGENT.md)
+
+Tengu reads `.tengu/AGENT.md` and legacy `.tengu/TENGU.md` files from global, project, and workspace scopes.
 
 ```markdown
 # Project Context

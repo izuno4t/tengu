@@ -2623,7 +2623,16 @@ fn percent_decode_basic(input: &str) -> String {
 }
 
 fn project_memory_path() -> PathBuf {
-    PathBuf::from(".").join(".tengu").join("TENGU.md")
+    let root = PathBuf::from(".").join(".tengu");
+    let agent_path = root.join("AGENT.md");
+    if agent_path.exists() {
+        return agent_path;
+    }
+    let tengu_path = root.join("TENGU.md");
+    if tengu_path.exists() {
+        return tengu_path;
+    }
+    agent_path
 }
 
 fn global_config_path() -> PathBuf {

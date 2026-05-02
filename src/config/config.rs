@@ -2,6 +2,7 @@
 // 設定ファイル管理
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -14,18 +15,48 @@ pub struct Config {
     pub sandbox: Option<SandboxConfig>,
     #[serde(default)]
     pub hooks: Option<HooksConfig>,
+    #[serde(default)]
+    pub auth: Option<AuthConfig>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ModelConfig {
     #[serde(default)]
     pub provider: String,
     #[serde(default)]
     pub default: String,
     pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub reasoning_effort: Option<String>,
+    pub cache_prompts: Option<bool>,
     pub backend: Option<String>,
     pub name: Option<String>,
     pub backend_url: Option<String>,
+    pub parameters: Option<ModelParametersConfig>,
+    pub anthropic: Option<ModelProviderConfig>,
+    pub openai: Option<ModelProviderConfig>,
+    pub google: Option<ModelProviderConfig>,
+    pub local: Option<ModelProviderConfig>,
+    #[serde(default)]
+    pub providers: HashMap<String, ModelProviderConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct ModelParametersConfig {
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub reasoning_effort: Option<String>,
+    pub cache_prompts: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct ModelProviderConfig {
+    pub api_key_env: Option<String>,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+    pub max_tokens: Option<u32>,
+    pub organization: Option<String>,
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -64,15 +95,34 @@ pub struct HookConfig {
     pub on_error: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct AuthConfig {
+    pub anthropic_api_key_env: Option<String>,
+    pub openai_api_key_env: Option<String>,
+    pub google_api_key_env: Option<String>,
+    pub token_store: Option<String>,
+    pub session_path: Option<String>,
+    pub oauth_enabled: Option<bool>,
+}
+
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             provider: "anthropic".to_string(),
             default: "claude-sonnet-4-20250514".to_string(),
             max_tokens: Some(8192),
+            temperature: None,
+            reasoning_effort: None,
+            cache_prompts: None,
             backend: None,
             name: None,
             backend_url: None,
+            parameters: None,
+            anthropic: None,
+            openai: None,
+            google: None,
+            local: None,
+            providers: HashMap::new(),
         }
     }
 }
@@ -97,6 +147,7 @@ impl Config {
         if let Some(backend_url) = &self.model.backend_url {
             self.model.backend_url = Some(expand_env_vars_in_string(backend_url));
         }
+        self.model.expand_env_vars();
         if let Some(permissions) = &mut self.permissions {
             if let Some(approval_policy) = &permissions.approval_policy {
                 permissions.approval_policy = Some(expand_env_vars_in_string(approval_policy));
@@ -130,6 +181,70 @@ impl Config {
         if let Some(hooks) = &mut self.hooks {
             hooks.expand_env_vars();
         }
+        if let Some(auth) = &mut self.auth {
+            auth.expand_env_vars();
+        }
+    }
+}
+
+impl ModelConfig {
+    pub fn effective_max_tokens(&self) -> Option<u32> {
+        self.max_tokens.or_else(|| {
+            self.parameters
+                .as_ref()
+                .and_then(|params| params.max_tokens)
+        })
+    }
+
+    fn expand_env_vars(&mut self) {
+        if let Some(reasoning_effort) = &self.reasoning_effort {
+            self.reasoning_effort = Some(expand_env_vars_in_string(reasoning_effort));
+        }
+        if let Some(parameters) = &mut self.parameters {
+            parameters.expand_env_vars();
+        }
+        for provider in [
+            &mut self.anthropic,
+            &mut self.openai,
+            &mut self.google,
+            &mut self.local,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            provider.expand_env_vars();
+        }
+        for provider in self.providers.values_mut() {
+            provider.expand_env_vars();
+        }
+    }
+}
+
+impl ModelParametersConfig {
+    fn expand_env_vars(&mut self) {
+        if let Some(reasoning_effort) = &self.reasoning_effort {
+            self.reasoning_effort = Some(expand_env_vars_in_string(reasoning_effort));
+        }
+    }
+}
+
+impl ModelProviderConfig {
+    fn expand_env_vars(&mut self) {
+        if let Some(api_key_env) = &self.api_key_env {
+            self.api_key_env = Some(expand_env_vars_in_string(api_key_env));
+        }
+        if let Some(api_key) = &self.api_key {
+            self.api_key = Some(expand_env_vars_in_string(api_key));
+        }
+        if let Some(base_url) = &self.base_url {
+            self.base_url = Some(expand_env_vars_in_string(base_url));
+        }
+        if let Some(organization) = &self.organization {
+            self.organization = Some(expand_env_vars_in_string(organization));
+        }
+        if let Some(project) = &self.project {
+            self.project = Some(expand_env_vars_in_string(project));
+        }
     }
 }
 
@@ -149,6 +264,26 @@ impl HooksConfig {
             if let Some(on_error) = &hook.on_error {
                 hook.on_error = Some(expand_env_vars_in_string(on_error));
             }
+        }
+    }
+}
+
+impl AuthConfig {
+    fn expand_env_vars(&mut self) {
+        if let Some(value) = &self.anthropic_api_key_env {
+            self.anthropic_api_key_env = Some(expand_env_vars_in_string(value));
+        }
+        if let Some(value) = &self.openai_api_key_env {
+            self.openai_api_key_env = Some(expand_env_vars_in_string(value));
+        }
+        if let Some(value) = &self.google_api_key_env {
+            self.google_api_key_env = Some(expand_env_vars_in_string(value));
+        }
+        if let Some(value) = &self.token_store {
+            self.token_store = Some(expand_env_vars_in_string(value));
+        }
+        if let Some(value) = &self.session_path {
+            self.session_path = Some(expand_env_vars_in_string(value));
         }
     }
 }
@@ -227,9 +362,19 @@ mod tests {
         assert_eq!(mc.provider, "anthropic");
         assert_eq!(mc.default, "claude-sonnet-4-20250514");
         assert_eq!(mc.max_tokens, Some(8192));
+        assert_eq!(mc.effective_max_tokens(), Some(8192));
+        assert!(mc.temperature.is_none());
+        assert!(mc.reasoning_effort.is_none());
+        assert!(mc.cache_prompts.is_none());
         assert!(mc.backend.is_none());
         assert!(mc.name.is_none());
         assert!(mc.backend_url.is_none());
+        assert!(mc.parameters.is_none());
+        assert!(mc.anthropic.is_none());
+        assert!(mc.openai.is_none());
+        assert!(mc.google.is_none());
+        assert!(mc.local.is_none());
+        assert!(mc.providers.is_empty());
     }
 
     #[test]
@@ -239,6 +384,7 @@ mod tests {
         assert!(cfg.permissions.is_none());
         assert!(cfg.sandbox.is_none());
         assert!(cfg.hooks.is_none());
+        assert!(cfg.auth.is_none());
     }
 
     #[test]
@@ -261,6 +407,113 @@ max_tokens = 4096
         assert_eq!(cfg.model.provider, "openai");
         assert_eq!(cfg.model.default, "gpt-4o");
         assert_eq!(cfg.model.max_tokens, Some(4096));
+    }
+
+    #[test]
+    fn loads_config_with_model_parameters_and_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tengu.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"
+[model]
+provider = "anthropic"
+default = "claude-sonnet-4-20250514"
+temperature = 0.2
+
+[model.parameters]
+max_tokens = 16384
+temperature = 0.7
+reasoning_effort = "high"
+cache_prompts = true
+
+[model.anthropic]
+api_key_env = "ANTHROPIC_API_KEY"
+base_url = "https://api.anthropic.com"
+max_tokens = 8192
+
+[model.openai]
+api_key_env = "OPENAI_API_KEY"
+base_url = "https://api.openai.com/v1"
+organization = "org_123"
+
+[model.local]
+base_url = "http://localhost:1234/v1"
+api_key = "not-needed"
+
+[model.providers.groq]
+api_key_env = "GROQ_API_KEY"
+base_url = "https://api.groq.com/openai/v1"
+"#
+        )
+        .unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.model.temperature, Some(0.2));
+        assert_eq!(cfg.model.effective_max_tokens(), Some(16384));
+        let params = cfg.model.parameters.unwrap();
+        assert_eq!(params.temperature, Some(0.7));
+        assert_eq!(params.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(params.cache_prompts, Some(true));
+        let anthropic = cfg.model.anthropic.unwrap();
+        assert_eq!(anthropic.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(
+            anthropic.base_url.as_deref(),
+            Some("https://api.anthropic.com")
+        );
+        assert_eq!(anthropic.max_tokens, Some(8192));
+        let openai = cfg.model.openai.unwrap();
+        assert_eq!(openai.organization.as_deref(), Some("org_123"));
+        let local = cfg.model.local.unwrap();
+        assert_eq!(local.api_key.as_deref(), Some("not-needed"));
+        assert_eq!(
+            cfg.model
+                .providers
+                .get("groq")
+                .and_then(|provider| provider.base_url.as_deref()),
+            Some("https://api.groq.com/openai/v1")
+        );
+    }
+
+    #[test]
+    fn loads_config_with_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tengu.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"
+[auth]
+anthropic_api_key_env = "ANTHROPIC_API_KEY"
+openai_api_key_env = "OPENAI_API_KEY"
+google_api_key_env = "GOOGLE_API_KEY"
+token_store = "$HOME/.tengu/auth/tokens.json"
+session_path = "$HOME/.tengu/auth/session.json"
+oauth_enabled = false
+"#
+        )
+        .unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        let auth = cfg.auth.unwrap();
+        assert_eq!(
+            auth.anthropic_api_key_env.as_deref(),
+            Some("ANTHROPIC_API_KEY")
+        );
+        assert_eq!(auth.openai_api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(auth.google_api_key_env.as_deref(), Some("GOOGLE_API_KEY"));
+        assert_eq!(auth.oauth_enabled, Some(false));
+        assert!(auth
+            .token_store
+            .as_deref()
+            .unwrap()
+            .contains(".tengu/auth/tokens.json"));
+        assert!(auth
+            .session_path
+            .as_deref()
+            .unwrap()
+            .contains(".tengu/auth/session.json"));
     }
 
     #[test]

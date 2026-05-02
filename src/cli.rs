@@ -947,28 +947,7 @@ impl Cli {
             sources.push("system_prompt_arg".to_string());
             parts.push(prompt.clone());
         } else {
-            if let Some(home) = std::env::var_os("HOME") {
-                let global_path = PathBuf::from(home).join(".tengu").join("TENGU.md");
-                if let Some(content) = read_optional_file(&global_path)? {
-                    sources.push(format!("global:{}", global_path.display()));
-                    parts.push(content);
-                }
-            }
-
-            let project_path = PathBuf::from(".").join(".tengu").join("TENGU.md");
-            if let Some(content) = read_optional_file(&project_path)? {
-                sources.push(format!("project:{}", project_path.display()));
-                parts.push(content);
-            }
-
-            let workspace_path = PathBuf::from(".")
-                .join("workspace")
-                .join(".tengu")
-                .join("TENGU.md");
-            if let Some(content) = read_optional_file(&workspace_path)? {
-                sources.push(format!("workspace:{}", workspace_path.display()));
-                parts.push(content);
-            }
+            read_system_prompt_candidates(&mut sources, &mut parts)?;
         }
 
         if let Some(path) = &self.append_system_prompt_file {
@@ -1048,6 +1027,41 @@ impl Cli {
     }
 }
 
+fn read_system_prompt_candidates(sources: &mut Vec<String>, parts: &mut Vec<String>) -> Result<()> {
+    for (scope, path) in system_prompt_candidate_paths() {
+        if let Some(content) = read_optional_file(&path)? {
+            sources.push(format!("{}:{}", scope, path.display()));
+            parts.push(content);
+        }
+    }
+    Ok(())
+}
+
+fn system_prompt_candidate_paths() -> Vec<(&'static str, PathBuf)> {
+    let mut candidates = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let root = PathBuf::from(home).join(".tengu");
+        candidates.extend(memory_file_candidates("global", &root));
+    }
+
+    candidates.extend(memory_file_candidates(
+        "project",
+        &PathBuf::from(".").join(".tengu"),
+    ));
+    candidates.extend(memory_file_candidates(
+        "workspace",
+        &PathBuf::from(".").join("workspace").join(".tengu"),
+    ));
+    candidates
+}
+
+fn memory_file_candidates(scope: &'static str, root: &Path) -> Vec<(&'static str, PathBuf)> {
+    vec![root.join("AGENT.md"), root.join("TENGU.md")]
+        .into_iter()
+        .map(|path| (scope, path))
+        .collect()
+}
+
 fn load_config() -> Option<Config> {
     let mut candidates = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
@@ -1075,19 +1089,37 @@ fn build_backend(
         LlmProvider::Local => {
             let base_url = cli_base_url
                 .or_else(|| std::env::var("OLLAMA_BASE_URL").ok())
+                .or_else(|| config.model.local.as_ref().and_then(|p| p.base_url.clone()))
                 .or_else(|| config.model.backend_url.clone())
                 .unwrap_or_else(|| "http://localhost:11434".to_string());
             Box::new(OllamaBackend::new(base_url))
         }
         LlmProvider::Anthropic => Box::new(AnthropicBackend::new(
-            config.model.backend_url.clone(),
-            config.model.max_tokens,
+            config
+                .model
+                .anthropic
+                .as_ref()
+                .and_then(|p| p.base_url.clone())
+                .or_else(|| config.model.backend_url.clone()),
+            config.model.effective_max_tokens(),
         )),
         LlmProvider::OpenAI => Box::new(OpenAiBackend::new(
-            config.model.backend_url.clone(),
-            config.model.max_tokens,
+            config
+                .model
+                .openai
+                .as_ref()
+                .and_then(|p| p.base_url.clone())
+                .or_else(|| config.model.backend_url.clone()),
+            config.model.effective_max_tokens(),
         )),
-        LlmProvider::Google => Box::new(GoogleBackend::new(config.model.backend_url.clone())),
+        LlmProvider::Google => Box::new(GoogleBackend::new(
+            config
+                .model
+                .google
+                .as_ref()
+                .and_then(|p| p.base_url.clone())
+                .or_else(|| config.model.backend_url.clone()),
+        )),
     }
 }
 
@@ -1483,6 +1515,65 @@ mod tests {
         assert!(request.prompt.contains("System instructions:"));
         assert!(request.prompt.contains("User request:"));
         assert!(request.images.is_empty());
+    }
+
+    #[test]
+    fn resolves_agent_and_tengu_memory_files_in_hierarchy() {
+        let home = unique_temp_dir("prompt-home");
+        let project = unique_temp_dir("prompt-project");
+        let original_home = std::env::var_os("HOME");
+        let original_dir = std::env::current_dir().unwrap();
+
+        fs::create_dir_all(home.join(".tengu")).unwrap();
+        fs::write(home.join(".tengu").join("AGENT.md"), "GLOBAL AGENT").unwrap();
+        fs::write(home.join(".tengu").join("TENGU.md"), "GLOBAL TENGU").unwrap();
+
+        fs::create_dir_all(project.join(".tengu")).unwrap();
+        fs::write(project.join(".tengu").join("AGENT.md"), "PROJECT AGENT").unwrap();
+        fs::write(project.join(".tengu").join("TENGU.md"), "PROJECT TENGU").unwrap();
+
+        fs::create_dir_all(project.join("workspace").join(".tengu")).unwrap();
+        fs::write(
+            project.join("workspace").join(".tengu").join("AGENT.md"),
+            "WORKSPACE AGENT",
+        )
+        .unwrap();
+        fs::write(
+            project.join("workspace").join(".tengu").join("TENGU.md"),
+            "WORKSPACE TENGU",
+        )
+        .unwrap();
+
+        std::env::set_var("HOME", &home);
+        std::env::set_current_dir(&project).unwrap();
+
+        let cli = test_cli_with_allowed_tools("");
+        let (prompt, sources) = cli.resolve_system_prompt().unwrap();
+
+        std::env::set_current_dir(original_dir).unwrap();
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        assert_eq!(
+            prompt.unwrap(),
+            [
+                "GLOBAL AGENT",
+                "GLOBAL TENGU",
+                "PROJECT AGENT",
+                "PROJECT TENGU",
+                "WORKSPACE AGENT",
+                "WORKSPACE TENGU"
+            ]
+            .join("\n\n")
+        );
+        assert_eq!(sources.len(), 6);
+        assert!(sources[0].contains("global:"));
+        assert!(sources[0].contains("AGENT.md"));
+        assert!(sources[5].contains("workspace:"));
+        assert!(sources[5].contains("TENGU.md"));
     }
 
     #[test]

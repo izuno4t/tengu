@@ -71,21 +71,21 @@
 
 ### 設定スキーマ
 
-現行 `Config` は `model`, `permissions`, `sandbox`, `hooks` が中心で、要求にある `temperature`, `reasoning_effort`, `cache_prompts`, provider別設定、auth詳細などを網羅していない。
+現行 `Config` は `model`, `permissions`, `sandbox`, `hooks`, `auth` を扱える。`model.parameters`、provider別設定、auth詳細はスキーマに追加済みである。
 
 影響:
 
-- 要求定義の設定例をそのまま表現できない。
-- 今後のドキュメント整備時に、仕様と実装の乖離が残る。
+- 要求定義の主要なTOML設定例を読み込める。
+- `model.parameters.max_tokens` と provider別 base URL は既存の実行経路へ反映できる。
 
 ### システムプロンプトファイル名
 
-要求定義は `AGENT.md` を前提にしているが、現行実装は `.tengu/TENGU.md` を読み込む。
+要求定義が前提にしている `AGENT.md` と、既存実装で使われてきた `.tengu/TENGU.md` の両方を階層的に読み込める。新規 `/init` は `.tengu/AGENT.md` を作成し、既存の `.tengu/TENGU.md` がある場合は互換ファイルとして扱う。
 
 影響:
 
-- Claude Code基準として読む利用者にとって設定場所が直感とずれる。
-- 互換方針を明示しないと、READMEとREQUIREMENTSの整合が崩れる。
+- Claude Code基準の `AGENT.md` と既存利用者向けの `TENGU.md` を併用できる。
+- 明示CLI指定の `--system-prompt` / `--system-prompt-file` は引き続き最優先である。
 
 ### セッション操作
 
