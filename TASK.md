@@ -102,8 +102,8 @@ Claude Code / Codex と同等の実用感・信頼性に近づけるため、Pha
 | ALT-029 | ✅ | 80%カバレッジ実測をCIまたは固定toolchainで取得する | ALT-026,ALT-028 |
 | ALT-030 | ✅ | ファイル参照のTAB補完・fuzzy検索・最近使用履歴を実装する | ALT-021 |
 | ALT-031 | ✅ | GitHub/GitLabのPRコメント・Issue・Label操作を実装する | ALT-022 |
-| ALT-032 | ⏳ | OAuthまたは暗号化トークン保存を含む認証保護を追加する | ALT-023 |
-| ALT-033 | ⏳ | チェックポイント・rollback・作業差分復元を実装する | ALT-021,ALT-022 |
+| ALT-032 | ✅ | OAuthまたは暗号化トークン保存を含む認証保護を追加する | ALT-023 |
+| ALT-033 | ✅ | チェックポイント・rollback・作業差分復元を実装する | ALT-021,ALT-022 |
 | ALT-034 | ⏳ | プロジェクトknowledge baseと永続メモリー検索を実装する | ALT-019 |
 | ALT-035 | ⏳ | 長時間セッション・大規模リポジトリの回帰テストを追加する | ALT-028,ALT-029 |
 | ALT-036 | ⏳ | Claude Code / Codex parityの最終判定レポートを更新する | ALT-030,ALT-031,ALT-032,ALT-033,ALT-034,ALT-035 |

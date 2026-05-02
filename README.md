@@ -25,10 +25,11 @@ Tengu is a flexible, multi-LLM coding agent that integrates with MCP servers, su
 ## Project Status
 
 Core CLI/TUI, multi-provider LLM routing, built-in tools, MCP, permissions,
-hooks, session resume, Git/review workflows, security defaults, performance
-checks, and required user documentation are implemented. Remaining tracked gaps
-are broader E2E evidence, 80% coverage proof in a matching LLVM environment,
-OAuth/encrypted token storage, and advanced optional features.
+hooks, session resume, Git/review workflows, checkpoints, security defaults,
+performance checks, encrypted token storage, and required user documentation are
+implemented.
+Remaining tracked gaps are broader E2E evidence, 80% coverage proof in a matching
+LLVM environment, and advanced optional features.
 
 ## 🚀 Quick Start
 
@@ -98,6 +99,20 @@ For `--output-format json`, Tengu prints a `{"type":"usage", ...}` object before
 
 You can also inspect provider auth readiness with `tengu auth status`.
 
+For encrypted local token storage, set a passphrase and run login while the
+provider API key environment variable is present:
+
+```bash
+export TENGU_AUTH_PASSPHRASE="use-a-long-local-passphrase"
+export ANTHROPIC_API_KEY="sk-ant-..."
+tengu auth login
+tengu auth status
+```
+
+`auth login` writes encrypted tokens to `~/.tengu/auth/tokens.json` and session
+metadata to `~/.tengu/auth/session.json`. `auth logout` removes both files.
+Tengu does not print stored token values.
+
 ## 📖 Examples
 
 For the full command guide, see [USAGE.md](USAGE.md). For configuration details,
@@ -159,6 +174,19 @@ tengu label create bug --color ff0000 --description "Broken behavior"
 tengu label --provider gitlab list
 ```
 
+### Checkpoints
+
+Tengu stores file snapshots under `.tengu/checkpoints` so edits can be inspected
+or restored without creating Git commits or stashes. `Write` and `Edit` tool
+operations create automatic checkpoints before changing files.
+
+```bash
+tengu checkpoint create src/main.rs --reason "before refactor"
+tengu checkpoint list
+tengu checkpoint diff
+tengu checkpoint restore
+```
+
 ### Coverage
 
 ```bash
@@ -181,7 +209,8 @@ Use `/image <path> [more_paths...]` to attach images to the next TUI prompt.
 Dragging image file paths into the TUI input also auto-attaches them for the next prompt.
 For local git and hosting actions, `/commit <message>`, `/pr [args]`, `/mr [args]`, `/issue ...`, `/label ...`, `/pr_comment ...`, and `/pr_review ...` ask for `y/n` confirmation before running `git`, `gh`, or `glab`; `/editor [path]` opens your `$VISUAL` or `$EDITOR`.
 Saved sessions now restore conversation history, visible logs, queued prompts, pending image attachments, and approval prompts that can be acknowledged again after restore.
-Additional TUI workflow commands now include `/plan`, `/taskwriter`, `/apply-plan`, `/compact`, `/memory`, `/init`, `/config`, `/doctor`, `/add-dir`, `/agents`, `/login`, `/logout`, `/pr_comments`, `/terminal-setup`, `/strategy`, `/bg`, `/usage`, `/model`, and `/vim`.
+Additional TUI workflow commands now include `/plan`, `/taskwriter`, `/apply-plan`, `/compact`, `/memory`, `/init`, `/config`, `/doctor`, `/add-dir`, `/agents`, `/login`, `/logout`, `/pr_comments`, `/terminal-setup`, `/strategy`, `/bg`, `/usage`, `/model`, `/vim`, `/checkpoint`, and `/rollback`.
+Use `/checkpoint list`, `/checkpoint create <path> [more_paths...]`, `/checkpoint diff [id]`, and `/rollback [id]` to inspect or restore saved snapshots.
 `/config` supports `list`, `get <key>`, and `set <key> <value>` for common local settings such as `model.default`, `model.provider`, and `plan_mode`.
 `/usage` shows provider-reported usage metadata when the selected provider returns it, aggregates it per provider, and preserves it in saved TUI sessions. `/usage export <path>` writes the current aggregated usage snapshot as JSON. Exact billing still depends on each provider pricing model and billing surfaces.
 

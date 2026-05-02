@@ -2,6 +2,8 @@ use anyhow::Result;
 use clap::Parser;
 
 mod agent;
+mod auth_store;
+mod checkpoint;
 mod cli;
 mod config;
 mod forge;

@@ -1,4 +1,6 @@
 use crate::agent::{AgentOutput, AgentRunner, AgentStore, StoredAgent};
+use crate::auth_store;
+use crate::checkpoint::{format_checkpoint_diff, format_checkpoint_list, CheckpointStore};
 use crate::config::{Config, PermissionsConfig};
 use crate::forge::{self, ForgeProvider, ReviewAction};
 use crate::llm::{
@@ -15,7 +17,7 @@ use base64::Engine;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::json;
 use std::fs;
 use std::io::Write as _;
@@ -109,6 +111,12 @@ pub enum Commands {
     Sessions {
         #[command(subcommand)]
         command: SessionCommands,
+    },
+
+    /// チェックポイント管理
+    Checkpoint {
+        #[command(subcommand)]
+        command: CheckpointCommands,
     },
 
     /// セッション再開
@@ -266,6 +274,30 @@ pub enum SessionCommands {
 
     /// 全セッション削除
     Clear,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CheckpointCommands {
+    /// Create a checkpoint for paths
+    Create {
+        /// Files to snapshot
+        paths: Vec<PathBuf>,
+        /// Checkpoint reason
+        #[arg(short, long, default_value = "manual")]
+        reason: String,
+    },
+    /// List checkpoints
+    List,
+    /// Show diff from checkpoint to current files
+    Diff {
+        /// Checkpoint ID; omit to use latest
+        id: Option<String>,
+    },
+    /// Restore files from checkpoint
+    Restore {
+        /// Checkpoint ID; omit to use latest
+        id: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -452,6 +484,7 @@ pub enum ToolCommands {
 impl Cli {
     pub async fn execute(mut self) -> Result<()> {
         self.apply_startup_overrides()?;
+        self.hydrate_stored_auth_token();
         if let Some(command) = &self.command {
             self.execute_command(command).await
         } else if self.prompt.is_some() {
@@ -466,6 +499,7 @@ impl Cli {
             Commands::Mcp { command } => self.execute_mcp_command(command).await,
             Commands::Agent { command } => self.execute_agent_command(command).await,
             Commands::Sessions { command } => self.execute_session_command(command).await,
+            Commands::Checkpoint { command } => self.execute_checkpoint_command(command),
             Commands::Tool { command } => self.execute_tool_command(command).await,
             Commands::Tui => self.execute_tui().await,
             Commands::Review { base, preset } => {
@@ -509,6 +543,19 @@ impl Cli {
         }
         self.add_dir = normalize_add_dirs(&self.add_dir)?;
         Ok(())
+    }
+
+    fn hydrate_stored_auth_token(&self) {
+        if std::env::var(auth_store::passphrase_env_var()).is_err() {
+            return;
+        }
+        let config = self.load_effective_config();
+        let provider = if config.model.provider.trim().is_empty() {
+            "anthropic"
+        } else {
+            config.model.provider.as_str()
+        };
+        let _ = auth_store::hydrate_env_for_provider(provider);
     }
 
     async fn execute_mcp_command(&self, command: &McpCommands) -> Result<()> {
@@ -648,6 +695,51 @@ impl Cli {
         }
     }
 
+    fn execute_checkpoint_command(&self, command: &CheckpointCommands) -> Result<()> {
+        let store = CheckpointStore::new(CheckpointStore::default_root());
+        match command {
+            CheckpointCommands::Create { paths, reason } => {
+                if paths.is_empty() {
+                    return Err(anyhow!("checkpoint create requires at least one path"));
+                }
+                let checkpoint = store.create_for_paths(paths, reason)?;
+                println!(
+                    "checkpoint created: {} files={}",
+                    checkpoint.id,
+                    checkpoint.files.len()
+                );
+                Ok(())
+            }
+            CheckpointCommands::List => {
+                println!("{}", format_checkpoint_list(&store.list()?));
+                Ok(())
+            }
+            CheckpointCommands::Diff { id } => {
+                let checkpoint = match id {
+                    Some(id) => store.load(id)?,
+                    None => store.latest()?.ok_or_else(|| anyhow!("no checkpoints"))?,
+                };
+                println!("{}", format_checkpoint_diff(&checkpoint));
+                Ok(())
+            }
+            CheckpointCommands::Restore { id } => {
+                let restored = match id {
+                    Some(id) => Some(store.restore(id)?),
+                    None => store.restore_latest()?,
+                };
+                match restored {
+                    Some(checkpoint) => println!(
+                        "checkpoint restored: {} files={}",
+                        checkpoint.id,
+                        checkpoint.files.len()
+                    ),
+                    None => println!("no checkpoints"),
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn execute_issue_command(
         &self,
         provider: ForgeProvider,
@@ -773,11 +865,17 @@ impl Cli {
                         provider_name
                     ));
                 };
-                if std::env::var(env_name).is_err() {
+                let token =
+                    std::env::var(env_name).map_err(|_| anyhow!("{} is not set", env_name))?;
+                if token.trim().is_empty() {
                     return Err(anyhow!("{} is not set", env_name));
                 }
-                save_auth_session(provider_name, env_name)?;
-                println!("auth ready: provider={} via {}", provider_name, env_name);
+                save_auth_session(provider_name, env_name, &token)?;
+                println!(
+                    "auth ready: provider={} token_store=encrypted passphrase_env={}",
+                    provider_name,
+                    auth_store::passphrase_env_var()
+                );
                 Ok(())
             }
             AuthCommands::Logout => {
@@ -798,14 +896,15 @@ impl Cli {
                 let session_status = load_auth_session()
                     .map(|session| {
                         format!(
-                            "session=ready provider={} updated_at={}",
-                            session.provider, session.updated_at
+                            "session=ready provider={} encrypted={} updated_at={}",
+                            session.provider, session.encrypted, session.updated_at
                         )
                     })
                     .unwrap_or_else(|| "session=none".to_string());
+                let token_status = auth_store::token_store_status(provider_name);
                 println!(
-                    "provider: {}\n{}\n{}",
-                    provider_name, env_status, session_status
+                    "provider: {}\n{}\n{}\n{}",
+                    provider_name, env_status, session_status, token_status
                 );
                 Ok(())
             }
@@ -1679,13 +1778,6 @@ fn apply_preview_write(executor: &ToolExecutor, result: &ToolResult) -> Result<O
     Ok(Some(applied))
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct AuthSession {
-    provider: String,
-    env_var: String,
-    updated_at: String,
-}
-
 fn auth_env_var_for_provider(provider: &str) -> Option<&'static str> {
     match provider.trim().to_ascii_lowercase().as_str() {
         "anthropic" => Some("ANTHROPIC_API_KEY"),
@@ -1695,53 +1787,58 @@ fn auth_env_var_for_provider(provider: &str) -> Option<&'static str> {
     }
 }
 
-fn auth_session_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME").map_err(|_| anyhow!("HOME not set"))?;
-    Ok(auth_session_path_from_home(Path::new(&home)))
-}
-
-fn save_auth_session(provider: &str, env_var: &str) -> Result<()> {
-    let path = auth_session_path()?;
-    save_auth_session_at(&path, provider, env_var)
-}
-
-fn auth_session_path_from_home(home: &Path) -> PathBuf {
-    home.join(".tengu").join("auth").join("session.json")
-}
-
-fn save_auth_session_at(path: &Path, provider: &str, env_var: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let session = AuthSession {
-        provider: provider.to_string(),
-        env_var: env_var.to_string(),
-        updated_at: Utc::now().to_rfc3339(),
-    };
-    fs::write(path, serde_json::to_string_pretty(&session)?)?;
+fn save_auth_session(provider: &str, env_var: &str, token: &str) -> Result<()> {
+    auth_store::save_login(provider, env_var, token)?;
     Ok(())
 }
 
-fn load_auth_session() -> Option<AuthSession> {
-    let path = auth_session_path().ok()?;
-    load_auth_session_from_path(&path)
+#[cfg(test)]
+fn auth_session_path_from_home(home: &Path) -> PathBuf {
+    auth_store::session_path_from_home(home)
 }
 
-fn load_auth_session_from_path(path: &Path) -> Option<AuthSession> {
-    let data = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&data).ok()
+#[cfg(test)]
+fn auth_token_store_path_from_home(home: &Path) -> PathBuf {
+    auth_store::token_store_path_from_home(home)
+}
+
+#[cfg(test)]
+fn save_auth_session_at(path: &Path, provider: &str, env_var: &str, token: &str) -> Result<()> {
+    let token_store = path
+        .parent()
+        .map(|parent| parent.join("tokens.json"))
+        .unwrap_or_else(|| PathBuf::from("tokens.json"));
+    auth_store::save_login_at_with_passphrase(
+        path,
+        &token_store,
+        provider,
+        env_var,
+        token,
+        b"test passphrase",
+    )?;
+    Ok(())
+}
+
+fn load_auth_session() -> Option<auth_store::AuthSession> {
+    auth_store::load_session()
+}
+
+#[cfg(test)]
+fn load_auth_session_from_path(path: &Path) -> Option<auth_store::AuthSession> {
+    auth_store::load_session_from_path(path)
 }
 
 fn clear_auth_session() -> Result<()> {
-    let path = auth_session_path()?;
-    clear_auth_session_at(&path)
+    auth_store::clear()
 }
 
+#[cfg(test)]
 fn clear_auth_session_at(path: &Path) -> Result<()> {
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    Ok(())
+    let token_store = path
+        .parent()
+        .map(|parent| parent.join("tokens.json"))
+        .unwrap_or_else(|| PathBuf::from("tokens.json"));
+    auth_store::clear_at(path, &token_store)
 }
 
 fn default_system_prompt() -> String {
@@ -2049,6 +2146,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_checkpoint_commands() {
+        let create = Cli::try_parse_from([
+            "tengu",
+            "checkpoint",
+            "create",
+            "src/main.rs",
+            "--reason",
+            "before refactor",
+        ])
+        .unwrap();
+        assert!(matches!(
+            create.command,
+            Some(Commands::Checkpoint {
+                command: CheckpointCommands::Create { paths, reason }
+            }) if paths == vec![PathBuf::from("src/main.rs")]
+                && reason == "before refactor"
+        ));
+
+        let restore = Cli::try_parse_from(["tengu", "checkpoint", "restore", "cp-1"]).unwrap();
+        assert!(matches!(
+            restore.command,
+            Some(Commands::Checkpoint {
+                command: CheckpointCommands::Restore { id }
+            }) if id == Some("cp-1".to_string())
+        ));
+    }
+
+    #[test]
     fn builds_headless_request_with_system_prompt() {
         let request = build_headless_request("hello", Some("system"), &[]).unwrap();
         assert!(request.prompt.contains("System instructions:"));
@@ -2196,14 +2321,19 @@ mod tests {
     fn saves_loads_and_clears_auth_session_file() {
         let root = unique_temp_dir("auth-session");
         let path = auth_session_path_from_home(&root);
+        let token_store = auth_token_store_path_from_home(&root);
 
-        save_auth_session_at(&path, "anthropic", "ANTHROPIC_API_KEY").unwrap();
+        save_auth_session_at(&path, "anthropic", "ANTHROPIC_API_KEY", "sk-secret").unwrap();
         let session = load_auth_session_from_path(&path).unwrap();
         assert_eq!(session.provider, "anthropic");
         assert_eq!(session.env_var, "ANTHROPIC_API_KEY");
+        assert!(session.encrypted);
+        let raw = fs::read_to_string(&token_store).unwrap();
+        assert!(!raw.contains("sk-secret"));
 
         clear_auth_session_at(&path).unwrap();
         assert!(load_auth_session_from_path(&path).is_none());
+        assert!(!token_store.exists());
     }
 
     #[test]

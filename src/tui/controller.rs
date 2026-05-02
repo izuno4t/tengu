@@ -17,6 +17,8 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::agent::{AgentRunner, AgentStore};
+use crate::auth_store;
+use crate::checkpoint::{format_checkpoint_diff, format_checkpoint_list, CheckpointStore};
 use crate::config::Config;
 use crate::forge::{self, ForgeCommand, ForgeProvider, ReviewAction};
 use crate::llm::{LlmImage, LlmRequest, LlmStreamEvent};
@@ -325,6 +327,12 @@ impl App {
                 }
                 SlashCommandOutcome::ConfigCommand(args) => {
                     let response = self.handle_config_command(&args);
+                    self.state.append_message(&response);
+                    self.state.append_blank_line();
+                    return;
+                }
+                SlashCommandOutcome::CheckpointCommand(args) => {
+                    let response = self.handle_checkpoint_command(&args);
                     self.state.append_message(&response);
                     self.state.append_blank_line();
                     return;
@@ -1199,6 +1207,59 @@ impl App {
         }
     }
 
+    fn handle_checkpoint_command(&mut self, args: &[String]) -> String {
+        let store = CheckpointStore::new(CheckpointStore::default_root());
+        let command = args.first().map(String::as_str).unwrap_or("list");
+        match command {
+            "create" => {
+                if args.len() < 2 {
+                    return "usage: /checkpoint create <path> [more_paths...]".to_string();
+                }
+                let paths = args[1..].iter().map(PathBuf::from).collect::<Vec<_>>();
+                match store.create_for_paths(&paths, "manual TUI checkpoint") {
+                    Ok(checkpoint) => format!(
+                        "checkpoint created: {} files={}",
+                        checkpoint.id,
+                        checkpoint.files.len()
+                    ),
+                    Err(err) => format!("checkpoint failed: {}", err),
+                }
+            }
+            "list" => match store.list() {
+                Ok(checkpoints) => format_checkpoint_list(&checkpoints),
+                Err(err) => format!("checkpoint list failed: {}", err),
+            },
+            "diff" => {
+                let checkpoint = match args.get(1) {
+                    Some(id) => store.load(id),
+                    None => store
+                        .latest()
+                        .and_then(|checkpoint| checkpoint.ok_or_else(|| anyhow!("no checkpoints"))),
+                };
+                match checkpoint {
+                    Ok(checkpoint) => format_checkpoint_diff(&checkpoint),
+                    Err(err) => format!("checkpoint diff failed: {}", err),
+                }
+            }
+            "restore" => {
+                let restored = match args.get(1) {
+                    Some(id) => store.restore(id).map(Some),
+                    None => store.restore_latest(),
+                };
+                match restored {
+                    Ok(Some(checkpoint)) => format!(
+                        "checkpoint restored: {} files={}",
+                        checkpoint.id,
+                        checkpoint.files.len()
+                    ),
+                    Ok(None) => "no checkpoints".to_string(),
+                    Err(err) => format!("checkpoint restore failed: {}", err),
+                }
+            }
+            _ => "usage: /checkpoint [list|create <path...>|diff [id]|restore [id]]".to_string(),
+        }
+    }
+
     fn get_config_value(&self, key: &str) -> String {
         match key {
             "model.default" => format!("model.default: {}", self.current_model_label()),
@@ -1339,11 +1400,18 @@ impl App {
         let Some(env_name) = auth_env_var_for_provider(&provider) else {
             return format!("login unsupported for provider: {}", provider);
         };
-        if std::env::var(env_name).is_err() {
+        let Ok(token) = std::env::var(env_name) else {
+            return format!("{} is not set", env_name);
+        };
+        if token.trim().is_empty() {
             return format!("{} is not set", env_name);
         }
-        match save_tui_auth_session(&provider, env_name) {
-            Ok(()) => format!("auth ready: provider={} via {}", provider, env_name),
+        match save_tui_auth_session(&provider, env_name, &token) {
+            Ok(()) => format!(
+                "auth ready: provider={} token_store=encrypted passphrase_env={}",
+                provider,
+                auth_store::passphrase_env_var()
+            ),
             Err(err) => format!("login failed: {}", err),
         }
     }
@@ -1802,6 +1870,7 @@ enum SlashCommandOutcome {
     OpenMemory,
     InitMemory,
     ConfigCommand(Vec<String>),
+    CheckpointCommand(Vec<String>),
     ShowBackground,
     UsageCommand(Vec<String>),
     SetStrategy(Option<String>),
@@ -1942,6 +2011,14 @@ fn handle_slash_command(input: &str) -> Option<SlashCommandOutcome> {
         "/init" => Some(SlashCommandOutcome::InitMemory),
         "/config" => Some(SlashCommandOutcome::ConfigCommand(
             args.iter().map(|arg| (*arg).to_string()).collect(),
+        )),
+        "/checkpoint" => Some(SlashCommandOutcome::CheckpointCommand(
+            args.iter().map(|arg| (*arg).to_string()).collect(),
+        )),
+        "/rollback" => Some(SlashCommandOutcome::CheckpointCommand(
+            std::iter::once("restore".to_string())
+                .chain(args.iter().map(|arg| (*arg).to_string()))
+                .collect(),
         )),
         "/doctor" => Some(SlashCommandOutcome::Doctor),
         "/mcp" => list_mcp_servers().ok().map(SlashCommandOutcome::Display),
@@ -2270,7 +2347,7 @@ fn slash_help_items() -> Vec<SlashCommandHelp> {
         },
         SlashCommandHelp {
             cmd: "/login",
-            desc_en: "Persist auth state from env vars",
+            desc_en: "Encrypt and persist auth token from env",
         },
         SlashCommandHelp {
             cmd: "/logout",
@@ -2359,6 +2436,14 @@ fn slash_help_items() -> Vec<SlashCommandHelp> {
         SlashCommandHelp {
             cmd: "/config",
             desc_en: "Show config and memory paths",
+        },
+        SlashCommandHelp {
+            cmd: "/checkpoint",
+            desc_en: "List/create/diff/restore checkpoints",
+        },
+        SlashCommandHelp {
+            cmd: "/rollback [id]",
+            desc_en: "Restore latest or selected checkpoint",
         },
         SlashCommandHelp {
             cmd: "/doctor",
@@ -3010,34 +3095,29 @@ fn auth_env_var_for_provider(provider: &str) -> Option<&'static str> {
 }
 
 fn tui_auth_session_path() -> PathBuf {
-    std::env::var_os("HOME")
+    let home = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".tengu")
-        .join("auth")
-        .join("session.json")
+        .unwrap_or_else(|| PathBuf::from("."));
+    auth_store::session_path_from_home(&home)
 }
 
-fn save_tui_auth_session(provider: &str, env_var: &str) -> Result<()> {
+fn save_tui_auth_session(provider: &str, env_var: &str, token: &str) -> Result<()> {
     let path = tui_auth_session_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let payload = serde_json::json!({
-        "provider": provider,
-        "env_var": env_var,
-        "updated_at": chrono::Utc::now().to_rfc3339(),
-    });
-    fs::write(path, serde_json::to_string_pretty(&payload)?)?;
+    let token_store = path
+        .parent()
+        .map(|parent| parent.join("tokens.json"))
+        .unwrap_or_else(|| PathBuf::from("tokens.json"));
+    auth_store::save_login_at(&path, &token_store, provider, env_var, token)?;
     Ok(())
 }
 
 fn clear_tui_auth_session() -> Result<()> {
     let path = tui_auth_session_path();
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    Ok(())
+    let token_store = path
+        .parent()
+        .map(|parent| parent.join("tokens.json"))
+        .unwrap_or_else(|| PathBuf::from("tokens.json"));
+    auth_store::clear_at(&path, &token_store)
 }
 
 #[cfg(test)]
@@ -3466,6 +3546,25 @@ mod tests {
             handle_slash_command("/config set plan_mode on"),
             Some(SlashCommandOutcome::ConfigCommand(args))
                 if args == vec!["set".to_string(), "plan_mode".to_string(), "on".to_string()]
+        ));
+    }
+
+    #[test]
+    fn parses_checkpoint_and_rollback_commands() {
+        assert!(matches!(
+            handle_slash_command("/checkpoint list"),
+            Some(SlashCommandOutcome::CheckpointCommand(args))
+                if args == vec!["list".to_string()]
+        ));
+        assert!(matches!(
+            handle_slash_command("/checkpoint restore cp-1"),
+            Some(SlashCommandOutcome::CheckpointCommand(args))
+                if args == vec!["restore".to_string(), "cp-1".to_string()]
+        ));
+        assert!(matches!(
+            handle_slash_command("/rollback cp-1"),
+            Some(SlashCommandOutcome::CheckpointCommand(args))
+                if args == vec!["restore".to_string(), "cp-1".to_string()]
         ));
     }
 }

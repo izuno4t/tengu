@@ -1,6 +1,7 @@
 // Tools module
 // ビルトインツール: Read, Edit, Write, Bash, Grep, Glob, WebFetch, WebSearch
 
+use crate::checkpoint::CheckpointStore;
 use crate::config::{
     Config, HookConfig, HooksConfig, PermissionsConfig, SandboxConfig, SecurityConfig,
 };
@@ -726,6 +727,7 @@ impl ToolExecutor {
                 old_string,
                 new_string,
             } => {
+                create_auto_checkpoint(std::slice::from_ref(&path), "before Edit")?;
                 let content = fs::read_to_string(&path)
                     .map_err(|e| anyhow!("failed to read {}: {}", path.display(), e))?;
                 let count = content.matches(&old_string).count();
@@ -754,6 +756,7 @@ impl ToolExecutor {
                         WRITE_MAX_BYTES
                     ));
                 }
+                create_auto_checkpoint(std::slice::from_ref(&path), "before Write")?;
                 if let Some(parent) = path.parent() {
                     if !parent.exists() {
                         fs::create_dir_all(parent)?;
@@ -1612,6 +1615,15 @@ fn audit_summary(input: &ToolInput) -> Value {
             "task_count": tasks.len(),
         }),
     }
+}
+
+fn create_auto_checkpoint(paths: &[PathBuf], reason: &str) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let store = CheckpointStore::new(CheckpointStore::default_root());
+    store.create_for_paths(paths, reason)?;
+    Ok(())
 }
 
 fn redact_sensitive_text(input: &str) -> String {
