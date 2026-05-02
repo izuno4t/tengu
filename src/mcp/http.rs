@@ -54,8 +54,7 @@ pub async fn call_tool_http(
             }
         })),
     };
-    let (_, session_id) =
-        send_request(&client, url, &headers, &init_request, next_id).await?;
+    let (_, session_id) = send_request(&client, url, &headers, &init_request, next_id).await?;
     if let Some(session_id) = session_id {
         headers.insert(
             HeaderName::from_static("mcp-session-id"),

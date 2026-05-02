@@ -9,12 +9,12 @@ use crate::llm::{
     ChatRequest, ChatStreamEvent, ContentBlock, LlmClient, LlmRequest, LlmResponse, LlmStream,
     LlmUsage, Message, StopReason, ToolDefinition,
 };
-use futures_util::StreamExt;
-use crate::mcp::{McpServerConfig, mcp_result_to_text};
+use crate::mcp::{mcp_result_to_text, McpServerConfig};
 use crate::tools::{
     builtin_tool_definitions, estimate_tokens, ToolApprovalDecision, ToolApprovalRequest,
     ToolExecutor, ToolPolicy, ToolResult,
 };
+use futures_util::StreamExt;
 
 const MAX_AGENT_TURNS: usize = 50;
 /// Maximum number of turns for sub-agents.
@@ -46,9 +46,7 @@ impl Agent {
 }
 
 /// Callback type for reporting tool executions to the UI.
-pub type ToolEventHandler = Arc<
-    dyn Fn(ToolEvent) -> BoxFuture<'static, ()> + Send + Sync,
->;
+pub type ToolEventHandler = Arc<dyn Fn(ToolEvent) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// Events emitted during the agent loop for UI display.
 #[derive(Debug, Clone)]
@@ -207,9 +205,11 @@ impl AgentRunner {
         // Ensure we don't start with an orphaned tool_result
         while !compacted.is_empty() {
             let first = &compacted[0];
-            let is_orphaned_tool_result = first.content.iter().any(|b| {
-                matches!(b, ContentBlock::ToolResult { .. })
-            }) && first.role == crate::llm::MessageRole::User;
+            let is_orphaned_tool_result = first
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                && first.role == crate::llm::MessageRole::User;
             if is_orphaned_tool_result {
                 compacted.remove(0);
             } else {
@@ -233,11 +233,9 @@ impl AgentRunner {
 
     /// Run the full agentic loop with tool use support.
     /// Uses streaming for real-time text output.
-    pub async fn run_agent_loop(
-        &self,
-        messages: Vec<Message>,
-    ) -> Result<AgentLoopResult> {
-        self.run_agent_loop_with_max_turns(messages, MAX_AGENT_TURNS).await
+    pub async fn run_agent_loop(&self, messages: Vec<Message>) -> Result<AgentLoopResult> {
+        self.run_agent_loop_with_max_turns(messages, MAX_AGENT_TURNS)
+            .await
     }
 
     /// Run the agentic loop with a custom maximum number of turns.
@@ -247,209 +245,212 @@ impl AgentRunner {
         max_turns: usize,
     ) -> futures_util::future::BoxFuture<'_, Result<AgentLoopResult>> {
         Box::pin(async move {
-        let mut tools = builtin_tool_definitions();
-        // Merge MCP tool definitions
-        tools.extend(self.get_mcp_tool_definitions());
-        let system = self.get_system_prompt();
-        let executor = ToolExecutor::with_policy(self.tool_policy.clone());
-        let mut total_turns = 0;
+            let mut tools = builtin_tool_definitions();
+            // Merge MCP tool definitions
+            tools.extend(self.get_mcp_tool_definitions());
+            let system = self.get_system_prompt();
+            let executor = ToolExecutor::with_policy(self.tool_policy.clone());
+            let mut total_turns = 0;
 
-        loop {
-            if total_turns >= max_turns {
-                break;
-            }
-            total_turns += 1;
-
-            // Compact messages to prevent context overflow
-            let trimmed_messages = if messages.len() > FORCE_COMPACT_THRESHOLD
-                || messages.len() > MAX_CONTEXT_MESSAGES
-            {
-                Self::compact_messages(&messages)
-            } else {
-                messages.clone()
-            };
-
-            let request = ChatRequest {
-                system: system.clone(),
-                messages: trimmed_messages,
-                tools: tools.clone(),
-                max_tokens: 16384,
-            };
-
-            // Retry on transient errors
-            let mut stream = {
-                let mut attempt = 0u32;
-                loop {
-                    match self.client.chat_stream(&self.model_name, &request).await {
-                        Ok(s) => break s,
-                        Err(e) => {
-                            attempt += 1;
-                            let err_str = e.to_string();
-                            let is_retryable = err_str.contains("429")
-                                || err_str.contains("529")
-                                || err_str.contains("rate")
-                                || err_str.contains("overloaded")
-                                || err_str.contains("500")
-                                || err_str.contains("502")
-                                || err_str.contains("503");
-                            if attempt >= 3 || !is_retryable {
-                                return Err(e);
-                            }
-                            let delay = std::time::Duration::from_secs(2u64.pow(attempt));
-                            tokio::time::sleep(delay).await;
-                        }
-                    }
+            loop {
+                if total_turns >= max_turns {
+                    break;
                 }
-            };
+                total_turns += 1;
 
-            // Collect response from stream
-            let mut response_content: Vec<ContentBlock> = Vec::new();
-            let mut text_buffer = String::new();
-            let mut thinking_buffer = String::new();
-            let mut stop_reason = StopReason::EndTurn;
-
-            while let Some(event_result) = stream.next().await {
-                match event_result? {
-                    ChatStreamEvent::TextDelta(delta) => {
-                        // Emit text incrementally for real-time display
-                        self.emit_tool_event(ToolEvent::Text(delta.clone())).await;
-                        text_buffer.push_str(&delta);
-                    }
-                    ChatStreamEvent::ThinkingDelta(delta) => {
-                        // Accumulate thinking content (extended thinking)
-                        self.emit_tool_event(ToolEvent::Thinking(delta.clone())).await;
-                        thinking_buffer.push_str(&delta);
-                    }
-                    ChatStreamEvent::ToolUse { id, name, input } => {
-                        // Flush accumulated thinking
-                        if !thinking_buffer.is_empty() {
-                            response_content.push(ContentBlock::Thinking {
-                                thinking: std::mem::take(&mut thinking_buffer),
-                            });
-                        }
-                        // Flush accumulated text as a content block
-                        if !text_buffer.is_empty() {
-                            response_content.push(ContentBlock::Text {
-                                text: std::mem::take(&mut text_buffer),
-                            });
-                        }
-                        response_content.push(ContentBlock::ToolUse {
-                            id,
-                            name,
-                            input,
-                        });
-                    }
-                    ChatStreamEvent::Usage(usage) => {
-                        self.emit_tool_event(ToolEvent::Usage(usage)).await;
-                    }
-                    ChatStreamEvent::Done(reason) => {
-                        stop_reason = reason;
-                    }
-                }
-            }
-
-            // Flush remaining thinking
-            if !thinking_buffer.is_empty() {
-                response_content.push(ContentBlock::Thinking {
-                    thinking: thinking_buffer,
-                });
-            }
-            // Flush remaining text
-            if !text_buffer.is_empty() {
-                response_content.push(ContentBlock::Text {
-                    text: text_buffer,
-                });
-            }
-
-            // Add assistant response to messages
-            messages.push(Message {
-                role: crate::llm::MessageRole::Assistant,
-                content: response_content.clone(),
-            });
-
-            // If no tool_use, we're done
-            if stop_reason != StopReason::ToolUse {
-                break;
-            }
-
-            // Execute each tool call
-            let tool_uses: Vec<(String, String, serde_json::Value)> = response_content
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::ToolUse { id, name, input } => {
-                        Some((id.clone(), name.clone(), input.clone()))
-                    }
-                    _ => None,
-                })
-                .collect();
-
-            if tool_uses.is_empty() {
-                break;
-            }
-
-            let mut tool_results = Vec::new();
-            for (id, name, input) in &tool_uses {
-                self.emit_tool_event(ToolEvent::ToolCall {
-                    name: name.clone(),
-                    input: input.clone(),
-                })
-                .await;
-
-                let (result_text, is_error) = if name.starts_with("mcp__") {
-                    self.execute_mcp_tool(name, input).await
+                // Compact messages to prevent context overflow
+                let trimmed_messages = if messages.len() > FORCE_COMPACT_THRESHOLD
+                    || messages.len() > MAX_CONTEXT_MESSAGES
+                {
+                    Self::compact_messages(&messages)
                 } else {
-                    match name.as_str() {
-                        "SubAgent" => self.execute_sub_agent(input).await,
-                        "ParallelAgents" => self.execute_parallel_agents(input).await,
-                        _ => executor.execute_from_json(name, input),
+                    messages.clone()
+                };
+
+                let request = ChatRequest {
+                    system: system.clone(),
+                    messages: trimmed_messages,
+                    tools: tools.clone(),
+                    max_tokens: 16384,
+                };
+
+                // Retry on transient errors
+                let mut stream = {
+                    let mut attempt = 0u32;
+                    loop {
+                        match self.client.chat_stream(&self.model_name, &request).await {
+                            Ok(s) => break s,
+                            Err(e) => {
+                                attempt += 1;
+                                let err_str = e.to_string();
+                                let is_retryable = err_str.contains("429")
+                                    || err_str.contains("529")
+                                    || err_str.contains("rate")
+                                    || err_str.contains("overloaded")
+                                    || err_str.contains("500")
+                                    || err_str.contains("502")
+                                    || err_str.contains("503");
+                                if attempt >= 3 || !is_retryable {
+                                    return Err(e);
+                                }
+                                let delay = std::time::Duration::from_secs(2u64.pow(attempt));
+                                tokio::time::sleep(delay).await;
+                            }
+                        }
                     }
                 };
 
-                self.emit_tool_event(ToolEvent::ToolResult {
-                    name: name.clone(),
-                    result: result_text.clone(),
-                    is_error,
-                })
-                .await;
+                // Collect response from stream
+                let mut response_content: Vec<ContentBlock> = Vec::new();
+                let mut text_buffer = String::new();
+                let mut thinking_buffer = String::new();
+                let mut stop_reason = StopReason::EndTurn;
 
-                tool_results.push(ContentBlock::ToolResult {
-                    tool_use_id: id.clone(),
-                    content: result_text,
-                    is_error,
+                while let Some(event_result) = stream.next().await {
+                    match event_result? {
+                        ChatStreamEvent::TextDelta(delta) => {
+                            // Emit text incrementally for real-time display
+                            self.emit_tool_event(ToolEvent::Text(delta.clone())).await;
+                            text_buffer.push_str(&delta);
+                        }
+                        ChatStreamEvent::ThinkingDelta(delta) => {
+                            // Accumulate thinking content (extended thinking)
+                            self.emit_tool_event(ToolEvent::Thinking(delta.clone()))
+                                .await;
+                            thinking_buffer.push_str(&delta);
+                        }
+                        ChatStreamEvent::ToolUse { id, name, input } => {
+                            // Flush accumulated thinking
+                            if !thinking_buffer.is_empty() {
+                                response_content.push(ContentBlock::Thinking {
+                                    thinking: std::mem::take(&mut thinking_buffer),
+                                });
+                            }
+                            // Flush accumulated text as a content block
+                            if !text_buffer.is_empty() {
+                                response_content.push(ContentBlock::Text {
+                                    text: std::mem::take(&mut text_buffer),
+                                });
+                            }
+                            response_content.push(ContentBlock::ToolUse { id, name, input });
+                        }
+                        ChatStreamEvent::Usage(usage) => {
+                            self.emit_tool_event(ToolEvent::Usage(usage)).await;
+                        }
+                        ChatStreamEvent::Done(reason) => {
+                            stop_reason = reason;
+                        }
+                    }
+                }
+
+                // Flush remaining thinking
+                if !thinking_buffer.is_empty() {
+                    response_content.push(ContentBlock::Thinking {
+                        thinking: thinking_buffer,
+                    });
+                }
+                // Flush remaining text
+                if !text_buffer.is_empty() {
+                    response_content.push(ContentBlock::Text { text: text_buffer });
+                }
+
+                // Add assistant response to messages
+                messages.push(Message {
+                    role: crate::llm::MessageRole::Assistant,
+                    content: response_content.clone(),
                 });
+
+                // If no tool_use, we're done
+                if stop_reason != StopReason::ToolUse {
+                    break;
+                }
+
+                // Execute each tool call
+                let tool_uses: Vec<(String, String, serde_json::Value)> = response_content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolUse { id, name, input } => {
+                            Some((id.clone(), name.clone(), input.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+
+                if tool_uses.is_empty() {
+                    break;
+                }
+
+                let mut tool_results = Vec::new();
+                for (id, name, input) in &tool_uses {
+                    self.emit_tool_event(ToolEvent::ToolCall {
+                        name: name.clone(),
+                        input: input.clone(),
+                    })
+                    .await;
+
+                    let (result_text, is_error) = if name.starts_with("mcp__") {
+                        self.execute_mcp_tool(name, input).await
+                    } else {
+                        match name.as_str() {
+                            "SubAgent" => self.execute_sub_agent(input).await,
+                            "ParallelAgents" => self.execute_parallel_agents(input).await,
+                            _ => executor.execute_from_json(name, input),
+                        }
+                    };
+
+                    self.emit_tool_event(ToolEvent::ToolResult {
+                        name: name.clone(),
+                        result: result_text.clone(),
+                        is_error,
+                    })
+                    .await;
+
+                    tool_results.push(ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: result_text,
+                        is_error,
+                    });
+                }
+
+                // Add tool results as user message
+                messages.push(Message::tool_results(tool_results));
             }
 
-            // Add tool results as user message
-            messages.push(Message::tool_results(tool_results));
-        }
+            // Extract final text from the last assistant message
+            let final_text = messages
+                .iter()
+                .rev()
+                .find(|m| m.role == crate::llm::MessageRole::Assistant)
+                .map(|m| m.text_content())
+                .unwrap_or_default();
 
-        // Extract final text from the last assistant message
-        let final_text = messages
-            .iter()
-            .rev()
-            .find(|m| m.role == crate::llm::MessageRole::Assistant)
-            .map(|m| m.text_content())
-            .unwrap_or_default();
+            // Estimate token usage from messages
+            let estimated_tokens = messages
+                .iter()
+                .map(|m| {
+                    m.content
+                        .iter()
+                        .map(|b| match b {
+                            ContentBlock::Text { text } => estimate_tokens(text),
+                            ContentBlock::Thinking { thinking } => estimate_tokens(thinking),
+                            ContentBlock::ToolUse { input, .. } => {
+                                estimate_tokens(&input.to_string())
+                            }
+                            ContentBlock::ToolResult { content, .. } => estimate_tokens(content),
+                        })
+                        .sum::<usize>()
+                })
+                .sum();
 
-        // Estimate token usage from messages
-        let estimated_tokens = messages.iter().map(|m| {
-            m.content.iter().map(|b| match b {
-                ContentBlock::Text { text } => estimate_tokens(text),
-                ContentBlock::Thinking { thinking } => estimate_tokens(thinking),
-                ContentBlock::ToolUse { input, .. } => estimate_tokens(&input.to_string()),
-                ContentBlock::ToolResult { content, .. } => estimate_tokens(content),
-            }).sum::<usize>()
-        }).sum();
+            // Persist messages for multi-turn conversation
+            self.save_conversation_messages(&messages);
 
-        // Persist messages for multi-turn conversation
-        self.save_conversation_messages(&messages);
-
-        Ok(AgentLoopResult {
-            final_text,
-            messages,
-            total_turns,
-            estimated_tokens,
-        })
+            Ok(AgentLoopResult {
+                final_text,
+                messages,
+                total_turns,
+                estimated_tokens,
+            })
         }) // end Box::pin
     }
 
@@ -485,19 +486,32 @@ impl AgentRunner {
         // Find the first underscore after server name
         let (server_name, mcp_tool_name) = match rest.find('_') {
             Some(idx) => (&rest[..idx], &rest[idx + 1..]),
-            None => return (format!("Error: invalid MCP tool name format: {}", tool_name), true),
+            None => {
+                return (
+                    format!("Error: invalid MCP tool name format: {}", tool_name),
+                    true,
+                )
+            }
         };
 
         let server_config = {
             let servers = self.mcp_servers.lock().ok();
             servers.as_ref().and_then(|guard| {
-                guard.iter().find(|(name, _)| name == server_name).map(|(_, config)| config.clone())
+                guard
+                    .iter()
+                    .find(|(name, _)| name == server_name)
+                    .map(|(_, config)| config.clone())
             })
         };
 
         let server = match server_config {
             Some(s) => s,
-            None => return (format!("Error: MCP server '{}' not found", server_name), true),
+            None => {
+                return (
+                    format!("Error: MCP server '{}' not found", server_name),
+                    true,
+                )
+            }
         };
 
         if server.url.is_some() {
@@ -521,7 +535,13 @@ impl AgentRunner {
                 Err(e) => (format!("MCP task error: {}", e), true),
             }
         } else {
-            (format!("Error: MCP server '{}' has no transport configured", server_name), true)
+            (
+                format!(
+                    "Error: MCP server '{}' has no transport configured",
+                    server_name
+                ),
+                true,
+            )
         }
     }
 
@@ -543,7 +563,10 @@ impl AgentRunner {
             .unwrap_or(MAX_SUB_AGENT_TURNS);
 
         if prompt.is_empty() {
-            return ("Error: SubAgent requires a non-empty prompt".to_string(), true);
+            return (
+                "Error: SubAgent requires a non-empty prompt".to_string(),
+                true,
+            );
         }
 
         let sub_runner = AgentRunner::new(
@@ -556,7 +579,10 @@ impl AgentRunner {
         }
 
         let messages = vec![Message::user_text(&prompt)];
-        match sub_runner.run_agent_loop_with_max_turns(messages, max_turns).await {
+        match sub_runner
+            .run_agent_loop_with_max_turns(messages, max_turns)
+            .await
+        {
             Ok(result) => (result.final_text, false),
             Err(e) => (format!("SubAgent error: {}", e), true),
         }
@@ -576,10 +602,16 @@ impl AgentRunner {
             .unwrap_or_default();
 
         if tasks.len() < 2 {
-            return ("Error: ParallelAgents requires at least 2 tasks".to_string(), true);
+            return (
+                "Error: ParallelAgents requires at least 2 tasks".to_string(),
+                true,
+            );
         }
         if tasks.len() > 6 {
-            return ("Error: ParallelAgents supports at most 6 tasks".to_string(), true);
+            return (
+                "Error: ParallelAgents supports at most 6 tasks".to_string(),
+                true,
+            );
         }
 
         let mut handles = Vec::new();
@@ -589,16 +621,15 @@ impl AgentRunner {
             let system_prompt = self.get_system_prompt();
 
             let handle = tokio::spawn(async move {
-                let sub_runner = AgentRunner::new(
-                    client,
-                    model_name,
-                    ToolPolicy::read_only(),
-                );
+                let sub_runner = AgentRunner::new(client, model_name, ToolPolicy::read_only());
                 if let Some(sys) = system_prompt {
                     sub_runner.set_system_prompt(sys);
                 }
                 let messages = vec![Message::user_text(&task)];
-                match sub_runner.run_agent_loop_with_max_turns(messages, MAX_SUB_AGENT_TURNS).await {
+                match sub_runner
+                    .run_agent_loop_with_max_turns(messages, MAX_SUB_AGENT_TURNS)
+                    .await
+                {
                     Ok(result) => (i, result.final_text, false),
                     Err(e) => (i, format!("Error: {}", e), true),
                 }
@@ -707,9 +738,7 @@ impl AgentRunner {
                 "Previous conversation context:\n{}",
                 context
             )));
-            messages.push(Message::assistant_text(
-                "Understood. I have the context.",
-            ));
+            messages.push(Message::assistant_text("Understood. I have the context."));
         }
         messages.push(Message::user_text(input));
 
@@ -818,8 +847,8 @@ type ApprovalHandler =
 mod tests {
     use super::*;
     use crate::llm::{
-        ChatRequest, ChatResponse, ContentBlock, LlmBackend, LlmClient,
-        LlmProvider, LlmRequest, LlmResponse, LlmStream, LlmUsage, StopReason,
+        ChatRequest, ChatResponse, ContentBlock, LlmBackend, LlmClient, LlmProvider, LlmRequest,
+        LlmResponse, LlmStream, LlmUsage, StopReason,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -851,11 +880,7 @@ mod tests {
             })
         }
 
-        async fn generate_stream(
-            &self,
-            _model: &str,
-            _request: &LlmRequest,
-        ) -> Result<LlmStream> {
+        async fn generate_stream(&self, _model: &str, _request: &LlmRequest) -> Result<LlmStream> {
             let text = self.response_text.clone();
             let events = vec![Ok(crate::llm::LlmStreamEvent::Text(text))];
             Ok(Box::pin(futures_util::stream::iter(events)))
@@ -900,11 +925,7 @@ mod tests {
             })
         }
 
-        async fn generate_stream(
-            &self,
-            _model: &str,
-            _request: &LlmRequest,
-        ) -> Result<LlmStream> {
+        async fn generate_stream(&self, _model: &str, _request: &LlmRequest) -> Result<LlmStream> {
             Ok(Box::pin(futures_util::stream::iter(vec![])))
         }
 
@@ -973,10 +994,7 @@ mod tests {
         assert!(runner.get_system_prompt().is_none());
 
         runner.set_system_prompt("You are a test agent.".to_string());
-        assert_eq!(
-            runner.get_system_prompt().unwrap(),
-            "You are a test agent."
-        );
+        assert_eq!(runner.get_system_prompt().unwrap(), "You are a test agent.");
     }
 
     #[tokio::test]
@@ -1059,10 +1077,7 @@ mod tests {
 
     #[test]
     fn compact_messages_no_op_when_small() {
-        let messages = vec![
-            Message::user_text("hello"),
-            Message::assistant_text("hi"),
-        ];
+        let messages = vec![Message::user_text("hello"), Message::assistant_text("hi")];
         let compacted = AgentRunner::compact_messages(&messages);
         assert_eq!(compacted.len(), 2);
     }
@@ -1113,9 +1128,10 @@ mod tests {
 
         let compacted = AgentRunner::compact_messages(&messages);
         // Should not start with a tool_result
-        let first_has_tool_result = compacted[0].content.iter().any(|b| {
-            matches!(b, ContentBlock::ToolResult { .. })
-        });
+        let first_has_tool_result = compacted[0]
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
         assert!(!first_has_tool_result);
     }
 

@@ -239,14 +239,8 @@ mod tests {
             classify_complexity("Fix this typo in the README"),
             ModelTier::Fast
         );
-        assert_eq!(
-            classify_complexity("Rename this variable"),
-            ModelTier::Fast
-        );
-        assert_eq!(
-            classify_complexity("Format this code"),
-            ModelTier::Fast
-        );
+        assert_eq!(classify_complexity("Rename this variable"), ModelTier::Fast);
+        assert_eq!(classify_complexity("Format this code"), ModelTier::Fast);
     }
 
     #[test]
@@ -267,10 +261,7 @@ mod tests {
             classify_complexity("このモジュールのセキュリティをレビューして"),
             ModelTier::Strong
         );
-        assert_eq!(
-            classify_complexity("コメントを追加して"),
-            ModelTier::Fast
-        );
+        assert_eq!(classify_complexity("コメントを追加して"), ModelTier::Fast);
     }
 
     #[test]

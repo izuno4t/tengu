@@ -296,9 +296,7 @@ impl GoogleBackend {
                                 content.push(ContentBlock::ToolUse {
                                     id,
                                     name: fc.name,
-                                    input: fc
-                                        .args
-                                        .unwrap_or(Value::Object(Default::default())),
+                                    input: fc.args.unwrap_or(Value::Object(Default::default())),
                                 });
                             }
                         }
@@ -322,9 +320,7 @@ impl GoogleBackend {
         ChatResponse {
             content,
             stop_reason,
-            usage: body
-                .usage_metadata
-                .map(|u| Self::normalize_usage(u, None)),
+            usage: body.usage_metadata.map(|u| Self::normalize_usage(u, None)),
         }
     }
 }

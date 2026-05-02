@@ -2371,6 +2371,8 @@ fn list_builtin_tools() -> String {
         "Shell",
         "Grep",
         "Glob",
+        "WebFetch",
+        "WebSearch",
         "MCP(@server/tool)",
     ]
     .join("\n")

@@ -534,10 +534,7 @@ impl LlmBackend for AnthropicBackend {
                 return Err(anyhow!("anthropic stream error: {}", error));
             }
 
-            let event_type = value
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
 
             match event_type {
                 "content_block_start" => {
@@ -549,14 +546,10 @@ impl LlmBackend for AnthropicBackend {
                             .to_string();
                         state.current_block_type = Some(block_type.clone());
                         if block_type == "tool_use" {
-                            state.current_tool_id = block
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .map(String::from);
-                            state.current_tool_name = block
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .map(String::from);
+                            state.current_tool_id =
+                                block.get("id").and_then(Value::as_str).map(String::from);
+                            state.current_tool_name =
+                                block.get("name").and_then(Value::as_str).map(String::from);
                             state.current_tool_input_json.clear();
                         }
                     }
@@ -564,20 +557,17 @@ impl LlmBackend for AnthropicBackend {
                 }
                 "content_block_delta" => {
                     if let Some(delta) = value.get("delta") {
-                        let delta_type = delta
-                            .get("type")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
+                        let delta_type = delta.get("type").and_then(Value::as_str).unwrap_or("");
                         match delta_type {
                             "text_delta" => {
                                 if let Some(text) = delta.get("text").and_then(Value::as_str) {
-                                    return Ok(Some(ChatStreamEvent::TextDelta(
-                                        text.to_string(),
-                                    )));
+                                    return Ok(Some(ChatStreamEvent::TextDelta(text.to_string())));
                                 }
                             }
                             "thinking_delta" => {
-                                if let Some(thinking) = delta.get("thinking").and_then(Value::as_str) {
+                                if let Some(thinking) =
+                                    delta.get("thinking").and_then(Value::as_str)
+                                {
                                     return Ok(Some(ChatStreamEvent::ThinkingDelta(
                                         thinking.to_string(),
                                     )));
@@ -599,9 +589,8 @@ impl LlmBackend for AnthropicBackend {
                     if state.current_block_type.as_deref() == Some("tool_use") {
                         let id = state.current_tool_id.take().unwrap_or_default();
                         let name = state.current_tool_name.take().unwrap_or_default();
-                        let input: Value =
-                            serde_json::from_str(&state.current_tool_input_json)
-                                .unwrap_or(Value::Object(Default::default()));
+                        let input: Value = serde_json::from_str(&state.current_tool_input_json)
+                            .unwrap_or(Value::Object(Default::default()));
                         state.current_tool_input_json.clear();
                         state.current_block_type = None;
                         return Ok(Some(ChatStreamEvent::ToolUse { id, name, input }));
@@ -611,9 +600,7 @@ impl LlmBackend for AnthropicBackend {
                 }
                 "message_delta" => {
                     // Extract stop_reason and usage
-                    if let Some(usage) =
-                        AnthropicBackend::extract_usage_value(&value)
-                    {
+                    if let Some(usage) = AnthropicBackend::extract_usage_value(&value) {
                         return Ok(Some(ChatStreamEvent::Usage(usage)));
                     }
                     let stop_reason = value
@@ -621,24 +608,17 @@ impl LlmBackend for AnthropicBackend {
                         .and_then(|d| d.get("stop_reason"))
                         .and_then(Value::as_str);
                     match stop_reason {
-                        Some("tool_use") => {
-                            Ok(Some(ChatStreamEvent::Done(StopReason::ToolUse)))
-                        }
+                        Some("tool_use") => Ok(Some(ChatStreamEvent::Done(StopReason::ToolUse))),
                         Some("max_tokens") => {
                             Ok(Some(ChatStreamEvent::Done(StopReason::MaxTokens)))
                         }
-                        Some("end_turn") => {
-                            Ok(Some(ChatStreamEvent::Done(StopReason::EndTurn)))
-                        }
+                        Some("end_turn") => Ok(Some(ChatStreamEvent::Done(StopReason::EndTurn))),
                         _ => Ok(None),
                     }
                 }
                 "message_start" => {
                     // Extract initial usage from message_start
-                    if let Some(usage) = value
-                        .get("message")
-                        .and_then(|m| m.get("usage"))
-                    {
+                    if let Some(usage) = value.get("message").and_then(|m| m.get("usage")) {
                         if let Ok(u) = serde_json::from_value::<MessageUsage>(usage.clone()) {
                             return Ok(Some(ChatStreamEvent::Usage(
                                 AnthropicBackend::normalize_usage(u, Some(usage.clone())),
@@ -655,9 +635,7 @@ impl LlmBackend for AnthropicBackend {
             }
         }
 
-        fn take_chat_event(
-            state: &mut ChatStreamState,
-        ) -> Result<Option<ChatStreamEvent>> {
+        fn take_chat_event(state: &mut ChatStreamState) -> Result<Option<ChatStreamEvent>> {
             while let Some(idx) = state.buffer.find('\n') {
                 let mut line = state.buffer[..idx].to_string();
                 state.buffer = state.buffer[idx + 1..].to_string();

@@ -72,18 +72,14 @@ impl Message {
     pub fn user_text(text: impl Into<String>) -> Self {
         Self {
             role: MessageRole::User,
-            content: vec![ContentBlock::Text {
-                text: text.into(),
-            }],
+            content: vec![ContentBlock::Text { text: text.into() }],
         }
     }
 
     pub fn assistant_text(text: impl Into<String>) -> Self {
         Self {
             role: MessageRole::Assistant,
-            content: vec![ContentBlock::Text {
-                text: text.into(),
-            }],
+            content: vec![ContentBlock::Text { text: text.into() }],
         }
     }
 
@@ -109,7 +105,9 @@ impl Message {
         self.content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::ToolUse { id, name, input } => Some((id.as_str(), name.as_str(), input)),
+                ContentBlock::ToolUse { id, name, input } => {
+                    Some((id.as_str(), name.as_str(), input))
+                }
                 _ => None,
             })
             .collect()
@@ -541,18 +539,36 @@ mod tests {
 
     #[test]
     fn provider_from_str_valid() {
-        assert_eq!(LlmProvider::from_str("anthropic").unwrap(), LlmProvider::Anthropic);
-        assert_eq!(LlmProvider::from_str("openai").unwrap(), LlmProvider::OpenAI);
-        assert_eq!(LlmProvider::from_str("google").unwrap(), LlmProvider::Google);
-        assert_eq!(LlmProvider::from_str("gemini").unwrap(), LlmProvider::Google);
+        assert_eq!(
+            LlmProvider::from_str("anthropic").unwrap(),
+            LlmProvider::Anthropic
+        );
+        assert_eq!(
+            LlmProvider::from_str("openai").unwrap(),
+            LlmProvider::OpenAI
+        );
+        assert_eq!(
+            LlmProvider::from_str("google").unwrap(),
+            LlmProvider::Google
+        );
+        assert_eq!(
+            LlmProvider::from_str("gemini").unwrap(),
+            LlmProvider::Google
+        );
         assert_eq!(LlmProvider::from_str("ollama").unwrap(), LlmProvider::Local);
         assert_eq!(LlmProvider::from_str("local").unwrap(), LlmProvider::Local);
     }
 
     #[test]
     fn provider_from_str_case_insensitive() {
-        assert_eq!(LlmProvider::from_str("ANTHROPIC").unwrap(), LlmProvider::Anthropic);
-        assert_eq!(LlmProvider::from_str("OpenAI").unwrap(), LlmProvider::OpenAI);
+        assert_eq!(
+            LlmProvider::from_str("ANTHROPIC").unwrap(),
+            LlmProvider::Anthropic
+        );
+        assert_eq!(
+            LlmProvider::from_str("OpenAI").unwrap(),
+            LlmProvider::OpenAI
+        );
     }
 
     #[test]

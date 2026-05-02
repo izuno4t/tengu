@@ -1,14 +1,14 @@
 // Tools module
 // ビルトインツール: Read, Edit, Write, Bash, Grep, Glob, WebFetch, WebSearch
 
+use crate::config::{Config, PermissionsConfig, SandboxConfig};
+use crate::llm::ToolDefinition;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use crate::config::{Config, PermissionsConfig, SandboxConfig};
-use crate::llm::ToolDefinition;
 
 const BASH_TIMEOUT_SECS: u64 = 120;
 const BASH_MAX_OUTPUT_BYTES: usize = 30 * 1024; // 30 KB
@@ -429,10 +429,17 @@ impl ToolPolicy {
 
 /// Check if a URL targets a private/local IP address (SSRF protection).
 fn is_private_url(url: &str) -> bool {
-    let host = if let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")) {
+    let host = if let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    {
         let host_port = rest.split('/').next().unwrap_or(rest);
         if host_port.starts_with('[') {
-            host_port.split(']').next().unwrap_or(host_port).trim_start_matches('[')
+            host_port
+                .split(']')
+                .next()
+                .unwrap_or(host_port)
+                .trim_start_matches('[')
         } else {
             host_port.split(':').next().unwrap_or(host_port)
         }
@@ -448,21 +455,39 @@ fn is_private_url(url: &str) -> bool {
 
     if let Ok(addr) = host.parse::<std::net::Ipv4Addr>() {
         let octets = addr.octets();
-        if octets[0] == 127 { return true; }
-        if octets[0] == 10 { return true; }
-        if octets[0] == 172 && (16..=31).contains(&octets[1]) { return true; }
-        if octets[0] == 192 && octets[1] == 168 { return true; }
-        if octets == [0, 0, 0, 0] { return true; }
-        if octets[0] == 169 && octets[1] == 254 { return true; }
+        if octets[0] == 127 {
+            return true;
+        }
+        if octets[0] == 10 {
+            return true;
+        }
+        if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+            return true;
+        }
+        if octets[0] == 192 && octets[1] == 168 {
+            return true;
+        }
+        if octets == [0, 0, 0, 0] {
+            return true;
+        }
+        if octets[0] == 169 && octets[1] == 254 {
+            return true;
+        }
     }
 
     if let Ok(addr) = host.parse::<std::net::Ipv6Addr>() {
-        if addr.is_loopback() || addr.is_unspecified() { return true; }
+        if addr.is_loopback() || addr.is_unspecified() {
+            return true;
+        }
         let segments = addr.segments();
-        if segments[0] & 0xffc0 == 0xfe80 { return true; }
+        if segments[0] & 0xffc0 == 0xfe80 {
+            return true;
+        }
     }
 
-    if host == "::1" || host == "0.0.0.0" { return true; }
+    if host == "::1" || host == "0.0.0.0" {
+        return true;
+    }
 
     false
 }
@@ -503,7 +528,11 @@ impl ToolExecutor {
     pub fn execute(&self, input: ToolInput) -> Result<ToolResult> {
         self.policy.check(&input)?;
         match input {
-            ToolInput::Read { path, offset, limit } => {
+            ToolInput::Read {
+                path,
+                offset,
+                limit,
+            } => {
                 // Check for image files
                 if is_image_path(&path) {
                     let meta = fs::metadata(&path)
@@ -531,9 +560,7 @@ impl ToolExecutor {
                 let lines: Vec<&str> = content.lines().collect();
                 let total = lines.len();
                 let start = offset.unwrap_or(0).min(total);
-                let end = limit
-                    .map(|l| (start + l).min(total))
-                    .unwrap_or(total);
+                let end = limit.map(|l| (start + l).min(total)).unwrap_or(total);
                 let numbered: Vec<String> = lines[start..end]
                     .iter()
                     .enumerate()
@@ -567,10 +594,7 @@ impl ToolExecutor {
                     .map_err(|e| anyhow!("failed to read {}: {}", path.display(), e))?;
                 let count = content.matches(&old_string).count();
                 if count == 0 {
-                    return Err(anyhow!(
-                        "old_string not found in {}",
-                        path.display()
-                    ));
+                    return Err(anyhow!("old_string not found in {}", path.display()));
                 }
                 if count > 1 {
                     return Err(anyhow!(
@@ -625,10 +649,7 @@ impl ToolExecutor {
                     return Err(anyhow!("no command provided"));
                 }
                 if is_dangerous_command(&command) {
-                    return Err(anyhow!(
-                        "dangerous command blocked: {}",
-                        command
-                    ));
+                    return Err(anyhow!("dangerous command blocked: {}", command));
                 }
                 let timeout_secs = timeout.unwrap_or(BASH_TIMEOUT_SECS);
                 let clean_env = build_clean_env();
@@ -784,7 +805,10 @@ impl ToolExecutor {
                 let stderr = String::from_utf8_lossy(&output.stderr);
 
                 if !output.status.success() {
-                    let mut msg = format!("HTTP request failed (exit code: {})", output.status.code().unwrap_or(-1));
+                    let mut msg = format!(
+                        "HTTP request failed (exit code: {})",
+                        output.status.code().unwrap_or(-1)
+                    );
                     if !stderr.is_empty() {
                         msg.push_str(&format!("\nstderr: {}", stderr));
                     }
@@ -838,24 +862,17 @@ impl ToolExecutor {
                 let results = parse_duckduckgo_lite(&html);
 
                 if results.is_empty() {
-                    Ok(ToolResult::Text(format!(
-                        "No results found for: {}",
-                        query
-                    )))
+                    Ok(ToolResult::Text(format!("No results found for: {}", query)))
                 } else {
                     Ok(ToolResult::Text(results.join("\n\n")))
                 }
             }
-            ToolInput::SubAgent { .. } => {
-                Ok(ToolResult::Text(
-                    "SubAgent tool must be executed in async agent loop context".to_string(),
-                ))
-            }
-            ToolInput::ParallelAgents { .. } => {
-                Ok(ToolResult::Text(
-                    "ParallelAgents tool must be executed in async agent loop context".to_string(),
-                ))
-            }
+            ToolInput::SubAgent { .. } => Ok(ToolResult::Text(
+                "SubAgent tool must be executed in async agent loop context".to_string(),
+            )),
+            ToolInput::ParallelAgents { .. } => Ok(ToolResult::Text(
+                "ParallelAgents tool must be executed in async agent loop context".to_string(),
+            )),
         }
     }
 
@@ -864,10 +881,7 @@ impl ToolExecutor {
     pub fn execute_from_json(&self, tool_name: &str, input: &Value) -> (String, bool) {
         let result = match tool_name {
             "Read" => {
-                let path = input
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let path = input.get("path").and_then(Value::as_str).unwrap_or("");
                 let offset = input
                     .get("offset")
                     .and_then(Value::as_u64)
@@ -908,33 +922,22 @@ impl ToolExecutor {
                     .or_else(|| input.get("file_path"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let content = input
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let content = input.get("content").and_then(Value::as_str).unwrap_or("");
                 self.execute(ToolInput::Write {
                     path: PathBuf::from(path),
                     content: content.to_string(),
                 })
             }
             "Bash" | "Shell" => {
-                let command = input
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let timeout = input
-                    .get("timeout")
-                    .and_then(Value::as_u64);
+                let command = input.get("command").and_then(Value::as_str).unwrap_or("");
+                let timeout = input.get("timeout").and_then(Value::as_u64);
                 self.execute(ToolInput::Bash {
                     command: command.to_string(),
                     timeout,
                 })
             }
             "Grep" => {
-                let pattern = input
-                    .get("pattern")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let pattern = input.get("pattern").and_then(Value::as_str).unwrap_or("");
                 let paths: Vec<PathBuf> = input
                     .get("paths")
                     .or_else(|| input.get("path"))
@@ -954,10 +957,7 @@ impl ToolExecutor {
                 })
             }
             "Glob" => {
-                let pattern = input
-                    .get("pattern")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let pattern = input.get("pattern").and_then(Value::as_str).unwrap_or("");
                 let root = input
                     .get("root")
                     .or_else(|| input.get("path"))
@@ -969,23 +969,14 @@ impl ToolExecutor {
                 })
             }
             "ListFiles" => {
-                let path = input
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .unwrap_or(".");
+                let path = input.get("path").and_then(Value::as_str).unwrap_or(".");
                 self.execute(ToolInput::ListFiles {
                     path: PathBuf::from(path),
                 })
             }
             "WebFetch" => {
-                let url = input
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let method = input
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .unwrap_or("GET");
+                let url = input.get("url").and_then(Value::as_str).unwrap_or("");
+                let method = input.get("method").and_then(Value::as_str).unwrap_or("GET");
                 let headers: Vec<(String, String)> = input
                     .get("headers")
                     .and_then(Value::as_object)
@@ -995,10 +986,7 @@ impl ToolExecutor {
                             .collect()
                     })
                     .unwrap_or_default();
-                let body = input
-                    .get("body")
-                    .and_then(Value::as_str)
-                    .map(String::from);
+                let body = input.get("body").and_then(Value::as_str).map(String::from);
                 self.execute(ToolInput::WebFetch {
                     url: url.to_string(),
                     method: method.to_string(),
@@ -1007,10 +995,7 @@ impl ToolExecutor {
                 })
             }
             "WebSearch" => {
-                let query = input
-                    .get("query")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let query = input.get("query").and_then(Value::as_str).unwrap_or("");
                 self.execute(ToolInput::WebSearch {
                     query: query.to_string(),
                 })
@@ -1477,11 +1462,7 @@ fn tool_match_targets(input: &ToolInput, root: Option<&Path>) -> Vec<String> {
     }
 }
 
-fn collect_grep_matches_regex(
-    re: &regex::Regex,
-    path: &Path,
-    out: &mut Vec<String>,
-) -> Result<()> {
+fn collect_grep_matches_regex(re: &regex::Regex, path: &Path, out: &mut Vec<String>) -> Result<()> {
     collect_grep_matches_regex_inner(re, path, out, true)
 }
 
@@ -1583,7 +1564,8 @@ fn parse_duckduckgo_lite(html: &str) -> Vec<String> {
         let trimmed = line.trim();
 
         // Look for result links
-        if (trimmed.contains("result-link") || (trimmed.contains("rel=\"nofollow\"") && trimmed.contains("href=")))
+        if (trimmed.contains("result-link")
+            || (trimmed.contains("rel=\"nofollow\"") && trimmed.contains("href=")))
             && trimmed.contains("<a")
         {
             if let Some(href_start) = trimmed.find("href=\"") {
@@ -1608,7 +1590,9 @@ fn parse_duckduckgo_lite(html: &str) -> Vec<String> {
         }
 
         // Look for snippet text following a result
-        if current_url.is_some() && (trimmed.starts_with("<td") || trimmed.contains("result-snippet")) {
+        if current_url.is_some()
+            && (trimmed.starts_with("<td") || trimmed.contains("result-snippet"))
+        {
             let snippet = strip_html_tags(trimmed).trim().to_string();
             if !snippet.is_empty() && snippet.len() > 10 {
                 if let Some(last) = results.last_mut() {
@@ -1851,10 +1835,7 @@ mod tests {
             .unwrap();
         let text = result.to_string_lossy();
         assert!(text.contains("Successfully edited"));
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            "hello world\nbaz qux\n"
-        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello world\nbaz qux\n");
     }
 
     #[test]
@@ -2118,9 +2099,20 @@ mod tests {
                     .filter_map(|p| p.file_name())
                     .map(|n| n.to_string_lossy().to_string())
                     .collect();
-                assert!(names.contains(&"a.rs".to_string()), "Missing a.rs in {:?}", names);
-                assert!(names.contains(&"b.rs".to_string()), "Missing b.rs in {:?}", names);
-                assert!(!names.contains(&"c.txt".to_string()), "Should not contain c.txt");
+                assert!(
+                    names.contains(&"a.rs".to_string()),
+                    "Missing a.rs in {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"b.rs".to_string()),
+                    "Missing b.rs in {:?}",
+                    names
+                );
+                assert!(
+                    !names.contains(&"c.txt".to_string()),
+                    "Should not contain c.txt"
+                );
             }
             other => panic!("Expected Paths, got {:?}", other),
         }
@@ -2201,10 +2193,8 @@ mod tests {
         let path = dir.path().join("test.txt");
         fs::write(&path, "hello\n").unwrap();
         let exec = make_executor(dir.path());
-        let (result, is_error) = exec.execute_from_json(
-            "Read",
-            &serde_json::json!({"path": path.to_str().unwrap()}),
-        );
+        let (result, is_error) =
+            exec.execute_from_json("Read", &serde_json::json!({"path": path.to_str().unwrap()}));
         assert!(!is_error);
         assert!(result.contains("hello"));
     }
@@ -2245,10 +2235,8 @@ mod tests {
     fn execute_from_json_bash() {
         let dir = TempDir::new().unwrap();
         let exec = make_executor(dir.path());
-        let (result, is_error) = exec.execute_from_json(
-            "Bash",
-            &serde_json::json!({"command": "echo from_json"}),
-        );
+        let (result, is_error) =
+            exec.execute_from_json("Bash", &serde_json::json!({"command": "echo from_json"}));
         assert!(!is_error);
         assert!(result.contains("from_json"));
     }
@@ -2257,8 +2245,7 @@ mod tests {
     fn execute_from_json_unknown_tool() {
         let dir = TempDir::new().unwrap();
         let exec = make_executor(dir.path());
-        let (result, is_error) =
-            exec.execute_from_json("UnknownTool", &serde_json::json!({}));
+        let (result, is_error) = exec.execute_from_json("UnknownTool", &serde_json::json!({}));
         assert!(is_error);
         assert!(result.contains("unknown tool"));
     }
@@ -2475,10 +2462,7 @@ mod tests {
         let path = dir.path().join("max.txt");
         let content = "x".repeat(WRITE_MAX_BYTES);
         let exec = make_executor(dir.path());
-        let result = exec.execute(ToolInput::Write {
-            path,
-            content,
-        });
+        let result = exec.execute(ToolInput::Write { path, content });
         assert!(result.is_ok());
     }
 
@@ -2657,16 +2641,20 @@ mod tests {
             ..ToolPolicy::default()
         };
         // Read should work
-        assert!(policy.check(&ToolInput::Read {
-            path: PathBuf::from("test.txt"),
-            offset: None,
-            limit: None,
-        }).is_ok());
+        assert!(policy
+            .check(&ToolInput::Read {
+                path: PathBuf::from("test.txt"),
+                offset: None,
+                limit: None,
+            })
+            .is_ok());
         // Write should be blocked
-        assert!(policy.check(&ToolInput::Write {
-            path: PathBuf::from("test.txt"),
-            content: "data".to_string(),
-        }).is_err());
+        assert!(policy
+            .check(&ToolInput::Write {
+                path: PathBuf::from("test.txt"),
+                content: "data".to_string(),
+            })
+            .is_err());
     }
 
     #[test]
@@ -2729,7 +2717,10 @@ mod tests {
         // Generate output larger than BASH_MAX_OUTPUT_BYTES
         let result = exec
             .execute(ToolInput::Bash {
-                command: format!("python3 -c \"print('x' * {})\"", BASH_MAX_OUTPUT_BYTES + 1000),
+                command: format!(
+                    "python3 -c \"print('x' * {})\"",
+                    BASH_MAX_OUTPUT_BYTES + 1000
+                ),
                 timeout: Some(10),
             })
             .unwrap();
@@ -2964,7 +2955,10 @@ mod tests {
             body: None,
         });
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unsupported HTTP method"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported HTTP method"));
     }
 
     #[test]
@@ -3163,7 +3157,10 @@ mod tests {
     fn tool_definitions_include_websearch() {
         let defs = builtin_tool_definitions();
         let websearch = defs.iter().find(|d| d.name == "WebSearch");
-        assert!(websearch.is_some(), "WebSearch tool definition should exist");
+        assert!(
+            websearch.is_some(),
+            "WebSearch tool definition should exist"
+        );
         let def = websearch.unwrap();
         let schema = def.input_schema.as_object().unwrap();
         let required = schema.get("required").unwrap().as_array().unwrap();
@@ -3214,10 +3211,12 @@ mod tests {
     fn subagent_execute_returns_placeholder() {
         let dir = TempDir::new().unwrap();
         let exec = make_executor(dir.path());
-        let result = exec.execute(ToolInput::SubAgent {
-            prompt: "do something".to_string(),
-            max_turns: Some(5),
-        }).unwrap();
+        let result = exec
+            .execute(ToolInput::SubAgent {
+                prompt: "do something".to_string(),
+                max_turns: Some(5),
+            })
+            .unwrap();
         let text = result.to_string_lossy();
         assert!(text.contains("SubAgent tool must be executed in async agent loop context"));
     }
@@ -3262,9 +3261,11 @@ mod tests {
     fn parallelagents_execute_returns_placeholder() {
         let dir = TempDir::new().unwrap();
         let exec = make_executor(dir.path());
-        let result = exec.execute(ToolInput::ParallelAgents {
-            tasks: vec!["task1".to_string(), "task2".to_string()],
-        }).unwrap();
+        let result = exec
+            .execute(ToolInput::ParallelAgents {
+                tasks: vec!["task1".to_string(), "task2".to_string()],
+            })
+            .unwrap();
         let text = result.to_string_lossy();
         assert!(text.contains("ParallelAgents tool must be executed in async agent loop context"));
     }

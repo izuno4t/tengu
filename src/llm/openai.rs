@@ -376,8 +376,8 @@ impl OpenAiBackend {
             }
             if let Some(tool_calls) = &msg.tool_calls {
                 for tc in tool_calls {
-                    let input: Value =
-                        serde_json::from_str(&tc.function.arguments).unwrap_or(Value::Object(Default::default()));
+                    let input: Value = serde_json::from_str(&tc.function.arguments)
+                        .unwrap_or(Value::Object(Default::default()));
                     content.push(ContentBlock::ToolUse {
                         id: tc.id.clone(),
                         name: tc.function.name.clone(),
@@ -391,7 +391,10 @@ impl OpenAiBackend {
             Some("tool_calls") => StopReason::ToolUse,
             Some("length") => StopReason::MaxTokens,
             _ => {
-                if content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. })) {
+                if content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+                {
                     StopReason::ToolUse
                 } else {
                     StopReason::EndTurn
@@ -439,9 +442,7 @@ impl LlmBackend for OpenAiBackend {
                 Value::String(text) => text,
                 Value::Array(items) => items
                     .into_iter()
-                    .filter_map(|item| {
-                        item.get("text").and_then(Value::as_str).map(str::to_string)
-                    })
+                    .filter_map(|item| item.get("text").and_then(Value::as_str).map(str::to_string))
                     .collect::<Vec<_>>()
                     .join(""),
                 _ => String::new(),
