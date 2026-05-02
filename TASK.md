@@ -98,7 +98,7 @@ Claude Code / Codex と同等の実用感・信頼性に近づけるため、Pha
 
 | ID | Status | Summary | DependsOn |
 | ---- | ------ | ------- | --------- |
-| ALT-028 | ⏳ | 主要CLI/TUI導線のE2Eテストハーネスを追加する | ALT-027 |
+| ALT-028 | ✅ | 主要CLI/TUI導線のE2Eテストハーネスを追加する | ALT-027 |
 | ALT-029 | ⏳ | 80%カバレッジ実測をCIまたは固定toolchainで取得する | ALT-026,ALT-028 |
 | ALT-030 | ⏳ | ファイル参照のTAB補完・fuzzy検索・最近使用履歴を実装する | ALT-021 |
 | ALT-031 | ⏳ | GitHub/GitLabのPRコメント・Issue・Label操作を実装する | ALT-022 |
