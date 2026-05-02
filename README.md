@@ -108,7 +108,7 @@ tengu review --base main --preset security
 ```
 
 In TUI, use `/review`, `/review --base main`, or `/review --preset security`.
-You can also use `/new`, `/clear`, `/resume`, `/save`, `/save <path>`, `/load <path>`, `/fork`, and `/diff` (optionally `/diff --stat`) for local session management and quick diff inspection.
+You can also use `/new`, `/clear`, `/resume`, `/resume --last`, `/resume <session-id>`, `/save`, `/save <path>`, `/load <path>`, `/fork`, and `/diff` (optionally `/diff --stat`) for local session management and quick diff inspection. From the CLI, `tengu sessions list` shows resumable session IDs, and `tengu resume --last` or `tengu resume <session-id>` opens the selected session in the TUI.
 Use `/image <path> [more_paths...]` to attach images to the next TUI prompt.
 Dragging image file paths into the TUI input also auto-attaches them for the next prompt.
 For local git actions, `/commit <message>` and `/pr [args]` ask for `y/n` confirmation before running `git commit` or `gh pr create`, and `/editor [path]` opens your `$VISUAL` or `$EDITOR`.

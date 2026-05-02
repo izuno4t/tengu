@@ -8,7 +8,7 @@ use crate::mcp::{list_tools_http, list_tools_stdio, McpServerConfig, McpStore};
 use crate::review::{build_review_prompt, ReviewOptions};
 use crate::session::{Session, SessionStore};
 use crate::tools::{ToolExecutor, ToolInput, ToolPolicy, ToolResult};
-use crate::tui::App;
+use crate::tui::{App, AppInit};
 use anyhow::{anyhow, Result};
 use base64::Engine;
 use chrono::Utc;
@@ -304,21 +304,8 @@ impl Cli {
                     .await
             }
             Commands::Resume { session_id, last } => {
-                let store = SessionStore::new(SessionStore::default_root()?);
-                if *last {
-                    if let Some(entry) = store.latest()? {
-                        let session = store.load(&entry.id)?;
-                        println!("resume: {} {}", session.id, session.updated_at);
-                    } else {
-                        println!("no sessions");
-                    }
-                } else if let Some(session_id) = session_id {
-                    let session = store.load(session_id)?;
-                    println!("resume: {} {}", session.id, session.updated_at);
-                } else {
-                    println!("session id required (use --last for latest)");
-                }
-                Ok(())
+                self.execute_resume_command(session_id.as_deref(), *last)
+                    .await
             }
             Commands::New => {
                 let store = SessionStore::new(SessionStore::default_root()?);
@@ -460,14 +447,7 @@ impl Cli {
         let store = SessionStore::new(SessionStore::default_root()?);
         match command {
             SessionCommands::List => {
-                let sessions = store.list()?;
-                if sessions.is_empty() {
-                    println!("no sessions");
-                } else {
-                    for entry in sessions {
-                        println!("{} {} {}", entry.id, entry.created_at, entry.updated_at);
-                    }
-                }
+                println!("{}", format_session_list(store.list()?));
                 Ok(())
             }
             SessionCommands::Delete { session_id } => {
@@ -481,6 +461,25 @@ impl Cli {
                 Ok(())
             }
         }
+    }
+
+    async fn execute_resume_command(&self, session_id: Option<&str>, last: bool) -> Result<()> {
+        let store = SessionStore::new(SessionStore::default_root()?);
+        if last {
+            if let Some(session) = store.latest()? {
+                return self.execute_tui_with_session(Some(session)).await;
+            }
+            println!("no sessions");
+            return Ok(());
+        }
+
+        if let Some(session_id) = session_id {
+            let session = store.load(session_id)?;
+            return self.execute_tui_with_session(Some(session)).await;
+        }
+
+        println!("{}", format_resume_selection_prompt(store.list()?));
+        Ok(())
     }
 
     async fn execute_auth_command(&self, command: &AuthCommands) -> Result<()> {
@@ -644,6 +643,10 @@ impl Cli {
     }
 
     async fn execute_tui(&self) -> Result<()> {
+        self.execute_tui_with_session(None).await
+    }
+
+    async fn execute_tui_with_session(&self, initial_session: Option<Session>) -> Result<()> {
         let banner = "👺 Tengu - Interactive mode".to_string();
         let config = self.load_effective_config();
         let (client, model_name) = self.resolve_llm_with_config(&config)?;
@@ -661,7 +664,7 @@ impl Cli {
             .unwrap_or("unknown")
             .to_string();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
-        let mut app = App::new(
+        let mut app = App::new(AppInit {
             runner,
             handle,
             banner,
@@ -669,7 +672,8 @@ impl Cli {
             status_build,
             result_rx,
             result_tx,
-        );
+            initial_session,
+        });
         app.set_initial_added_dirs(self.add_dir.clone());
         app.run()?;
         Ok(())
@@ -1060,6 +1064,40 @@ fn memory_file_candidates(scope: &'static str, root: &Path) -> Vec<(&'static str
         .into_iter()
         .map(|path| (scope, path))
         .collect()
+}
+
+fn format_resume_selection_prompt(sessions: Vec<Session>) -> String {
+    if sessions.is_empty() {
+        return "no sessions".to_string();
+    }
+    format!(
+        "{}\n\nResume with `tengu resume <session-id>` or `tengu resume --last`.",
+        format_session_list(sessions)
+    )
+}
+
+fn format_session_list(mut sessions: Vec<Session>) -> String {
+    if sessions.is_empty() {
+        return "no sessions".to_string();
+    }
+    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sessions
+        .iter()
+        .map(format_session_entry)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_session_entry(session: &Session) -> String {
+    format!(
+        "{} updated={} created={} turns={} logs={} queue={}",
+        session.id,
+        session.updated_at,
+        session.created_at,
+        session.conversation.len(),
+        session.log_lines.len(),
+        session.queue.len()
+    )
 }
 
 fn load_config() -> Option<Config> {
@@ -1698,6 +1736,42 @@ mod tests {
         assert_eq!(value["cache_read_input_tokens"], 3);
         assert_eq!(value["reasoning_tokens"], 2);
         assert_eq!(value["raw"]["prompt_tokens"], 12);
+    }
+
+    #[test]
+    fn formats_session_list_latest_first_with_resume_details() {
+        let mut older = Session::with_id("older".to_string());
+        older.created_at = "2026-01-01T00:00:00Z".to_string();
+        older.updated_at = "2026-01-01T00:00:00Z".to_string();
+
+        let mut newer = Session::with_id("newer".to_string());
+        newer.created_at = "2026-01-02T00:00:00Z".to_string();
+        newer.updated_at = "2026-01-03T00:00:00Z".to_string();
+        newer
+            .conversation
+            .push(crate::session::SessionConversationTurn {
+                role: crate::session::SessionConversationRole::User,
+                content: "hello".to_string(),
+            });
+
+        let output = format_session_list(vec![older, newer]);
+        let lines = output.lines().collect::<Vec<_>>();
+
+        assert!(lines[0].starts_with("newer updated=2026-01-03T00:00:00Z"));
+        assert!(lines[0].contains("turns=1"));
+        assert!(lines[1].starts_with("older updated=2026-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn formats_resume_selection_prompt_with_next_commands() {
+        let mut session = Session::with_id("session-a".to_string());
+        session.updated_at = "2026-01-01T00:00:00Z".to_string();
+
+        let output = format_resume_selection_prompt(vec![session]);
+
+        assert!(output.contains("session-a updated=2026-01-01T00:00:00Z"));
+        assert!(output.contains("tengu resume <session-id>"));
+        assert!(output.contains("tengu resume --last"));
     }
 
     #[test]

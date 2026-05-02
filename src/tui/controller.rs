@@ -40,32 +40,45 @@ pub struct App {
     initial_added_dirs: Vec<PathBuf>,
 }
 
+pub struct AppInit {
+    pub runner: Arc<AgentRunner>,
+    pub handle: Handle,
+    pub banner: String,
+    pub status_model: String,
+    pub status_build: String,
+    pub result_rx: mpsc::Receiver<anyhow::Result<TuiEvent>>,
+    pub result_tx: mpsc::Sender<anyhow::Result<TuiEvent>>,
+    pub initial_session: Option<Session>,
+}
+
 impl App {
-    pub fn new(
-        runner: Arc<AgentRunner>,
-        handle: Handle,
-        banner: String,
-        status_model: String,
-        status_build: String,
-        result_rx: mpsc::Receiver<anyhow::Result<TuiEvent>>,
-        result_tx: mpsc::Sender<anyhow::Result<TuiEvent>>,
-    ) -> Self {
-        let state = AppState::new(banner, status_model, status_build, result_rx, result_tx);
+    pub fn new(init: AppInit) -> Self {
+        let state = AppState::new(
+            init.banner,
+            init.status_model,
+            init.status_build,
+            init.result_rx,
+            init.result_tx,
+        );
         let session_store = SessionStore::default_root().ok().map(SessionStore::new);
-        let current_session = create_persisted_session(session_store.as_ref());
+        let current_session = init
+            .initial_session
+            .clone()
+            .or_else(|| create_persisted_session(session_store.as_ref()));
         let approval_sender = state.result_tx.clone();
-        runner.set_approval_handler(Arc::new(move |request: ToolApprovalRequest| {
-            let (tx, rx) = oneshot::channel();
-            let _ = approval_sender.send(Ok(TuiEvent::ApprovalRequest {
-                request,
-                respond_to: tx,
+        init.runner
+            .set_approval_handler(Arc::new(move |request: ToolApprovalRequest| {
+                let (tx, rx) = oneshot::channel();
+                let _ = approval_sender.send(Ok(TuiEvent::ApprovalRequest {
+                    request,
+                    respond_to: tx,
+                }));
+                Box::pin(async move { rx.await.unwrap_or(ToolApprovalDecision::DenyOnce) })
             }));
-            Box::pin(async move { rx.await.unwrap_or(ToolApprovalDecision::DenyOnce) })
-        }));
-        Self {
+        let mut app = Self {
             state,
-            runner,
-            handle,
+            runner: init.runner,
+            handle: init.handle,
             current_task: None,
             session_store,
             current_session,
@@ -73,7 +86,11 @@ impl App {
             pending_tool_approval: None,
             restored_tool_approval: None,
             initial_added_dirs: Vec::new(),
+        };
+        if let Some(session) = init.initial_session {
+            app.restore_session_state(&session);
         }
+        app
     }
 
     pub fn set_initial_added_dirs(&mut self, paths: Vec<PathBuf>) {
@@ -899,15 +916,7 @@ impl App {
             },
             ResumeTarget::Last => match store.latest() {
                 Ok(Some(session)) => {
-                    self.current_session = Some(session.clone());
-                    self.state.restore_from_session(
-                        &session.conversation,
-                        &session.log_lines,
-                        &session.queue,
-                        &session.pending_images,
-                        &session.usage_records,
-                    );
-                    self.restore_pending_approval(session.pending_approval.clone());
+                    self.restore_session_state(&session);
                     format!("resumed session: {}", session.id)
                 }
                 Ok(None) => "no sessions".to_string(),
@@ -915,15 +924,7 @@ impl App {
             },
             ResumeTarget::ById(id) => match store.load(&id) {
                 Ok(session) => {
-                    self.current_session = Some(session.clone());
-                    self.state.restore_from_session(
-                        &session.conversation,
-                        &session.log_lines,
-                        &session.queue,
-                        &session.pending_images,
-                        &session.usage_records,
-                    );
-                    self.restore_pending_approval(session.pending_approval.clone());
+                    self.restore_session_state(&session);
                     format!("resumed session: {}", session.id)
                 }
                 Err(err) => format!("resume failed: {}", err),
@@ -934,19 +935,23 @@ impl App {
     fn load_session_from_path(&mut self, path: &Path) -> String {
         match SessionStore::load_from_path(path) {
             Ok(session) => {
-                self.current_session = Some(session.clone());
-                self.state.restore_from_session(
-                    &session.conversation,
-                    &session.log_lines,
-                    &session.queue,
-                    &session.pending_images,
-                    &session.usage_records,
-                );
-                self.restore_pending_approval(session.pending_approval.clone());
+                self.restore_session_state(&session);
                 format!("loaded session: {}", path.display())
             }
             Err(err) => format!("load failed: {}", err),
         }
+    }
+
+    fn restore_session_state(&mut self, session: &Session) {
+        self.current_session = Some(session.clone());
+        self.state.restore_from_session(
+            &session.conversation,
+            &session.log_lines,
+            &session.queue,
+            &session.pending_images,
+            &session.usage_records,
+        );
+        self.restore_pending_approval(session.pending_approval.clone());
     }
 
     fn attach_images(&mut self, paths: Vec<PathBuf>) -> String {
