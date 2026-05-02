@@ -2206,6 +2206,41 @@ mod tests {
         ToolExecutor::with_policy(policy)
     }
 
+    #[test]
+    fn audit_redaction_masks_known_secret_markers() {
+        let redacted = redact_sensitive_text(
+            "OPENAI_API_KEY=sk-openai ghp_example github_pat_example xoxb-example",
+        );
+
+        assert!(redacted.contains("[redacted-env]"));
+        assert_eq!(redacted.matches("[redacted-secret]").count(), 4);
+        assert!(!redacted.contains("sk-openai"));
+        assert!(!redacted.contains("ghp_example"));
+        assert!(!redacted.contains("github_pat_example"));
+        assert!(!redacted.contains("xoxb-example"));
+    }
+
+    #[test]
+    fn audit_summary_redacts_sensitive_tool_inputs() {
+        let bash = audit_summary(&ToolInput::Bash {
+            command: "echo sk-secret".to_string(),
+            timeout: Some(10),
+        });
+        assert_eq!(bash["command"], "[redacted]");
+        assert_eq!(bash["timeout"], 10);
+
+        let fetch = audit_summary(&ToolInput::WebFetch {
+            url: "https://example.com?token=ghp_secret".to_string(),
+            method: "POST".to_string(),
+            headers: vec![("Authorization".to_string(), "Bearer sk-secret".to_string())],
+            body: Some("github_pat_secret".to_string()),
+        });
+        assert_eq!(fetch["url"], "https://example.com?token=[redacted-secret]");
+        assert_eq!(fetch["method"], "POST");
+        assert_eq!(fetch["header_count"], 1);
+        assert_eq!(fetch["body"], "[redacted]");
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Read Tool Tests
     // ═══════════════════════════════════════════════════════════════════════

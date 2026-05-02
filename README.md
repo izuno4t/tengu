@@ -10,8 +10,9 @@ Tengu is a flexible, multi-LLM coding agent that integrates with MCP servers, su
   LLM-native tool_use APIs (LLM -> ToolUse -> Result -> LLM...).
 - **Multi-LLM Support**: Anthropic, OpenAI, Google, and Ollama support
   tool_use / function calling across providers.
-- **8 Built-in Tools**: Read, Edit, Write, Bash, Grep, Glob, WebFetch, and
-  WebSearch for coding and research workflows.
+- **Built-in Tools**: Read, Edit, Write, Bash, Grep, Glob, ListFiles,
+  WebFetch, WebSearch, and agent orchestration helpers for coding and
+  research workflows.
 - **MCP Integration**: Connect to external tool servers over STDIO and HTTP
   transports.
 - **Permission Control**: Per-tool permissions, sandboxing, and glob pattern
@@ -20,6 +21,14 @@ Tengu is a flexible, multi-LLM coding agent that integrates with MCP servers, su
   execution logs.
 - **Project Configuration**: Manage project context with hierarchical
   `.tengu/AGENT.md` files, with legacy `.tengu/TENGU.md` compatibility.
+
+## Project Status
+
+Core CLI/TUI, multi-provider LLM routing, built-in tools, MCP, permissions,
+hooks, session resume, Git/review workflows, security defaults, performance
+checks, and required user documentation are implemented. Remaining tracked gaps
+are broader E2E evidence, 80% coverage proof in a matching LLVM environment,
+OAuth/encrypted token storage, and advanced optional features.
 
 ## 🚀 Quick Start
 
@@ -91,6 +100,10 @@ You can also inspect provider auth readiness with `tengu auth status`.
 
 ## 📖 Examples
 
+For the full command guide, see [USAGE.md](USAGE.md). For configuration details,
+see [CONFIGURATION.md](CONFIGURATION.md). For MCP server setup, see
+[MCP_GUIDE.md](MCP_GUIDE.md).
+
 ### File Operations
 
 ```bash
@@ -117,6 +130,20 @@ tengu review --base main --preset security
 tengu perf
 tengu perf --format json --strict
 ```
+
+### Coverage
+
+```bash
+# Line coverage summary with an 80% minimum
+scripts/coverage.sh
+
+# HTML report
+COVERAGE_MIN_LINES=80 scripts/coverage.sh html
+```
+
+The coverage helper prefers `cargo llvm-cov` and falls back to
+`cargo tarpaulin` when available. If the active `rustc` does not match the
+available LLVM tools, set `LLVM_COV` and `LLVM_PROFDATA` to matching binaries.
 
 In TUI, use `/review`, `/review --base main`, or `/review --preset security`.
 You can also use `/new`, `/clear`, `/resume`, `/resume --last`, `/resume <session-id>`, `/save`, `/save <path>`, `/load <path>`, `/fork`, and `/diff` (optionally `/diff --stat`) for local session management and quick diff inspection. From the CLI, `tengu sessions list` shows resumable session IDs, and `tengu resume --last` or `tengu resume <session-id>` opens the selected session in the TUI.

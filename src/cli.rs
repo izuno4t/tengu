@@ -657,11 +657,15 @@ impl Cli {
     }
 
     fn execute_perf_command(&self, format: &str, strict: bool) -> Result<()> {
+        if !matches!(format, "json" | "text") {
+            return Err(anyhow!("unsupported perf format: {}", format));
+        }
+
         let report = run_performance_checks()?;
         match format {
             "json" => println!("{}", serde_json::to_string_pretty(&report)?),
             "text" => println!("{}", format_performance_report(&report)),
-            other => return Err(anyhow!("unsupported perf format: {}", other)),
+            _ => unreachable!("format was validated before performance checks"),
         }
         if strict && !report.passed() {
             return Err(anyhow!("performance baseline failed"));
@@ -1982,6 +1986,24 @@ mod tests {
     }
 
     #[test]
+    fn performance_report_treats_unavailable_metrics_as_skipped() {
+        let report = PerformanceReport {
+            metrics: vec![PerformanceMetric {
+                name: "rss_memory".to_string(),
+                value: 0.0,
+                unit: "MB".to_string(),
+                threshold: 200.0,
+                available: false,
+            }],
+        };
+
+        assert!(report.passed());
+        let text = format_performance_report(&report);
+        assert!(text.contains("skip rss_memory unavailable"));
+        assert!(text.contains("overall: ok"));
+    }
+
+    #[test]
     fn performance_checks_include_required_local_metrics() {
         let report = run_performance_checks().unwrap();
         let names = report
@@ -2011,6 +2033,13 @@ mod tests {
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["metrics"][0]["name"], "command_dispatch");
         assert_eq!(json["metrics"][0]["threshold"], 100.0);
+    }
+
+    #[test]
+    fn perf_command_rejects_unknown_format_before_running_checks() {
+        let cli = test_cli_with_allowed_tools("");
+        let err = cli.execute_perf_command("xml", false).unwrap_err();
+        assert!(err.to_string().contains("unsupported perf format: xml"));
     }
 
     #[test]
