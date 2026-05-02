@@ -7,6 +7,9 @@ Usage: scripts/coverage.sh [summary|html|lcov]
 
 Environment:
   COVERAGE_MIN_LINES  Minimum line coverage percentage. Default: 80.
+  COVERAGE_IGNORE_REGEX
+                      Optional cargo-llvm-cov filename regex to exclude files
+                      from the measured scope.
   LLVM_COV            Path to llvm-cov matching the active rustc, if needed.
   LLVM_PROFDATA       Path to llvm-profdata matching the active rustc, if needed.
 USAGE
@@ -29,6 +32,9 @@ esac
 
 run_llvm_cov() {
   local args=(llvm-cov --fail-under-lines "$min_lines")
+  if [ -n "${COVERAGE_IGNORE_REGEX:-}" ]; then
+    args+=(--ignore-filename-regex "$COVERAGE_IGNORE_REGEX")
+  fi
 
   case "$mode" in
     summary)
@@ -86,6 +92,10 @@ HINT
 fi
 
 if cargo tarpaulin --version >/dev/null 2>&1; then
+  if [ -n "${COVERAGE_IGNORE_REGEX:-}" ]; then
+    echo "COVERAGE_IGNORE_REGEX is only supported by cargo llvm-cov." >&2
+    exit 2
+  fi
   run_tarpaulin
   exit 0
 fi

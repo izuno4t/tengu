@@ -144,6 +144,8 @@ COVERAGE_MIN_LINES=80 scripts/coverage.sh html
 The coverage helper prefers `cargo llvm-cov` and falls back to
 `cargo tarpaulin` when available. If the active `rustc` does not match the
 available LLVM tools, set `LLVM_COV` and `LLVM_PROFDATA` to matching binaries.
+The CI coverage job measures core non-interactive code at an 80% line threshold
+and excludes interactive TUI rendering and network transport adapters.
 
 In TUI, use `/review`, `/review --base main`, or `/review --preset security`.
 You can also use `/new`, `/clear`, `/resume`, `/resume --last`, `/resume <session-id>`, `/save`, `/save <path>`, `/load <path>`, `/fork`, and `/diff` (optionally `/diff --stat`) for local session management and quick diff inspection. From the CLI, `tengu sessions list` shows resumable session IDs, and `tengu resume --last` or `tengu resume <session-id>` opens the selected session in the TUI.

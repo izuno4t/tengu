@@ -19,7 +19,7 @@
 | ---- | ------------ | ---- |
 | Claude Code 基準の中核機能 | 85-90% | 主要導線と安全既定は成立している |
 | `docs/REQUIREMENTS.md` 全体 | 75-85% | 拡張・品質要件に不足がある |
-| 製品完了度 | 70-80% | 対話TUI/外部連携E2E、coverage実測、認証保護、任意高度機能に不足がある |
+| 製品完了度 | 70-80% | 対話TUI/外部連携E2E、full coverage、認証保護、任意高度機能に不足がある |
 
 ## 成立している主要導線
 
@@ -125,11 +125,11 @@
 
 ### テストとカバレッジ
 
-ユニットテストは存在し、`cargo test` は成功している。主要CLIは実バイナリを起動するE2Eハーネスで、auth、sessions、agent、MCP、tools、perf の代表導線を検証している。性能計測は `tengu perf` で起動経路、軽量コマンド、1MBファイル読み込み、RSSメモリを測定し、要求基準値と比較できる。カバレッジ計測は `scripts/coverage.sh` で `cargo llvm-cov` を優先し、`cargo tarpaulin` にフォールバックする導線を追加した。ただし要求の 80% カバレッジ達成証跡、完全な対話TUI E2Eテストの証跡は不足している。
+ユニットテストは存在し、`cargo test` は成功している。主要CLIは実バイナリを起動するE2Eハーネスで、auth、sessions、agent、MCP、tools、perf の代表導線を検証している。性能計測は `tengu perf` で起動経路、軽量コマンド、1MBファイル読み込み、RSSメモリを測定し、要求基準値と比較できる。カバレッジ計測は `scripts/coverage.sh` で `cargo llvm-cov` を優先し、`cargo tarpaulin` にフォールバックする導線を追加した。固定toolchainまたはmatching LLVM toolsでは、対話TUI描画と外部network transport adapterを除いた core coverage が 81.12% である。ただし full coverage は 53.25% であり、完全な対話TUI E2Eテストの証跡は不足している。
 
 影響:
 
-- 主要CLIのE2E証跡は追加済みだが、80% 達成の実測証跡と対話TUIの完全なE2E証跡は別途取得が必要である。
+- 主要CLIのE2E証跡と core coverage 80% 達成証跡は追加済みだが、full coverage 80% と対話TUIの完全なE2E証跡は別途取得が必要である。
 - LLM応答開始時間など外部API依存の性能証跡は今後の強化余地として残る。
 
 ### セキュリティと監査
@@ -146,8 +146,8 @@ APIキーは環境変数ベースで扱う。`.env` / `.env.*` はデフォル�
 1. 要求差分マトリクス、TASK、READMEの完了扱いと未達扱いは現行実装基準で再整合済みである。
 2. CLI引数、パーミッション、設定スキーマ、システムプロンプト互換は既存導線へ反映済みである。
 3. セッション再開、主要CLI、Git/レビュー導線は統合寄りテストまたはE2Eテストを補強済みであり、ファイル参照補完は未達として管理する。
-4. セキュリティ、監査ログ、性能計測、カバレッジ計測導線は整備済みであり、80% coverage達成証跡は後続で扱う。
-5. 残作業は対話TUI/外部連携E2E証跡、coverage実測、OAuth/暗号化保存、任意高度機能に絞って管理する。
+4. セキュリティ、監査ログ、性能計測、カバレッジ計測導線、core coverage 80%達成証跡は整備済みである。
+5. 残作業は対話TUI/外部連携E2E証跡、full coverage拡張、OAuth/暗号化保存、任意高度機能に絞って管理する。
 
 ## 検証結果
 
@@ -156,8 +156,8 @@ cargo test
 297 passed; 0 failed; 0 ignored
 
 scripts/coverage.sh
-failed: active cargo-llvm-cov could not find LLVM tools matching the active rustc.
-Set matching LLVM_COV and LLVM_PROFDATA, or use a rustup toolchain with llvm-tools-preview.
+core coverage: 81.12% lines with matching LLVM tools
+full coverage: 53.25% lines; interactive TUI and network adapters are the main remaining gaps
 ```
 
 ## 判断記録

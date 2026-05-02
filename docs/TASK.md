@@ -156,7 +156,7 @@
 |ID|Status|Summary|DependsOn|
 |----|--------|---------|-----------|
 |TASK-112|✅|主要CLI/TUI導線のE2Eテストハーネスを追加する|TASK-107,TASK-108,TASK-111|
-|TASK-113|⏳|80%カバレッジ実測をCIまたは固定toolchainで取得する|TASK-112|
+|TASK-113|✅|80%カバレッジ実測をCIまたは固定toolchainで取得する|TASK-112|
 |TASK-114|⏳|ファイル参照のTAB補完・fuzzy検索・最近使用履歴を実装する|TASK-010,TASK-111|
 |TASK-115|⏳|GitHub/GitLabのPRコメント・Issue・Label操作を実装する|TASK-108|
 |TASK-116|⏳|OAuthまたは暗号化トークン保存を含む認証保護を追加する|TASK-110|
