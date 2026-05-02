@@ -31,6 +31,8 @@ large-repository regression checks, and required user documentation are
 implemented.
 Remaining tracked gaps are full interactive terminal E2E coverage and advanced
 optional features.
+The final parity assessment is recorded in
+[PARITY_REPORT.md](docs/PARITY_REPORT.md).
 
 ## 🚀 Quick Start
 

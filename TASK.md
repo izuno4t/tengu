@@ -106,7 +106,7 @@ Claude Code / Codex と同等の実用感・信頼性に近づけるため、Pha
 | ALT-033 | ✅ | チェックポイント・rollback・作業差分復元を実装する | ALT-021,ALT-022 |
 | ALT-034 | ✅ | プロジェクトknowledge baseと永続メモリー検索を実装する | ALT-019 |
 | ALT-035 | ✅ | 長時間セッション・大規模リポジトリの回帰テストを追加する | ALT-028,ALT-029 |
-| ALT-036 | ⏳ | Claude Code / Codex parityの最終判定レポートを更新する | ALT-030,ALT-031,ALT-032,ALT-033,ALT-034,ALT-035 |
+| ALT-036 | ✅ | Claude Code / Codex parityの最終判定レポートを更新する | ALT-030,ALT-031,ALT-032,ALT-033,ALT-034,ALT-035 |
 
 ## 変更サマリ
 
