@@ -2384,8 +2384,13 @@ fn list_builtin_tools() -> String {
 }
 
 fn show_git_diff(args: &[&str]) -> anyhow::Result<String> {
+    show_git_diff_in_dir(args, Path::new("."))
+}
+
+fn show_git_diff_in_dir(args: &[&str], cwd: &Path) -> anyhow::Result<String> {
     let mut command = Command::new("git");
     command.arg("diff").arg("--no-ext-diff");
+    command.current_dir(cwd);
 
     match args {
         [] => {}
@@ -2447,12 +2452,17 @@ fn build_pr_action(args: &[&str]) -> SlashCommandOutcome {
 }
 
 fn execute_pending_local_action(action: PendingLocalAction) -> String {
+    execute_pending_local_action_in_dir(action, Path::new("."))
+}
+
+fn execute_pending_local_action_in_dir(action: PendingLocalAction, cwd: &Path) -> String {
     match action {
         PendingLocalAction::GitCommit { message } => {
             let output = Command::new("git")
                 .arg("commit")
                 .arg("-m")
                 .arg(&message)
+                .current_dir(cwd)
                 .output();
             format_command_result("git commit", output)
         }
@@ -2461,6 +2471,7 @@ fn execute_pending_local_action(action: PendingLocalAction) -> String {
                 .arg("pr")
                 .arg("create")
                 .args(&args)
+                .current_dir(cwd)
                 .output();
             format_command_result("gh pr create", output)
         }

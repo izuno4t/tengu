@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{anyhow, Result};
@@ -39,10 +40,14 @@ pub fn parse_review_args(args: &[&str]) -> Result<ReviewOptions> {
 }
 
 pub fn build_review_prompt(options: &ReviewOptions) -> Result<Option<String>> {
+    build_review_prompt_in_dir(options, Path::new("."))
+}
+
+fn build_review_prompt_in_dir(options: &ReviewOptions, cwd: &Path) -> Result<Option<String>> {
     let range = options.base.as_deref().map(|base| format!("{base}...HEAD"));
 
-    let stat = run_git_diff(range.as_deref(), true)?;
-    let diff = run_git_diff(range.as_deref(), false)?;
+    let stat = run_git_diff(range.as_deref(), true, cwd)?;
+    let diff = run_git_diff(range.as_deref(), false, cwd)?;
     Ok(build_review_prompt_from_diff(&stat, &diff, options))
 }
 
@@ -87,9 +92,10 @@ fn build_review_prompt_from_diff(
     Some(prompt)
 }
 
-fn run_git_diff(range: Option<&str>, stat_only: bool) -> Result<String> {
+fn run_git_diff(range: Option<&str>, stat_only: bool, cwd: &Path) -> Result<String> {
     let mut command = Command::new("git");
     command.arg("diff").arg("--no-ext-diff");
+    command.current_dir(cwd);
     if stat_only {
         command.arg("--stat");
     }
@@ -109,6 +115,55 @@ fn run_git_diff(range: Option<&str>, stat_only: bool) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn setup_git_repo_with_worktree_diff() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["init"]);
+        run_git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=Tengu Test",
+                "-c",
+                "user.email=tengu@example.test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        fs::write(dir.path().join("notes.txt"), "before\n").unwrap();
+        run_git(dir.path(), &["add", "notes.txt"]);
+        run_git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=Tengu Test",
+                "-c",
+                "user.email=tengu@example.test",
+                "commit",
+                "-m",
+                "add notes",
+            ],
+        );
+        fs::write(dir.path().join("notes.txt"), "before\nafter\n").unwrap();
+        dir
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn parses_review_args_with_base_and_preset() {
@@ -146,5 +201,44 @@ mod tests {
         let prompt =
             build_review_prompt_from_diff(" no files changed", "", &ReviewOptions::default());
         assert!(prompt.is_none());
+    }
+
+    #[test]
+    fn builds_review_prompt_from_real_git_worktree_diff() {
+        let dir = setup_git_repo_with_worktree_diff();
+
+        let prompt = build_review_prompt_in_dir(
+            &ReviewOptions {
+                base: None,
+                preset: Some("correctness".to_string()),
+            },
+            dir.path(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(prompt.contains("対象範囲: working tree"));
+        assert!(prompt.contains("バグ、回帰、仕様不整合"));
+        assert!(prompt.contains("notes.txt"));
+        assert!(prompt.contains("+after"));
+    }
+
+    #[test]
+    fn builds_review_prompt_from_real_git_base_range() {
+        let dir = setup_git_repo_with_worktree_diff();
+
+        let prompt = build_review_prompt_in_dir(
+            &ReviewOptions {
+                base: Some("HEAD~1".to_string()),
+                preset: Some("performance".to_string()),
+            },
+            dir.path(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(prompt.contains("対象範囲: HEAD~1...HEAD"));
+        assert!(prompt.contains("性能劣化"));
+        assert!(prompt.contains("notes.txt"));
     }
 }
