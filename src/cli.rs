@@ -1,5 +1,5 @@
 use crate::agent::{AgentOutput, AgentRunner, AgentStore, StoredAgent};
-use crate::config::Config;
+use crate::config::{Config, PermissionsConfig};
 use crate::llm::{
     AnthropicBackend, GoogleBackend, LlmBackend, LlmClient, LlmImage, LlmProvider, LlmRequest,
     LlmStreamEvent, LlmUsage, OllamaBackend, OpenAiBackend,
@@ -262,7 +262,8 @@ pub enum ToolCommands {
 }
 
 impl Cli {
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(mut self) -> Result<()> {
+        self.apply_startup_overrides()?;
         if let Some(command) = &self.command {
             self.execute_command(command).await
         } else if self.prompt.is_some() {
@@ -309,6 +310,14 @@ impl Cli {
             }
             Commands::Auth { command } => self.execute_auth_command(command).await,
         }
+    }
+
+    fn apply_startup_overrides(&mut self) -> Result<()> {
+        if let Some(cwd) = self.cwd.as_deref() {
+            std::env::set_current_dir(cwd)?;
+        }
+        self.add_dir = normalize_add_dirs(&self.add_dir)?;
+        Ok(())
     }
 
     async fn execute_mcp_command(&self, command: &McpCommands) -> Result<()> {
@@ -456,7 +465,7 @@ impl Cli {
     }
 
     async fn execute_auth_command(&self, command: &AuthCommands) -> Result<()> {
-        let config = load_config().unwrap_or_default();
+        let config = self.load_effective_config();
         let provider_name = if !config.model.provider.trim().is_empty() {
             config.model.provider.as_str()
         } else {
@@ -511,7 +520,7 @@ impl Cli {
     }
 
     async fn execute_tool_command(&self, command: &ToolCommands) -> Result<()> {
-        let config = load_config().unwrap_or_default();
+        let config = self.load_effective_config();
         let policy = ToolPolicy::from_config(&config);
         let executor = ToolExecutor::with_policy(policy);
         let result = match command {
@@ -556,7 +565,7 @@ impl Cli {
             return Ok(());
         };
 
-        let config = load_config().unwrap_or_default();
+        let config = self.load_effective_config();
         let (client, model_name) = self.resolve_llm_with_config(&config)?;
         let policy = ToolPolicy::from_config(&config);
         let runner = AgentRunner::new(client, model_name, policy);
@@ -601,7 +610,7 @@ impl Cli {
 
     async fn execute_tui(&self) -> Result<()> {
         let banner = "👺 Tengu - Interactive mode".to_string();
-        let config = load_config().unwrap_or_default();
+        let config = self.load_effective_config();
         let (client, model_name) = self.resolve_llm_with_config(&config)?;
         let policy = ToolPolicy::from_config(&config);
         let status_model = model_name.clone();
@@ -620,6 +629,7 @@ impl Cli {
             result_rx,
             result_tx,
         );
+        app.set_initial_added_dirs(self.add_dir.clone());
         app.run()?;
         Ok(())
     }
@@ -630,9 +640,11 @@ impl Cli {
         if let Some(prompt) = self.prompt.as_deref() {
             let request = build_headless_request(prompt, system_prompt.as_deref(), &self.image)?;
             if self.output_format == "stream-json" {
-                let config = load_config().unwrap_or_default();
+                let config = self.load_effective_config();
                 let (client, model_name) = self.resolve_llm_with_config(&config)?;
+                let workspace_context = self.additional_workspace_context();
                 if !request.images.is_empty() {
+                    let request = request_with_prompt_context(&request, &workspace_context);
                     let mut stream = client.generate_stream(&model_name, &request).await?;
                     println!("{}", json!({ "type": "start", "mode": "llm" }));
                     while let Some(chunk) = stream.next().await {
@@ -665,7 +677,7 @@ impl Cli {
                 let policy = ToolPolicy::from_config(&config);
                 let runner = AgentRunner::new(client, model_name, policy);
                 let (mut stream, tool_result) = runner
-                    .handle_prompt_stream_with_tool_context(&request.prompt, "")
+                    .handle_prompt_stream_with_tool_context(&request.prompt, &workspace_context)
                     .await?;
 
                 println!("{}", json!({ "type": "start", "mode": "llm" }));
@@ -703,7 +715,7 @@ impl Cli {
                             "content": format_tool_result(result)
                         })
                     );
-                    if let Some(applied) = apply_preview_write_with_config(result)? {
+                    if let Some(applied) = self.apply_preview_write_with_effective_config(result)? {
                         println!(
                             "{}",
                             json!({
@@ -722,9 +734,11 @@ impl Cli {
         self.print_output("headless", &message, self.prompt.as_deref());
         if let Some(prompt) = self.prompt.as_deref() {
             let request = build_headless_request(prompt, system_prompt.as_deref(), &self.image)?;
-            let config = load_config().unwrap_or_default();
+            let config = self.load_effective_config();
             let (client, model_name) = self.resolve_llm_with_config(&config)?;
+            let workspace_context = self.additional_workspace_context();
             if !request.images.is_empty() {
+                let request = request_with_prompt_context(&request, &workspace_context);
                 let output = client.generate(&model_name, &request).await?;
                 if self.output_format == "json" {
                     if let Some(usage) = output.usage.as_ref() {
@@ -739,7 +753,9 @@ impl Cli {
             }
             let policy = ToolPolicy::from_config(&config);
             let runner = AgentRunner::new(client, model_name, policy);
-            let output = runner.handle_prompt(&request.prompt).await?;
+            let output = runner
+                .handle_prompt_with_context(&request.prompt, &workspace_context)
+                .await?;
             if self.output_format == "json" {
                 if let Some(usage) = output.response.usage.as_ref() {
                     println!(
@@ -752,6 +768,37 @@ impl Cli {
             self.print_tool_result(&output);
         }
         Ok(())
+    }
+
+    fn load_effective_config(&self) -> Config {
+        let mut config = load_config().unwrap_or_default();
+        self.apply_cli_config_overrides(&mut config);
+        config
+    }
+
+    fn apply_cli_config_overrides(&self, config: &mut Config) {
+        if let Some(allowed_tools) = self.allowed_tools.as_deref() {
+            let tools = parse_allowed_tools(allowed_tools);
+            let permissions = config.permissions.get_or_insert(PermissionsConfig {
+                approval_policy: None,
+                allowed_tools: None,
+                deny: None,
+            });
+            permissions.allowed_tools = Some(tools);
+        }
+    }
+
+    fn additional_workspace_context(&self) -> String {
+        if self.add_dir.is_empty() {
+            return String::new();
+        }
+        let dirs = self
+            .add_dir
+            .iter()
+            .map(|path| format!("- {}", path.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("Additional workspace directories:\n{}", dirs)
     }
 
     fn print_output(&self, mode: &str, message: &str, prompt: Option<&str>) {
@@ -937,7 +984,7 @@ fn build_backend(
 
 impl Cli {
     async fn generate_agent_with_llm(&self, store: &AgentStore) -> Result<()> {
-        let config = load_config().unwrap_or_default();
+        let config = self.load_effective_config();
         let (client, model_name) = self.resolve_llm_with_config(&config)?;
         let request = LlmRequest::text(
             "Create a practical coding assistant agent configuration.\n\
@@ -961,7 +1008,7 @@ impl Cli {
             return;
         };
         self.print_output("tool", &format_tool_result(result), None);
-        match apply_preview_write_with_config(result) {
+        match self.apply_preview_write_with_effective_config(result) {
             Ok(Some(applied)) => {
                 self.print_output("tool", &format_tool_result(&applied), None);
             }
@@ -970,6 +1017,16 @@ impl Cli {
                 eprintln!("failed to apply write: {}", err);
             }
         }
+    }
+
+    fn apply_preview_write_with_effective_config(
+        &self,
+        result: &ToolResult,
+    ) -> Result<Option<ToolResult>> {
+        let config = self.load_effective_config();
+        let policy = ToolPolicy::from_config(&config);
+        let executor = ToolExecutor::with_policy(policy);
+        apply_preview_write(&executor, result)
     }
 }
 
@@ -996,13 +1053,6 @@ fn apply_preview_write(executor: &ToolExecutor, result: &ToolResult) -> Result<O
         content: content.clone(),
     })?;
     Ok(Some(applied))
-}
-
-fn apply_preview_write_with_config(result: &ToolResult) -> Result<Option<ToolResult>> {
-    let config = load_config().unwrap_or_default();
-    let policy = ToolPolicy::from_config(&config);
-    let executor = ToolExecutor::with_policy(policy);
-    apply_preview_write(&executor, result)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1153,6 +1203,43 @@ fn build_headless_request(
     Ok(LlmRequest { prompt, images })
 }
 
+fn request_with_prompt_context(request: &LlmRequest, context: &str) -> LlmRequest {
+    if context.trim().is_empty() {
+        return request.clone();
+    }
+    LlmRequest {
+        prompt: format!(
+            "Conversation context:\n{}\n\nUser request:\n{}",
+            context, request.prompt
+        ),
+        images: request.images.clone(),
+    }
+}
+
+fn parse_allowed_tools(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_add_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let cwd = std::env::current_dir()?;
+    let mut normalized = Vec::new();
+    for path in paths {
+        let resolved = if path.is_absolute() {
+            path.clone()
+        } else {
+            cwd.join(path)
+        };
+        if !normalized.iter().any(|existing| existing == &resolved) {
+            normalized.push(resolved);
+        }
+    }
+    Ok(normalized)
+}
+
 fn load_llm_image(path: &Path) -> Result<LlmImage> {
     let media_type = image_media_type(path)
         .ok_or_else(|| anyhow!("unsupported image type: {}", path.display()))?;
@@ -1231,6 +1318,66 @@ mod tests {
     }
 
     #[test]
+    fn parses_allowed_tools_csv() {
+        assert_eq!(
+            parse_allowed_tools("Read, Write, Shell(cargo *)"),
+            vec![
+                "Read".to_string(),
+                "Write".to_string(),
+                "Shell(cargo *)".to_string()
+            ]
+        );
+        assert!(parse_allowed_tools(" , ").is_empty());
+    }
+
+    #[test]
+    fn applies_allowed_tools_override_to_config() {
+        let cli = test_cli_with_allowed_tools("Read,Write");
+        let mut config = Config::default();
+
+        cli.apply_cli_config_overrides(&mut config);
+
+        assert_eq!(
+            config.permissions.and_then(|p| p.allowed_tools),
+            Some(vec!["Read".to_string(), "Write".to_string()])
+        );
+    }
+
+    #[test]
+    fn normalizes_add_dirs_relative_to_current_dir() {
+        let root = unique_temp_dir("add-dir-normalize");
+        let expected_root = root.canonicalize().unwrap();
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+
+        let dirs = normalize_add_dirs(&[PathBuf::from("src"), PathBuf::from("src")]).unwrap();
+
+        std::env::set_current_dir(original).unwrap();
+        assert_eq!(dirs, vec![expected_root.join("src")]);
+    }
+
+    #[test]
+    fn adds_workspace_context_to_image_request_prompt() {
+        let request = LlmRequest {
+            prompt: "describe".to_string(),
+            images: vec![LlmImage {
+                media_type: "image/png".to_string(),
+                data_base64: "AA==".to_string(),
+            }],
+        };
+
+        let with_context =
+            request_with_prompt_context(&request, "Additional workspace directories:\n- /tmp/a");
+
+        assert!(with_context.prompt.contains("Conversation context:"));
+        assert!(with_context
+            .prompt
+            .contains("Additional workspace directories:"));
+        assert!(with_context.prompt.contains("User request:\ndescribe"));
+        assert_eq!(with_context.images.len(), 1);
+    }
+
+    #[test]
     fn saves_loads_and_clears_auth_session_file() {
         let root = unique_temp_dir("auth-session");
         let path = auth_session_path_from_home(&root);
@@ -1292,5 +1439,25 @@ mod tests {
         let agent = fallback_generated_agent();
         assert!(agent.name.starts_with("generated-"));
         assert!(!agent.prompt.is_empty());
+    }
+
+    fn test_cli_with_allowed_tools(allowed_tools: &str) -> Cli {
+        Cli {
+            prompt: None,
+            model: None,
+            image: Vec::new(),
+            ollama_base_url: None,
+            allowed_tools: Some(allowed_tools.to_string()),
+            system_prompt: None,
+            system_prompt_file: None,
+            append_system_prompt: None,
+            append_system_prompt_file: None,
+            output_format: "text".to_string(),
+            agent: None,
+            cwd: None,
+            add_dir: Vec::new(),
+            verbose: false,
+            command: None,
+        }
     }
 }

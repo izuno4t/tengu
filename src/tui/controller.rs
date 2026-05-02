@@ -37,6 +37,7 @@ pub struct App {
     pending_local_action: Option<PendingLocalAction>,
     pending_tool_approval: Option<ToolApprovalRequest>,
     restored_tool_approval: Option<RestoredToolApproval>,
+    initial_added_dirs: Vec<PathBuf>,
 }
 
 impl App {
@@ -71,7 +72,13 @@ impl App {
             pending_local_action: None,
             pending_tool_approval: None,
             restored_tool_approval: None,
+            initial_added_dirs: Vec::new(),
         }
+    }
+
+    pub fn set_initial_added_dirs(&mut self, paths: Vec<PathBuf>) {
+        self.initial_added_dirs = paths.clone();
+        self.state.set_added_dirs(paths);
     }
 
     pub fn run(&mut self) -> anyhow::Result<()> {
@@ -364,6 +371,7 @@ impl App {
                     }
                     self.cancel_pending_approval();
                     self.state.reset_session_view();
+                    self.state.set_added_dirs(self.initial_added_dirs.clone());
                     if new_session {
                         self.current_session =
                             create_persisted_session(self.session_store.as_ref());

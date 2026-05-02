@@ -237,6 +237,16 @@ impl AppState {
     pub fn build_context(&self, max_turns: usize) -> String {
         let start = self.conversation.len().saturating_sub(max_turns);
         let mut parts = Vec::new();
+        if !self.added_dirs.is_empty() {
+            parts.push(format!(
+                "追加ワークスペースディレクトリ:\n{}",
+                self.added_dirs
+                    .iter()
+                    .map(|path| format!("- {}", path.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
         for turn in self.conversation.iter().skip(start) {
             let role = match turn.role {
                 ConversationRole::User => "ユーザー",
@@ -375,6 +385,10 @@ impl AppState {
 
     pub fn set_pending_images(&mut self, images: Vec<LlmImage>) {
         self.pending_images = images;
+    }
+
+    pub fn set_added_dirs(&mut self, paths: Vec<PathBuf>) {
+        self.added_dirs = paths;
     }
 
     pub fn take_pending_images(&mut self) -> Vec<LlmImage> {

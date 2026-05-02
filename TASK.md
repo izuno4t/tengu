@@ -46,27 +46,46 @@
 | ---- | ------ | ------- | --------- |
 | ALT-001 | ✅ | 継続実装で進める判断と主要導線の定義を確定する | - |
 | ALT-002 | ✅ | Claude Code 基準から外れた cloud 導線を除去する | ALT-001 |
-| ALT-003 | completed | レビュー導線（CLI `review` / TUI `/review`）を製品相当に仕上げる | ALT-001 |
+| ALT-003 | ✅ | レビュー導線（CLI `review` / TUI `/review`）を製品相当に仕上げる | ALT-001 |
 
 ### Phase B: Feature Completion
 
 | ID | Status | Summary | DependsOn |
 | ---- | ------ | ------- | --------- |
-| ALT-004 | completed | 画像入力導線を実装する | ALT-003 |
-| ALT-005 | completed | エージェント管理コマンドを実体化する | ALT-003 |
-| ALT-006 | completed | Auth コマンドを実体化する | ALT-003 |
+| ALT-004 | ✅ | 画像入力導線を実装する | ALT-003 |
+| ALT-005 | ✅ | エージェント管理コマンドを実体化する | ALT-003 |
+| ALT-006 | ✅ | Auth コマンドを実体化する | ALT-003 |
 
 ### Phase C: Hardening
 
 | ID | Status | Summary | DependsOn |
 | ---- | ------ | ------- | --------- |
-| ALT-007 | completed | 主要導線の統合テストを追加する | ALT-003,ALT-004,ALT-005,ALT-006 |
-| ALT-008 | completed | README / REQUIREMENTS / TASK の整合を最終化する | ALT-007 |
-| ALT-009 | completed | `/config` を実用コマンド化し、ローカル設定の確認・更新を TUI から行えるようにする | ALT-008 |
-| ALT-010 | completed | プロバイダ別 usage を取得・記録し、`/usage` と `stream-json` に反映する | ALT-009 |
-| ALT-011 | completed | `usage` イベント仕様と解析テストを追加し、文書と実装を整合させる | ALT-010 |
-| ALT-012 | completed | `json` / `stream-json` の usage 出力契約を文書化し、補助テストを追加する | ALT-011 |
-| ALT-013 | completed | `/usage export <path>` を追加し、usage 集計を JSON で書き出せるようにする | ALT-012 |
+| ALT-007 | ✅ | 主要導線の統合テストを追加する | ALT-003,ALT-004,ALT-005,ALT-006 |
+| ALT-008 | ✅ | README / REQUIREMENTS / TASK の整合を最終化する | ALT-007 |
+| ALT-009 | ✅ | `/config` を実用コマンド化し、ローカル設定の確認・更新を TUI から行えるようにする | ALT-008 |
+| ALT-010 | ✅ | プロバイダ別 usage を取得・記録し、`/usage` と `stream-json` に反映する | ALT-009 |
+| ALT-011 | ✅ | `usage` イベント仕様と解析テストを追加し、文書と実装を整合させる | ALT-010 |
+| ALT-012 | ✅ | `json` / `stream-json` の usage 出力契約を文書化し、補助テストを追加する | ALT-011 |
+| ALT-013 | ✅ | `/usage export <path>` を追加し、usage 集計を JSON で書き出せるようにする | ALT-012 |
+
+### Phase D: Requirements Gap Closure
+
+| ID | Status | Summary | DependsOn |
+| ---- | ------ | ------- | --------- |
+| ALT-014 | ✅ | 要求差分マトリクスを現行コード基準で更新する | ALT-013 |
+| ALT-015 | ✅ | CLI引数の未接続項目を実行経路へ反映する | ALT-014 |
+| ALT-016 | ⏳ | WebFetchとWebSearchツールを追加する | ALT-014 |
+| ALT-017 | ⏳ | パーミッション仕様をregexと否定対応に拡張する | ALT-015 |
+| ALT-018 | ⏳ | フック設定とpre/post実行基盤を実装する | ALT-017 |
+| ALT-019 | ⏳ | 設定スキーマを要求項目まで拡張する | ALT-014 |
+| ALT-020 | ⏳ | AGENT.md/TENGU.mdの互換方針を実装する | ALT-019 |
+| ALT-021 | ⏳ | セッション再開と一覧操作の対話導線を補強する | ALT-014 |
+| ALT-022 | ⏳ | Git/PR/レビュー導線の統合テストを追加する | ALT-021 |
+| ALT-023 | ⏳ | セキュリティ既定拒否と監査ログを実装する | ALT-017,ALT-018 |
+| ALT-024 | ⏳ | 性能計測コマンドと基準値検証を追加する | ALT-022 |
+| ALT-025 | ⏳ | 必須ドキュメント三点を作成する | ALT-016,ALT-023 |
+| ALT-026 | ⏳ | カバレッジ計測と不足テストを追加する | ALT-022,ALT-024 |
+| ALT-027 | ⏳ | REQUIREMENTS/TASK/READMEの完了判定を再整合する | ALT-025,ALT-026 |
 
 ## Residual Backlog
 
