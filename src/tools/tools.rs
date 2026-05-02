@@ -1,13 +1,14 @@
 // Tools module
 // ビルトインツール: Read, Edit, Write, Bash, Grep, Glob, WebFetch, WebSearch
 
-use crate::config::{Config, PermissionsConfig, SandboxConfig};
+use crate::config::{Config, HookConfig, HooksConfig, PermissionsConfig, SandboxConfig};
 use crate::llm::ToolDefinition;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 const BASH_TIMEOUT_SECS: u64 = 120;
@@ -90,7 +91,7 @@ pub fn estimate_tokens(text: &str) -> usize {
     }
     let cjk_count = text.chars().filter(|c| is_cjk_char(*c)).count();
     let non_cjk_count = text.chars().count() - cjk_count;
-    cjk_count + (non_cjk_count + 3) / 4 // round up division
+    cjk_count + non_cjk_count.div_ceil(4)
 }
 
 fn is_cjk_char(ch: char) -> bool {
@@ -220,6 +221,7 @@ impl ToolResult {
 pub struct ToolPolicy {
     permissions: Option<PermissionsConfig>,
     sandbox: Option<SandboxConfig>,
+    hooks: Option<HooksConfig>,
     workspace_root: PathBuf,
     approval_override: Arc<Mutex<ApprovalOverride>>,
 }
@@ -230,6 +232,7 @@ impl Default for ToolPolicy {
         Self {
             permissions: None,
             sandbox: None,
+            hooks: None,
             workspace_root,
             approval_override: Arc::new(Mutex::new(ApprovalOverride::None)),
         }
@@ -242,6 +245,7 @@ impl ToolPolicy {
         Self {
             permissions: config.permissions.clone(),
             sandbox: config.sandbox.clone(),
+            hooks: config.hooks.clone(),
             workspace_root,
             approval_override: Arc::new(Mutex::new(ApprovalOverride::None)),
         }
@@ -257,6 +261,7 @@ impl ToolPolicy {
                 deny: None,
             }),
             sandbox: None,
+            hooks: None,
             workspace_root,
             approval_override: Arc::new(Mutex::new(ApprovalOverride::None)),
         }
@@ -327,19 +332,23 @@ impl ToolPolicy {
         }
 
         if let Some(deny) = &permissions.deny {
-            for rule in deny {
-                if rule_matches_tool(rule, input, Some(&self.workspace_root)) {
-                    return Err(anyhow!("permission denied by rule: {}", rule));
-                }
+            if matches!(
+                permission_rules_match(deny, input, Some(&self.workspace_root)),
+                Some(PermissionRuleDecision::Include)
+            ) {
+                return Err(anyhow!(
+                    "permission denied by rule for tool: {}",
+                    tool_name(input)
+                ));
             }
         }
 
         if let Some(allowed) = &permissions.allowed_tools {
-            if !allowed
-                .iter()
-                .any(|rule| rule_matches_tool(rule, input, Some(&self.workspace_root)))
-            {
-                return Err(anyhow!("tool not allowed: {}", tool_name(input)));
+            match permission_rules_match(allowed, input, Some(&self.workspace_root)) {
+                Some(PermissionRuleDecision::Include) => {}
+                Some(PermissionRuleDecision::Exclude) | None => {
+                    return Err(anyhow!("tool not allowed: {}", tool_name(input)));
+                }
             }
         }
 
@@ -527,6 +536,17 @@ impl ToolExecutor {
 
     pub fn execute(&self, input: ToolInput) -> Result<ToolResult> {
         self.policy.check(&input)?;
+        self.run_hooks(&self.pre_tool_hooks(), &input, None)?;
+        let result = self.execute_checked(input.clone());
+        let output = match &result {
+            Ok(result) => result.to_string_lossy(),
+            Err(err) => format!("Error: {}", err),
+        };
+        self.run_hooks(&self.post_tool_hooks(), &input, Some(&output))?;
+        result
+    }
+
+    fn execute_checked(&self, input: ToolInput) -> Result<ToolResult> {
         match input {
             ToolInput::Read {
                 path,
@@ -874,6 +894,116 @@ impl ToolExecutor {
                 "ParallelAgents tool must be executed in async agent loop context".to_string(),
             )),
         }
+    }
+
+    fn pre_tool_hooks(&self) -> Vec<HookConfig> {
+        self.policy
+            .hooks
+            .as_ref()
+            .map(|hooks| hooks.pre_tool_use.clone())
+            .unwrap_or_default()
+    }
+
+    fn post_tool_hooks(&self) -> Vec<HookConfig> {
+        self.policy
+            .hooks
+            .as_ref()
+            .map(|hooks| hooks.post_tool_use.clone())
+            .unwrap_or_default()
+    }
+
+    fn run_hooks(
+        &self,
+        hooks: &[HookConfig],
+        input: &ToolInput,
+        output: Option<&str>,
+    ) -> Result<()> {
+        for hook in hooks {
+            if !hook_matches_input(hook, input, Some(&self.policy.workspace_root)) {
+                continue;
+            }
+            if let Err(err) = self.run_hook(hook, input, output) {
+                match hook_on_error(hook) {
+                    HookOnError::Ignore => {}
+                    HookOnError::Warn => eprintln!("hook warning: {}", err),
+                    HookOnError::Fail => return Err(err),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn run_hook(&self, hook: &HookConfig, input: &ToolInput, output: Option<&str>) -> Result<()> {
+        if hook.command.trim().is_empty() {
+            return Ok(());
+        }
+        let input_json = tool_input_json(input);
+        let input_text = serde_json::to_string(&input_json)?;
+        let file = hook_file_env(input, &self.policy.workspace_root);
+        let tool = tool_name(input);
+        let output = output.unwrap_or("");
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&hook.command)
+            .current_dir(&self.policy.workspace_root)
+            .envs(build_clean_env())
+            .env("file", &file)
+            .env("tool", tool)
+            .env("input", &input_text)
+            .env("output", output)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("failed to spawn hook '{}': {}", hook.command, e))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(input_text.as_bytes())
+                .map_err(|e| anyhow!("failed to write hook stdin: {}", e))?;
+        }
+
+        let timeout_ms = hook.timeout_ms.unwrap_or(30_000);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        return Err(anyhow!(
+                            "hook timed out after {}ms: {}",
+                            timeout_ms,
+                            hook.command
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => return Err(anyhow!("error waiting for hook: {}", e)),
+            }
+        }
+
+        let result = child
+            .wait_with_output()
+            .map_err(|e| anyhow!("failed to collect hook output: {}", e))?;
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            let detail = if !stderr.trim().is_empty() {
+                stderr.trim()
+            } else {
+                stdout.trim()
+            };
+            return Err(anyhow!(
+                "hook failed (exit code: {}){}{}",
+                result.status.code().unwrap_or(-1),
+                if detail.is_empty() { "" } else { ": " },
+                detail
+            ));
+        }
+
+        Ok(())
     }
 
     /// Execute a tool from JSON input (used by the agentic loop).
@@ -1365,16 +1495,57 @@ fn resolve_path(root: &Path, path: &Path) -> PathBuf {
 fn path_matches_any(path: &str, rel_path: Option<&str>, rules: &[String]) -> bool {
     for rule in rules {
         let rule = rule.trim();
-        if wildcard_match(rule, path) {
+        if pattern_matches_target(rule, path) {
             return true;
         }
         if let Some(rel) = rel_path {
-            if wildcard_match(rule, rel) {
+            if pattern_matches_target(rule, rel) {
                 return true;
             }
         }
     }
     false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionRuleDecision {
+    Include,
+    Exclude,
+}
+
+fn permission_rules_match(
+    rules: &[String],
+    input: &ToolInput,
+    root: Option<&Path>,
+) -> Option<PermissionRuleDecision> {
+    let mut matched = None;
+    for rule in rules {
+        if let Some(decision) = permission_rule_matches_tool(rule, input, root) {
+            if decision == PermissionRuleDecision::Exclude {
+                return Some(decision);
+            }
+            matched = Some(decision);
+        }
+    }
+    matched
+}
+
+fn permission_rule_matches_tool(
+    rule: &str,
+    input: &ToolInput,
+    root: Option<&Path>,
+) -> Option<PermissionRuleDecision> {
+    let rule = rule.trim();
+    if rule.is_empty() {
+        return None;
+    }
+    let (decision, rule) = if let Some(stripped) = rule.strip_prefix('!') {
+        (PermissionRuleDecision::Exclude, stripped.trim())
+    } else {
+        (PermissionRuleDecision::Include, rule)
+    };
+
+    rule_matches_tool(rule, input, root).then_some(decision)
 }
 
 fn rule_matches_tool(rule: &str, input: &ToolInput, root: Option<&Path>) -> bool {
@@ -1409,7 +1580,9 @@ fn rule_matches_tool(rule: &str, input: &ToolInput, root: Option<&Path>) -> bool
     };
 
     let targets = tool_match_targets(input, root);
-    targets.iter().any(|target| wildcard_match(pattern, target))
+    targets
+        .iter()
+        .any(|target| pattern_matches_target(pattern, target))
 }
 
 fn tool_match_targets(input: &ToolInput, root: Option<&Path>) -> Vec<String> {
@@ -1696,6 +1869,131 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     }
 
     p_idx == p.len()
+}
+
+fn pattern_matches_target(pattern: &str, target: &str) -> bool {
+    if wildcard_match(pattern, target) {
+        return true;
+    }
+    if !looks_like_regex(pattern) {
+        return false;
+    }
+    regex::Regex::new(pattern)
+        .map(|re| re.is_match(target))
+        .unwrap_or(false)
+}
+
+fn looks_like_regex(pattern: &str) -> bool {
+    pattern.chars().any(|ch| {
+        matches!(
+            ch,
+            '(' | ')' | '|' | '[' | ']' | '+' | '{' | '}' | '^' | '$' | '\\'
+        )
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookOnError {
+    Ignore,
+    Warn,
+    Fail,
+}
+
+fn hook_on_error(hook: &HookConfig) -> HookOnError {
+    match hook
+        .on_error
+        .as_deref()
+        .unwrap_or("fail")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "ignore" => HookOnError::Ignore,
+        "warn" => HookOnError::Warn,
+        _ => HookOnError::Fail,
+    }
+}
+
+fn hook_matches_input(hook: &HookConfig, input: &ToolInput, root: Option<&Path>) -> bool {
+    hook.matcher
+        .as_deref()
+        .map(|matcher| rule_matches_tool(matcher, input, root))
+        .unwrap_or(true)
+}
+
+fn hook_file_env(input: &ToolInput, root: &Path) -> String {
+    tool_paths(input)
+        .into_iter()
+        .next()
+        .map(|path| resolve_path(root, &path).to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+fn tool_input_json(input: &ToolInput) -> Value {
+    match input {
+        ToolInput::Read {
+            path,
+            offset,
+            limit,
+        } => serde_json::json!({
+            "path": path,
+            "offset": offset,
+            "limit": limit,
+        }),
+        ToolInput::Edit {
+            path,
+            old_string,
+            new_string,
+        } => serde_json::json!({
+            "path": path,
+            "old_string": old_string,
+            "new_string": new_string,
+        }),
+        ToolInput::Write { path, content } => serde_json::json!({
+            "path": path,
+            "content": content,
+        }),
+        ToolInput::Shell { command, args } => serde_json::json!({
+            "command": command,
+            "args": args,
+        }),
+        ToolInput::Bash { command, timeout } => serde_json::json!({
+            "command": command,
+            "timeout": timeout,
+        }),
+        ToolInput::Grep { pattern, paths } => serde_json::json!({
+            "pattern": pattern,
+            "paths": paths,
+        }),
+        ToolInput::Glob { pattern, root } => serde_json::json!({
+            "pattern": pattern,
+            "root": root,
+        }),
+        ToolInput::ListFiles { path } => serde_json::json!({
+            "path": path,
+        }),
+        ToolInput::WebFetch {
+            url,
+            method,
+            headers,
+            body,
+        } => serde_json::json!({
+            "url": url,
+            "method": method,
+            "headers": headers,
+            "body": body,
+        }),
+        ToolInput::WebSearch { query } => serde_json::json!({
+            "query": query,
+        }),
+        ToolInput::SubAgent { prompt, max_turns } => serde_json::json!({
+            "prompt": prompt,
+            "max_turns": max_turns,
+        }),
+        ToolInput::ParallelAgents { tasks } => serde_json::json!({
+            "tasks": tasks,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -2655,6 +2953,200 @@ mod tests {
                 content: "data".to_string(),
             })
             .is_err());
+    }
+
+    #[test]
+    fn policy_allowed_tools_support_regex_patterns() {
+        let policy = ToolPolicy {
+            permissions: Some(PermissionsConfig {
+                approval_policy: None,
+                allowed_tools: Some(vec!["Bash(git (status|log|diff))".to_string()]),
+                deny: None,
+            }),
+            ..ToolPolicy::default()
+        };
+
+        assert!(policy
+            .check(&ToolInput::Bash {
+                command: "git status".to_string(),
+                timeout: None,
+            })
+            .is_ok());
+        assert!(policy
+            .check(&ToolInput::Bash {
+                command: "git push".to_string(),
+                timeout: None,
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn policy_allowed_tools_support_negated_exclusions() {
+        let policy = ToolPolicy {
+            permissions: Some(PermissionsConfig {
+                approval_policy: None,
+                allowed_tools: Some(vec!["Read".to_string(), "!Read(.env*)".to_string()]),
+                deny: None,
+            }),
+            ..ToolPolicy::default()
+        };
+
+        assert!(policy
+            .check(&ToolInput::Read {
+                path: PathBuf::from("README.md"),
+                offset: None,
+                limit: None,
+            })
+            .is_ok());
+        assert!(policy
+            .check(&ToolInput::Read {
+                path: PathBuf::from(".env.local"),
+                offset: None,
+                limit: None,
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn policy_deny_supports_negated_exceptions() {
+        let policy = ToolPolicy {
+            permissions: Some(PermissionsConfig {
+                approval_policy: None,
+                allowed_tools: None,
+                deny: Some(vec!["Read(*)".to_string(), "!Read(public/**)".to_string()]),
+            }),
+            ..ToolPolicy::default()
+        };
+
+        assert!(policy
+            .check(&ToolInput::Read {
+                path: PathBuf::from("private/file.txt"),
+                offset: None,
+                limit: None,
+            })
+            .is_err());
+        assert!(policy
+            .check(&ToolInput::Read {
+                path: PathBuf::from("public/file.txt"),
+                offset: None,
+                limit: None,
+            })
+            .is_ok());
+    }
+
+    #[test]
+    fn pre_tool_hook_runs_with_input_on_stdin() {
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("pre-hook.json");
+        let policy = ToolPolicy {
+            hooks: Some(HooksConfig {
+                pre_tool_use: vec![HookConfig {
+                    matcher: Some("Write(*)".to_string()),
+                    command: format!("cat > {}", marker.display()),
+                    timeout_ms: Some(1000),
+                    cache_ttl_seconds: None,
+                    on_error: Some("fail".to_string()),
+                }],
+                ..HooksConfig::default()
+            }),
+            workspace_root: dir.path().to_path_buf(),
+            ..ToolPolicy::default()
+        };
+        let exec = ToolExecutor::with_policy(policy);
+
+        exec.execute(ToolInput::Write {
+            path: dir.path().join("out.txt"),
+            content: "hello".to_string(),
+        })
+        .unwrap();
+
+        let hook_input = fs::read_to_string(marker).unwrap();
+        assert!(hook_input.contains("\"content\":\"hello\""));
+    }
+
+    #[test]
+    fn post_tool_hook_runs_with_file_tool_and_output_env() {
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("post-hook.txt");
+        let policy = ToolPolicy {
+            hooks: Some(HooksConfig {
+                post_tool_use: vec![HookConfig {
+                    matcher: Some("Write(*.txt)".to_string()),
+                    command: format!(
+                        "printf '%s|%s|%s' \"$tool\" \"$file\" \"$output\" > {}",
+                        marker.display()
+                    ),
+                    timeout_ms: Some(1000),
+                    cache_ttl_seconds: None,
+                    on_error: Some("fail".to_string()),
+                }],
+                ..HooksConfig::default()
+            }),
+            workspace_root: dir.path().to_path_buf(),
+            ..ToolPolicy::default()
+        };
+        let exec = ToolExecutor::with_policy(policy);
+
+        let path = dir.path().join("hooked.txt");
+        exec.execute(ToolInput::Write {
+            path: path.clone(),
+            content: "hello".to_string(),
+        })
+        .unwrap();
+
+        let hook_output = fs::read_to_string(marker).unwrap();
+        assert!(hook_output.contains("Write|"));
+        assert!(hook_output.contains(&path.display().to_string()));
+        assert!(hook_output.contains("Successfully wrote"));
+    }
+
+    #[test]
+    fn hook_failure_respects_on_error() {
+        let fail_policy = ToolPolicy {
+            hooks: Some(HooksConfig {
+                pre_tool_use: vec![HookConfig {
+                    matcher: Some("Write(*)".to_string()),
+                    command: "exit 7".to_string(),
+                    timeout_ms: Some(1000),
+                    cache_ttl_seconds: None,
+                    on_error: Some("fail".to_string()),
+                }],
+                ..HooksConfig::default()
+            }),
+            ..ToolPolicy::default()
+        };
+        let fail_exec = ToolExecutor::with_policy(fail_policy);
+        assert!(fail_exec
+            .execute(ToolInput::Write {
+                path: PathBuf::from("blocked.txt"),
+                content: "blocked".to_string(),
+            })
+            .is_err());
+
+        let warn_policy = ToolPolicy {
+            hooks: Some(HooksConfig {
+                pre_tool_use: vec![HookConfig {
+                    matcher: Some("Write(*)".to_string()),
+                    command: "exit 7".to_string(),
+                    timeout_ms: Some(1000),
+                    cache_ttl_seconds: None,
+                    on_error: Some("ignore".to_string()),
+                }],
+                ..HooksConfig::default()
+            }),
+            ..ToolPolicy::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let warn_exec = ToolExecutor::with_policy(ToolPolicy {
+            workspace_root: dir.path().to_path_buf(),
+            ..warn_policy
+        });
+        assert!(warn_exec
+            .execute(ToolInput::Write {
+                path: dir.path().join("allowed.txt"),
+                content: "allowed".to_string(),
+            })
+            .is_ok());
     }
 
     #[test]

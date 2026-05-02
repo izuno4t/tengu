@@ -163,7 +163,7 @@ impl ModelRouter {
 
         // Try primary provider first
         let primary_health = health.get(&self.primary_provider);
-        if primary_health.map_or(true, |h| h.is_healthy()) {
+        if primary_health.is_none_or(|h| h.is_healthy()) {
             return (
                 tier_models(tier, self.primary_provider).to_string(),
                 self.primary_provider,
@@ -182,7 +182,7 @@ impl ModelRouter {
                 continue;
             }
             let provider_health = health.get(&provider);
-            if provider_health.map_or(true, |h| h.is_healthy()) {
+            if provider_health.is_none_or(|h| h.is_healthy()) {
                 return (tier_models(tier, provider).to_string(), provider);
             }
         }
@@ -197,19 +197,13 @@ impl ModelRouter {
     /// Record a provider failure.
     pub fn record_failure(&self, provider: LlmProvider) {
         let mut health = self.health.lock().unwrap_or_else(|e| e.into_inner());
-        health
-            .entry(provider)
-            .or_insert_with(ProviderHealth::new)
-            .record_failure();
+        health.entry(provider).or_default().record_failure();
     }
 
     /// Record a provider success.
     pub fn record_success(&self, provider: LlmProvider) {
         let mut health = self.health.lock().unwrap_or_else(|e| e.into_inner());
-        health
-            .entry(provider)
-            .or_insert_with(ProviderHealth::new)
-            .record_success();
+        health.entry(provider).or_default().record_success();
     }
 }
 

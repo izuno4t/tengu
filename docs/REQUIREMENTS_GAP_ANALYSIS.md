@@ -26,7 +26,7 @@
 - TUI 起動、対話、ストリーミング表示、基本スラッシュコマンドは実装済み。
 - Headless `-p` と `json` / `stream-json` 出力は実装済み。
 - Anthropic / OpenAI / Google / Ollama の LLM バックエンド抽象は存在する。
-- Read / Write / Shell / Grep / Glob のローカルツールは実装済み。
+- Read / Write / Shell / Grep / Glob / WebFetch / WebSearch のツールは実装済み。
 - MCP の STDIO / HTTP ツール検出導線は存在する。
 - カスタムコマンド、カスタムエージェント、レビュー導線、画像入力の基本は実装済み。
 - `cargo test` は 44 件成功している。
@@ -35,12 +35,12 @@
 
 ### 必須ツール
 
-`docs/REQUIREMENTS.md` は `WebFetch` と `WebSearch` を必須ツールとしているが、現行の `Tool` / `ToolInput` は `Read`, `Write`, `Shell`, `Grep`, `Glob` のみである。
+`docs/REQUIREMENTS.md` が必須ツールとしている `WebFetch` と `WebSearch` は、`Tool` / `ToolInput`、CLI `tool` サブコマンド、LLM向けツール定義、JSON実行経路へ追加済みである。
 
 影響:
 
-- URL取得やWeb検索を前提にした要求をローカルツールとして満たせない。
-- パーミッション、監査ログ、MCP連携と同じツール実行基盤でWeb系操作を扱えない。
+- URL取得とWeb検索をツール実行基盤で扱える。
+- WebFetch は SSRF 対策として private / local アドレスを拒否する。
 
 ### CLI引数の未接続
 
@@ -53,25 +53,25 @@
 
 ### パーミッション仕様
 
-要求では Glob、正規表現、否定パターンをサポートするが、現行実装は単純なワイルドカード照合中心である。
+要求で求められている Glob、正規表現、否定パターンは、`allowed_tools` / `deny` のツールルール照合へ追加済みである。
 
 影響:
 
-- `Bash(git (status|log|diff))` のような正規表現ルールを正しく扱えない。
-- `!Write(node_modules/**)` のような否定パターンを仕様どおり扱えない。
+- `Bash(git (status|log|diff))` のような正規表現ルールを扱える。
+- `!Read(.env*)` や `!Read(public/**)` のような否定ルールを、許可リストの除外または拒否リストの例外として扱える。
 
 ### フック機構
 
-要求では `agentSpawn`, `userPromptSubmit`, `preToolUse`, `postToolUse` と、環境変数・タイムアウト・エラー処理を定義している。現行実装にはフック設定構造、実行器、ツール実行前後の連携がない。
+要求で定義されている `agentSpawn`, `userPromptSubmit`, `preToolUse`, `postToolUse` の設定構造は読み込み可能である。`preToolUse` / `postToolUse` は `ToolExecutor` の実行前後に統合済みで、matcher、環境変数、stdin入力、timeout、`on_error` を扱える。
 
 影響:
 
-- 自動フォーマット、監査、事前検査などのClaude Code基準の自動化ポイントを満たせない。
-- 監査ログ要件の実装先も不足する。
+- Write後の自動フォーマットやツール実行前の検査を設定から実行できる。
+- 監査ログ要件は `postToolUse` で出力先を設定できるが、専用監査ログ形式は後続のセキュリティ既定拒否タスクで扱う。
 
 ### 設定スキーマ
 
-現行 `Config` は `model`, `permissions`, `sandbox` が中心で、要求にある `temperature`, `reasoning_effort`, `cache_prompts`, provider別設定、hooks、auth詳細などを網羅していない。
+現行 `Config` は `model`, `permissions`, `sandbox`, `hooks` が中心で、要求にある `temperature`, `reasoning_effort`, `cache_prompts`, provider別設定、auth詳細などを網羅していない。
 
 影響:
 
@@ -135,10 +135,9 @@ APIキーは環境変数ベースで扱うが、暗号化保存、`.env` 読み�
 
 1. まず要求差分マトリクスを現行コード基準で更新し、完了扱いと未達扱いを明確にする。
 2. CLI引数、パーミッション、設定スキーマ、システムプロンプト互換を先に整え、既存導線の仕様乖離を減らす。
-3. WebFetch / WebSearch とフック機構を追加し、ツール実行基盤の不足を埋める。
-4. セッション再開、ファイル参照補完、Git/レビューE2Eを補強する。
-5. セキュリティ、監査ログ、性能計測、カバレッジを整備する。
-6. 必須ドキュメントを作成し、`README.md`, `TASK.md`, `docs/REQUIREMENTS.md` の完了表現を再整合する。
+3. セッション再開、ファイル参照補完、Git/レビューE2Eを補強する。
+4. セキュリティ、監査ログ、性能計測、カバレッジを整備する。
+5. 必須ドキュメントを作成し、`README.md`, `TASK.md`, `docs/REQUIREMENTS.md` の完了表現を再整合する。
 
 ## 検証結果
 

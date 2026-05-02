@@ -8,7 +8,7 @@ Tengu is a flexible, multi-LLM coding agent that integrates with MCP servers, su
 
 - **Autonomous Agent Loop**: LLM native tool_use API による自律的ツール実行ループ（LLM → ToolUse → Result → LLM...）
 - **Multi-LLM Support**: Anthropic, OpenAI, Google, Ollama — 全プロバイダーで tool_use / function calling 対応
-- **6 Built-in Tools**: Read, Edit, Write, Bash, Grep, Glob — コーディングに必要なツールを内蔵
+- **8 Built-in Tools**: Read, Edit, Write, Bash, Grep, Glob, WebFetch, WebSearch — コーディングと調査に必要なツールを内蔵
 - **MCP Integration**: STDIO/HTTP トランスポートで外部ツールサーバーと連携
 - **Permission Control**: ツール別権限制御、サンドボックス、glob パターンマッチング
 - **Interactive TUI**: ストリーミング表示、Markdownレンダリング、ツール実行ログ表示

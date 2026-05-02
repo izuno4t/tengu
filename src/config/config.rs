@@ -12,6 +12,8 @@ pub struct Config {
     pub permissions: Option<PermissionsConfig>,
     #[serde(default)]
     pub sandbox: Option<SandboxConfig>,
+    #[serde(default)]
+    pub hooks: Option<HooksConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -38,6 +40,28 @@ pub struct SandboxConfig {
     pub mode: Option<String>,
     pub allowed_paths: Option<Vec<String>>,
     pub blocked_paths: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct HooksConfig {
+    #[serde(default)]
+    pub agent_spawn: Vec<HookConfig>,
+    #[serde(default)]
+    pub user_prompt_submit: Vec<HookConfig>,
+    #[serde(default)]
+    pub pre_tool_use: Vec<HookConfig>,
+    #[serde(default)]
+    pub post_tool_use: Vec<HookConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct HookConfig {
+    pub command: String,
+    pub matcher: Option<String>,
+    pub timeout_ms: Option<u64>,
+    pub cache_ttl_seconds: Option<u64>,
+    pub on_error: Option<String>,
 }
 
 impl Default for ModelConfig {
@@ -101,6 +125,29 @@ impl Config {
                 for item in blocked_paths.iter_mut() {
                     *item = expand_env_vars_in_string(item);
                 }
+            }
+        }
+        if let Some(hooks) = &mut self.hooks {
+            hooks.expand_env_vars();
+        }
+    }
+}
+
+impl HooksConfig {
+    fn expand_env_vars(&mut self) {
+        for hook in self
+            .agent_spawn
+            .iter_mut()
+            .chain(self.user_prompt_submit.iter_mut())
+            .chain(self.pre_tool_use.iter_mut())
+            .chain(self.post_tool_use.iter_mut())
+        {
+            hook.command = expand_env_vars_in_string(&hook.command);
+            if let Some(matcher) = &hook.matcher {
+                hook.matcher = Some(expand_env_vars_in_string(matcher));
+            }
+            if let Some(on_error) = &hook.on_error {
+                hook.on_error = Some(expand_env_vars_in_string(on_error));
             }
         }
     }
@@ -191,6 +238,7 @@ mod tests {
         assert_eq!(cfg.model.provider, "anthropic");
         assert!(cfg.permissions.is_none());
         assert!(cfg.sandbox.is_none());
+        assert!(cfg.hooks.is_none());
     }
 
     #[test]
@@ -267,6 +315,41 @@ blocked_paths = ["/etc"]
         assert_eq!(sb.mode.unwrap(), "strict");
         assert_eq!(sb.allowed_paths.unwrap(), vec!["/tmp", "/home"]);
         assert_eq!(sb.blocked_paths.unwrap(), vec!["/etc"]);
+    }
+
+    #[test]
+    fn loads_config_with_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tengu.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"
+[[hooks.preToolUse]]
+matcher = "Bash(git *)"
+command = "echo $tool"
+timeout_ms = 5000
+on_error = "fail"
+
+[[hooks.postToolUse]]
+matcher = "Write(*.rs)"
+command = "cargo fmt"
+cache_ttl_seconds = 300
+"#
+        )
+        .unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        let hooks = cfg.hooks.unwrap();
+        assert_eq!(hooks.pre_tool_use.len(), 1);
+        assert_eq!(
+            hooks.pre_tool_use[0].matcher.as_deref(),
+            Some("Bash(git *)")
+        );
+        assert_eq!(hooks.pre_tool_use[0].timeout_ms, Some(5000));
+        assert_eq!(hooks.pre_tool_use[0].on_error.as_deref(), Some("fail"));
+        assert_eq!(hooks.post_tool_use.len(), 1);
+        assert_eq!(hooks.post_tool_use[0].cache_ttl_seconds, Some(300));
     }
 
     #[test]

@@ -9,9 +9,9 @@ Phase G は `docs/REQUIREMENTS.md` に対する不足を埋める。
 ## Phase A: メッセージモデルの刷新（G-002, G-003） ✅
 
 | ID | Status | Task | Details |
-|----|--------|------|---------|
+| ---- | ------ | ---- | ------- |
 | T-001 | ✅ | Message 型の定義 | role(user/assistant), content blocks (Text/ToolUse/ToolResult) を定義 |
-| T-002 | ✅ | ChatRequest/ChatResponse の導入 | messages: Vec<Message> + tools: Vec<ToolDefinition> + system prompt |
+| T-002 | ✅ | ChatRequest/ChatResponse の導入 | messages: `Vec<Message>` + tools: `Vec<ToolDefinition>` + system prompt |
 | T-003 | ✅ | Anthropic バックエンドに chat メソッド追加 | tool definitions 送信、tool_use レスポンス解析 |
 | T-004 | ✅ | OpenAI バックエンドに chat メソッド追加 | tool→function calling 変換 |
 | T-005 | ✅ | Google バックエンドに chat メソッド追加 | tool→functionDeclarations 変換 |
@@ -19,7 +19,7 @@ Phase G は `docs/REQUIREMENTS.md` に対する不足を埋める。
 ## Phase B: エージェントループの再構築（G-001, G-007） ✅
 
 | ID | Status | Task | Details |
-|----|--------|------|---------|
+| ---- | ------ | ---- | ------- |
 | T-006 | ✅ | AgentRunner に run_agent_loop 実装 | LLM→ToolUse→Result→LLM... を end_turn まで繰り返す（最大50ターン） |
 | T-007 | ✅ | ToolResult を ContentBlock::ToolResult として会話に追加 | execute_from_json → (result_text, is_error) |
 | T-008 | ✅ | Write/Edit ツールで実際にファイル書き込み | execute_from_json が直接ファイルを操作する |
@@ -28,7 +28,7 @@ Phase G は `docs/REQUIREMENTS.md` に対する不足を埋める。
 ## Phase C: ツールの強化（G-004, G-005, G-006） ✅
 
 | ID | Status | Task | Details |
-|----|--------|------|---------|
+| ---- | ------ | ---- | ------- |
 | T-010 | ✅ | Edit ツールの追加 | old_string→new_string の部分置換。一意性チェック付き |
 | T-011 | ✅ | Bash ツールの強化 | sh -c 実行、stdout+stderr統合、タイムアウト、exit code返却 |
 | T-012 | ✅ | Grep の正規表現対応 | regex crate を使用。hidden/target/node_modules 自動除外 |
@@ -37,15 +37,15 @@ Phase G は `docs/REQUIREMENTS.md` に対する不足を埋める。
 ## Phase D: TUI/CLIの統合（G-008） ✅
 
 | ID | Status | Task | Details |
-|----|--------|------|---------|
+| ---- | ------ | ---- | ------- |
 | T-014 | ✅ | TUI でのエージェントループ統合 | ToolEventHandler経由でToolCall/ToolResult表示 |
 | T-015 | ✅ | CLI ヘッドレスモードでのループ統合 | run_prompt で tool_use 対応、system_prompt 反映 |
-| T-016 | ✅ | セッション履歴にメッセージ配列を保存 | Session に messages: Vec<Value> フィールド追加 |
+| T-016 | ✅ | セッション履歴にメッセージ配列を保存 | Session に messages: `Vec<Value>` フィールド追加 |
 
 ## Phase E: 品質向上 ✅
 
 | ID | Status | Task | Details |
-|----|--------|------|---------|
+| ---- | ------ | ---- | ------- |
 | T-017 | ✅ | ビルド確認・テスト | cargo build 警告ゼロ、cargo test 45テスト全通過 |
 | T-018 | ✅ | ドキュメント最終更新 | ARCHITECTURE.md 刷新、GAP_ANALYSIS.md 新規作成、README.md 更新 |
 | T-019 | ✅ | clippy / 警告解消 | 全 warning 解消済み |
@@ -55,7 +55,7 @@ Phase G は `docs/REQUIREMENTS.md` に対する不足を埋める。
 20件の critical issues を修正し、co-vibe と同等の実用レベルに引き上げる。
 
 | ID | Status | Task | Details |
-|----|--------|------|---------|
+| ---- | ------ | ---- | ------- |
 | T-020 | ✅ | TUI システムプロンプト設定 | execute_tui() で resolve_system_prompt → runner.set_system_prompt() |
 | T-021 | ✅ | デフォルトシステムプロンプト | ツール一覧・ガイドラインを含む包括的なシステムプロンプト |
 | T-022 | ✅ | ToolEventHandler 競合修正 | async タスク spawn 前に handler を設定 |
@@ -76,12 +76,12 @@ Phase G は `docs/REQUIREMENTS.md` に対する不足を埋める。
 ## Phase G: Requirements Gap Closure
 
 | ID | Status | Summary | DependsOn |
-|----|--------|---------|-----------|
+| ---- | ------ | ------- | --------- |
 | ALT-014 | ✅ | 要求差分マトリクスを現行コード基準で更新する | ALT-013 |
 | ALT-015 | ✅ | CLI引数の未接続項目を実行経路へ反映する | ALT-014 |
-| ALT-016 | 🚧 | WebFetchとWebSearchツールを追加する | ALT-014 |
-| ALT-017 | ⏳ | パーミッション仕様をregexと否定対応に拡張する | ALT-015 |
-| ALT-018 | ⏳ | フック設定とpre/post実行基盤を実装する | ALT-017 |
+| ALT-016 | ✅ | WebFetchとWebSearchツールを追加する | ALT-014 |
+| ALT-017 | ✅ | パーミッション仕様をregexと否定対応に拡張する | ALT-015 |
+| ALT-018 | ✅ | フック設定とpre/post実行基盤を実装する | ALT-017 |
 | ALT-019 | ⏳ | 設定スキーマを要求項目まで拡張する | ALT-014 |
 | ALT-020 | ⏳ | AGENT.md/TENGU.mdの互換方針を実装する | ALT-019 |
 | ALT-021 | ⏳ | セッション再開と一覧操作の対話導線を補強する | ALT-014 |
@@ -97,7 +97,7 @@ Phase G は `docs/REQUIREMENTS.md` に対する不足を埋める。
 ### Phase F 変更ファイル
 
 | ファイル | 変更内容 |
-|---------|---------|
+| -------- | -------- |
 | `src/cli.rs` | TUI system prompt設定、default_system_prompt()、stream-json agent loop化、headless tool event |
 | `src/agent/agent.rs` | conversation_messages保持、Usage event、リトライ、コンテキスト制限、max_tokens増加 |
 | `src/tools/tools.rs` | Read offset/limit、ListFiles追加、ToolInput更新 |

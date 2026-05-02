@@ -157,6 +157,7 @@ pub struct ChatResponse {
     pub usage: Option<LlmUsage>,
 }
 
+#[allow(dead_code)]
 impl ChatResponse {
     pub fn text_content(&self) -> String {
         self.content
@@ -290,6 +291,7 @@ impl LlmClient {
         self.backend.generate_stream(model, request).await
     }
 
+    #[allow(dead_code)]
     pub async fn chat(&self, model: &str, request: &ChatRequest) -> Result<ChatResponse> {
         self.backend.chat(model, request).await
     }
