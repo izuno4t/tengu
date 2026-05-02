@@ -2720,6 +2720,42 @@ fn clear_tui_auth_session() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn setup_git_repo_with_staged_change() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["init"]);
+        fs::write(dir.path().join("notes.txt"), "before\n").unwrap();
+        run_git(dir.path(), &["add", "notes.txt"]);
+        run_git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=Tengu Test",
+                "-c",
+                "user.email=tengu@example.test",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+        fs::write(dir.path().join("notes.txt"), "before\nafter\n").unwrap();
+        dir
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn strips_frontmatter_from_custom_command() {
@@ -2770,6 +2806,18 @@ mod tests {
     }
 
     #[test]
+    fn shows_real_git_diff_from_supplied_repository() {
+        let dir = setup_git_repo_with_staged_change();
+
+        let diff = show_git_diff_in_dir(&[], dir.path()).unwrap();
+        let stat = show_git_diff_in_dir(&["--stat"], dir.path()).unwrap();
+
+        assert!(diff.contains("diff --git"));
+        assert!(diff.contains("+after"));
+        assert!(stat.contains("notes.txt"));
+    }
+
+    #[test]
     fn parses_resume_last_command() {
         let outcome = handle_slash_command("/resume --last");
         assert!(matches!(
@@ -2815,6 +2863,30 @@ mod tests {
     }
 
     #[test]
+    fn commit_local_action_runs_git_commit_in_supplied_repository() {
+        let dir = setup_git_repo_with_staged_change();
+        run_git(dir.path(), &["add", "notes.txt"]);
+
+        let result = execute_pending_local_action_in_dir(
+            PendingLocalAction::GitCommit {
+                message: "record notes update".to_string(),
+            },
+            dir.path(),
+        );
+        let log = Command::new("git")
+            .args(["log", "-1", "--pretty=%s"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        assert!(!result.contains("failed"), "{result}");
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).trim(),
+            "record notes update"
+        );
+    }
+
+    #[test]
     fn parses_pr_as_confirmed_local_action() {
         let outcome = handle_slash_command("/pr --draft");
         assert!(matches!(
@@ -2824,6 +2896,22 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn pr_local_action_preserves_pass_through_args_and_prompt() {
+        let outcome = handle_slash_command("/pr --draft --fill");
+
+        match outcome {
+            Some(SlashCommandOutcome::ConfirmLocal {
+                prompt,
+                action: PendingLocalAction::GhPrCreate { args },
+            }) => {
+                assert_eq!(args, vec!["--draft", "--fill"]);
+                assert!(prompt.contains("gh pr create --draft --fill"));
+            }
+            _ => panic!("expected confirmed PR action"),
+        }
     }
 
     #[test]
