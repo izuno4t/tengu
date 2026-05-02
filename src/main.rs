@@ -9,6 +9,7 @@ mod config;
 mod forge;
 mod llm;
 mod mcp;
+mod memory;
 mod review;
 mod session;
 mod tools;

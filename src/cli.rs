@@ -8,6 +8,7 @@ use crate::llm::{
     LlmStreamEvent, LlmUsage, OllamaBackend, OpenAiBackend,
 };
 use crate::mcp::{list_tools_http, list_tools_stdio, McpServerConfig, McpStore};
+use crate::memory::{format_memory_context, format_memory_entries, MemoryStore};
 use crate::review::{build_review_prompt, ReviewOptions};
 use crate::session::{Session, SessionStore};
 use crate::tools::{ToolExecutor, ToolInput, ToolPolicy, ToolResult};
@@ -117,6 +118,12 @@ pub enum Commands {
     Checkpoint {
         #[command(subcommand)]
         command: CheckpointCommands,
+    },
+
+    /// 永続メモリー管理
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommands,
     },
 
     /// セッション再開
@@ -297,6 +304,27 @@ pub enum CheckpointCommands {
     Restore {
         /// Checkpoint ID; omit to use latest
         id: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MemoryCommands {
+    /// Add a project memory entry
+    Add {
+        /// Memory content
+        content: Vec<String>,
+    },
+    /// List project memory entries
+    List,
+    /// Search project memory entries
+    Search {
+        /// Search query
+        query: Vec<String>,
+    },
+    /// Remove a project memory entry by ID
+    Remove {
+        /// Memory ID
+        id: String,
     },
 }
 
@@ -500,6 +528,7 @@ impl Cli {
             Commands::Agent { command } => self.execute_agent_command(command).await,
             Commands::Sessions { command } => self.execute_session_command(command).await,
             Commands::Checkpoint { command } => self.execute_checkpoint_command(command),
+            Commands::Memory { command } => self.execute_memory_command(command),
             Commands::Tool { command } => self.execute_tool_command(command).await,
             Commands::Tui => self.execute_tui().await,
             Commands::Review { base, preset } => {
@@ -734,6 +763,37 @@ impl Cli {
                         checkpoint.files.len()
                     ),
                     None => println!("no checkpoints"),
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn execute_memory_command(&self, command: &MemoryCommands) -> Result<()> {
+        let store = MemoryStore::new(MemoryStore::default_path());
+        match command {
+            MemoryCommands::Add { content } => {
+                let content = content.join(" ");
+                let entry = store.add(&content)?;
+                println!("memory added: {}", entry.id);
+                Ok(())
+            }
+            MemoryCommands::List => {
+                println!("{}", format_memory_entries(&store.list()?));
+                Ok(())
+            }
+            MemoryCommands::Search { query } => {
+                println!(
+                    "{}",
+                    format_memory_entries(&store.search(&query.join(" "))?)
+                );
+                Ok(())
+            }
+            MemoryCommands::Remove { id } => {
+                if store.remove(id)? {
+                    println!("memory removed: {}", id);
+                } else {
+                    println!("memory not found: {}", id);
                 }
                 Ok(())
             }
@@ -1428,6 +1488,21 @@ fn read_system_prompt_candidates(sources: &mut Vec<String>, parts: &mut Vec<Stri
             sources.push(format!("{}:{}", scope, path.display()));
             parts.push(content);
         }
+    }
+    append_memory_prompt_context(sources, parts, MemoryStore::default_path())?;
+    Ok(())
+}
+
+fn append_memory_prompt_context(
+    sources: &mut Vec<String>,
+    parts: &mut Vec<String>,
+    path: PathBuf,
+) -> Result<()> {
+    let store = MemoryStore::new(path.clone());
+    let entries = store.list()?;
+    if let Some(context) = format_memory_context(&entries, 20) {
+        sources.push(format!("project:{}", path.display()));
+        parts.push(context);
     }
     Ok(())
 }
@@ -2174,6 +2249,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_memory_commands() {
+        let add = Cli::try_parse_from(["tengu", "memory", "add", "Use", "cargo", "test"]).unwrap();
+        assert!(matches!(
+            add.command,
+            Some(Commands::Memory {
+                command: MemoryCommands::Add { content }
+            }) if content == vec!["Use".to_string(), "cargo".to_string(), "test".to_string()]
+        ));
+
+        let search = Cli::try_parse_from(["tengu", "memory", "search", "cargo"]).unwrap();
+        assert!(matches!(
+            search.command,
+            Some(Commands::Memory {
+                command: MemoryCommands::Search { query }
+            }) if query == vec!["cargo".to_string()]
+        ));
+    }
+
+    #[test]
     fn builds_headless_request_with_system_prompt() {
         let request = build_headless_request("hello", Some("system"), &[]).unwrap();
         assert!(request.prompt.contains("System instructions:"));
@@ -2238,6 +2332,27 @@ mod tests {
         assert!(sources[0].contains("AGENT.md"));
         assert!(sources[5].contains("workspace:"));
         assert!(sources[5].contains("TENGU.md"));
+    }
+
+    #[test]
+    fn includes_project_memory_in_system_prompt_candidates() {
+        let project = unique_temp_dir("prompt-memory-project");
+        let memory_path = project.join(".tengu").join("memory.json");
+
+        let store = MemoryStore::new(memory_path.clone());
+        store
+            .add("Use cargo test before marking work complete")
+            .unwrap();
+
+        let mut sources = Vec::new();
+        let mut parts = Vec::new();
+        append_memory_prompt_context(&mut sources, &mut parts, memory_path).unwrap();
+
+        assert!(sources
+            .iter()
+            .any(|source| source.contains(".tengu/memory.json")));
+        assert!(parts.iter().any(|part| part.contains("Project memory:")));
+        assert!(parts.iter().any(|part| part.contains("cargo test")));
     }
 
     #[test]

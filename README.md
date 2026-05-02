@@ -25,9 +25,9 @@ Tengu is a flexible, multi-LLM coding agent that integrates with MCP servers, su
 ## Project Status
 
 Core CLI/TUI, multi-provider LLM routing, built-in tools, MCP, permissions,
-hooks, session resume, Git/review workflows, checkpoints, security defaults,
-performance checks, encrypted token storage, and required user documentation are
-implemented.
+hooks, session resume, Git/review workflows, checkpoints, project memory,
+security defaults, performance checks, encrypted token storage, and required user
+documentation are implemented.
 Remaining tracked gaps are broader E2E evidence, 80% coverage proof in a matching
 LLVM environment, and advanced optional features.
 
@@ -187,6 +187,18 @@ tengu checkpoint diff
 tengu checkpoint restore
 ```
 
+### Project Memory
+
+Tengu stores structured project memory in `.tengu/memory.json`, searches it
+locally, and injects recent memory entries into the system prompt.
+
+```bash
+tengu memory add "Use cargo test before marking work complete"
+tengu memory list
+tengu memory search cargo
+tengu memory remove <memory-id>
+```
+
 ### Coverage
 
 ```bash
@@ -210,6 +222,7 @@ Dragging image file paths into the TUI input also auto-attaches them for the nex
 For local git and hosting actions, `/commit <message>`, `/pr [args]`, `/mr [args]`, `/issue ...`, `/label ...`, `/pr_comment ...`, and `/pr_review ...` ask for `y/n` confirmation before running `git`, `gh`, or `glab`; `/editor [path]` opens your `$VISUAL` or `$EDITOR`.
 Saved sessions now restore conversation history, visible logs, queued prompts, pending image attachments, and approval prompts that can be acknowledged again after restore.
 Additional TUI workflow commands now include `/plan`, `/taskwriter`, `/apply-plan`, `/compact`, `/memory`, `/init`, `/config`, `/doctor`, `/add-dir`, `/agents`, `/login`, `/logout`, `/pr_comments`, `/terminal-setup`, `/strategy`, `/bg`, `/usage`, `/model`, `/vim`, `/checkpoint`, and `/rollback`.
+Use `/memory add <text>`, `/memory list`, `/memory search <query>`, and `/memory remove <id>` to manage structured project memory. `/memory` without arguments still opens the project memory file.
 Use `/checkpoint list`, `/checkpoint create <path> [more_paths...]`, `/checkpoint diff [id]`, and `/rollback [id]` to inspect or restore saved snapshots.
 `/config` supports `list`, `get <key>`, and `set <key> <value>` for common local settings such as `model.default`, `model.provider`, and `plan_mode`.
 `/usage` shows provider-reported usage metadata when the selected provider returns it, aggregates it per provider, and preserves it in saved TUI sessions. `/usage export <path>` writes the current aggregated usage snapshot as JSON. Exact billing still depends on each provider pricing model and billing surfaces.

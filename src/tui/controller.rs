@@ -23,6 +23,7 @@ use crate::config::Config;
 use crate::forge::{self, ForgeCommand, ForgeProvider, ReviewAction};
 use crate::llm::{LlmImage, LlmRequest, LlmStreamEvent};
 use crate::mcp::McpStore;
+use crate::memory::{format_memory_entries, MemoryStore};
 use crate::review::{build_review_prompt, parse_review_args};
 use crate::session::SessionPendingApproval;
 use crate::session::{Session, SessionStore};
@@ -315,6 +316,12 @@ impl App {
                 }
                 SlashCommandOutcome::OpenMemory => {
                     let response = self.open_editor(Some(project_memory_path()));
+                    self.state.append_message(&response);
+                    self.state.append_blank_line();
+                    return;
+                }
+                SlashCommandOutcome::MemoryCommand(args) => {
+                    let response = self.handle_memory_command(&args);
                     self.state.append_message(&response);
                     self.state.append_blank_line();
                     return;
@@ -1157,6 +1164,7 @@ impl App {
             format!("config: {}", global_config_path().display()),
             format!("config: {}", local_config_path().display()),
             format!("memory: {}", project_memory_path().display()),
+            format!("memory store: {}", MemoryStore::default_path().display()),
             format!("provider: {}", self.current_provider_label()),
             format!("model.default: {}", self.current_model_label()),
             format!(
@@ -1257,6 +1265,40 @@ impl App {
                 }
             }
             _ => "usage: /checkpoint [list|create <path...>|diff [id]|restore [id]]".to_string(),
+        }
+    }
+
+    fn handle_memory_command(&mut self, args: &[String]) -> String {
+        let store = MemoryStore::new(MemoryStore::default_path());
+        let command = args.first().map(String::as_str).unwrap_or("list");
+        match command {
+            "add" => {
+                let content = args[1..].join(" ");
+                match store.add(&content) {
+                    Ok(entry) => format!("memory added: {}", entry.id),
+                    Err(err) => format!("memory add failed: {}", err),
+                }
+            }
+            "list" => match store.list() {
+                Ok(entries) => format_memory_entries(&entries),
+                Err(err) => format!("memory list failed: {}", err),
+            },
+            "search" => match store.search(&args[1..].join(" ")) {
+                Ok(entries) => format_memory_entries(&entries),
+                Err(err) => format!("memory search failed: {}", err),
+            },
+            "remove" => {
+                let Some(id) = args.get(1) else {
+                    return "usage: /memory remove <id>".to_string();
+                };
+                match store.remove(id) {
+                    Ok(true) => format!("memory removed: {}", id),
+                    Ok(false) => format!("memory not found: {}", id),
+                    Err(err) => format!("memory remove failed: {}", err),
+                }
+            }
+            "open" => self.open_editor(Some(project_memory_path())),
+            _ => "usage: /memory [open|add <text>|list|search <query>|remove <id>]".to_string(),
         }
     }
 
@@ -1868,6 +1910,7 @@ enum SlashCommandOutcome {
     ApplyPlan,
     Compact(Option<String>),
     OpenMemory,
+    MemoryCommand(Vec<String>),
     InitMemory,
     ConfigCommand(Vec<String>),
     CheckpointCommand(Vec<String>),
@@ -2007,7 +2050,15 @@ fn handle_slash_command(input: &str) -> Option<SlashCommandOutcome> {
         "/compact" => Some(SlashCommandOutcome::Compact(
             (!args.is_empty()).then(|| args.join(" ")),
         )),
-        "/memory" => Some(SlashCommandOutcome::OpenMemory),
+        "/memory" => {
+            if args.is_empty() {
+                Some(SlashCommandOutcome::OpenMemory)
+            } else {
+                Some(SlashCommandOutcome::MemoryCommand(
+                    args.iter().map(|arg| (*arg).to_string()).collect(),
+                ))
+            }
+        }
         "/init" => Some(SlashCommandOutcome::InitMemory),
         "/config" => Some(SlashCommandOutcome::ConfigCommand(
             args.iter().map(|arg| (*arg).to_string()).collect(),
@@ -2339,7 +2390,7 @@ fn slash_help_items() -> Vec<SlashCommandHelp> {
         },
         SlashCommandHelp {
             cmd: "/memory",
-            desc_en: "Open project memory file",
+            desc_en: "Open or manage project memory",
         },
         SlashCommandHelp {
             cmd: "/init",
@@ -3565,6 +3616,29 @@ mod tests {
             handle_slash_command("/rollback cp-1"),
             Some(SlashCommandOutcome::CheckpointCommand(args))
                 if args == vec!["restore".to_string(), "cp-1".to_string()]
+        ));
+    }
+
+    #[test]
+    fn parses_memory_subcommands() {
+        assert!(matches!(
+            handle_slash_command("/memory"),
+            Some(SlashCommandOutcome::OpenMemory)
+        ));
+        assert!(matches!(
+            handle_slash_command("/memory add use cargo test"),
+            Some(SlashCommandOutcome::MemoryCommand(args))
+                if args == vec![
+                    "add".to_string(),
+                    "use".to_string(),
+                    "cargo".to_string(),
+                    "test".to_string()
+                ]
+        ));
+        assert!(matches!(
+            handle_slash_command("/memory search cargo"),
+            Some(SlashCommandOutcome::MemoryCommand(args))
+                if args == vec!["search".to_string(), "cargo".to_string()]
         ));
     }
 }

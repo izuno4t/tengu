@@ -161,7 +161,7 @@
 |TASK-115|⏳|GitHub/GitLabのPRコメント・Issue・Label操作を実装する|TASK-108|
 |TASK-116|⏳|OAuthまたは暗号化トークン保存を含む認証保護を追加する|TASK-110|
 |TASK-117|✅|チェックポイント・rollback・作業差分復元を実装する|TASK-009,TASK-108|
-|TASK-118|⏳|プロジェクトknowledge baseと永続メモリー検索を実装する|TASK-109|
+|TASK-118|✅|プロジェクトknowledge baseと永続メモリー検索を実装する|TASK-109|
 |TASK-119|⏳|長時間セッション・大規模リポジトリの回帰テストを追加する|TASK-112,TASK-113|
 |TASK-120|⏳|Claude Code / Codex parityの最終判定レポートを更新する|TASK-114,TASK-115,TASK-116,TASK-117,TASK-118,TASK-119|
 
