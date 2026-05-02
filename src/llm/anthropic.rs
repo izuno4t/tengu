@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::llm::{
-    LlmBackend, LlmProvider, LlmRequest, LlmResponse, LlmStream, LlmStreamEvent, LlmUsage,
+    ChatRequest, ChatResponse, ChatStream, ChatStreamEvent, ContentBlock, LlmBackend, LlmProvider,
+    LlmRequest, LlmResponse, LlmStream, LlmStreamEvent, LlmUsage, StopReason,
 };
 
 const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
@@ -17,6 +18,8 @@ pub struct AnthropicBackend {
     pub base_url: String,
     pub max_tokens: u32,
 }
+
+// -- Legacy request/response types (for generate/generate_stream) --
 
 #[derive(Debug, Serialize)]
 struct MessageRequest {
@@ -49,9 +52,11 @@ struct ImageSource {
 
 #[derive(Debug, Deserialize)]
 struct MessageResponse {
-    content: Vec<ContentBlock>,
+    content: Vec<ResponseContentBlock>,
     #[serde(default)]
     usage: Option<MessageUsage>,
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -67,10 +72,17 @@ struct MessageUsage {
 }
 
 #[derive(Debug, Deserialize)]
-struct ContentBlock {
+struct ResponseContentBlock {
     #[serde(rename = "type")]
     kind: String,
+    #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    input: Option<Value>,
 }
 
 impl AnthropicBackend {
@@ -118,11 +130,11 @@ impl AnthropicBackend {
         }
     }
 
-    fn collect_text(blocks: Vec<ContentBlock>) -> String {
+    fn collect_text(blocks: &[ResponseContentBlock]) -> String {
         blocks
-            .into_iter()
+            .iter()
             .filter(|block| block.kind == "text")
-            .filter_map(|block| block.text)
+            .filter_map(|block| block.text.as_deref())
             .collect::<Vec<_>>()
             .join("")
     }
@@ -194,6 +206,116 @@ impl AnthropicBackend {
 
         Ok(None)
     }
+
+    // -- Chat API (tool_use) helpers --
+
+    fn build_chat_body(&self, model: &str, request: &ChatRequest) -> Value {
+        let mut messages = Vec::new();
+        for msg in &request.messages {
+            let role = match msg.role {
+                crate::llm::MessageRole::User => "user",
+                crate::llm::MessageRole::Assistant => "assistant",
+            };
+            let content = msg
+                .content
+                .iter()
+                .map(|block| match block {
+                    ContentBlock::Text { text } => {
+                        serde_json::json!({"type": "text", "text": text})
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        serde_json::json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": input,
+                        })
+                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
+                        serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": content,
+                            "is_error": is_error,
+                        })
+                    }
+                    ContentBlock::Thinking { thinking } => {
+                        serde_json::json!({
+                            "type": "thinking",
+                            "thinking": thinking,
+                        })
+                    }
+                })
+                .collect::<Vec<_>>();
+            messages.push(serde_json::json!({"role": role, "content": content}));
+        }
+
+        let tools: Vec<Value> = request
+            .tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.input_schema,
+                })
+            })
+            .collect();
+
+        let mut body = serde_json::json!({
+            "model": model,
+            "max_tokens": request.max_tokens,
+            "messages": messages,
+        });
+
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools);
+        }
+
+        if let Some(system) = &request.system {
+            // Use structured system with cache_control for prompt caching
+            body["system"] = serde_json::json!([{
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"}
+            }]);
+        }
+
+        body
+    }
+
+    fn parse_chat_response(body: MessageResponse) -> ChatResponse {
+        let content = body
+            .content
+            .into_iter()
+            .filter_map(|block| match block.kind.as_str() {
+                "text" => block.text.map(|text| ContentBlock::Text { text }),
+                "tool_use" => {
+                    let id = block.id.unwrap_or_default();
+                    let name = block.name.unwrap_or_default();
+                    let input = block.input.unwrap_or(Value::Object(Default::default()));
+                    Some(ContentBlock::ToolUse { id, name, input })
+                }
+                _ => None,
+            })
+            .collect();
+
+        let stop_reason = match body.stop_reason.as_deref() {
+            Some("tool_use") => StopReason::ToolUse,
+            Some("max_tokens") => StopReason::MaxTokens,
+            _ => StopReason::EndTurn,
+        };
+
+        ChatResponse {
+            content,
+            stop_reason,
+            usage: body.usage.map(|u| Self::normalize_usage(u, None)),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -222,7 +344,7 @@ impl LlmBackend for AnthropicBackend {
 
         let body: MessageResponse = response.json().await?;
         Ok(LlmResponse {
-            content: Self::collect_text(body.content),
+            content: Self::collect_text(&body.content),
             usage: body.usage.map(|usage| Self::normalize_usage(usage, None)),
         })
     }
@@ -333,6 +455,288 @@ impl LlmBackend for AnthropicBackend {
 
         Ok(Box::pin(output) as BoxStream<'static, Result<LlmStreamEvent>>)
     }
+
+    async fn chat(&self, model: &str, request: &ChatRequest) -> Result<ChatResponse> {
+        let api_key = self.api_key()?;
+        let client = reqwest::Client::new();
+        let body = self.build_chat_body(model, request);
+
+        let response = client
+            .post(self.messages_url())
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
+            .header("anthropic-beta", "prompt-caching-2024-07-31")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let resp_body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("anthropic error: {} {}", status, resp_body.trim()));
+        }
+
+        let msg_response: MessageResponse = response.json().await?;
+        Ok(Self::parse_chat_response(msg_response))
+    }
+
+    async fn chat_stream(&self, model: &str, request: &ChatRequest) -> Result<ChatStream> {
+        let api_key = self.api_key()?;
+        let client = reqwest::Client::new();
+        let mut body = self.build_chat_body(model, request);
+        body["stream"] = Value::Bool(true);
+
+        let response = client
+            .post(self.messages_url())
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
+            .header("anthropic-beta", "prompt-caching-2024-07-31")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let resp_body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("anthropic error: {} {}", status, resp_body.trim()));
+        }
+
+        /// State for accumulating tool_use blocks from streaming events.
+        struct ChatStreamState {
+            stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+            buffer: String,
+            pending_data: Vec<String>,
+            finished: bool,
+            // Track current content block being streamed
+            current_block_type: Option<String>,
+            current_tool_id: Option<String>,
+            current_tool_name: Option<String>,
+            current_tool_input_json: String,
+        }
+
+        fn parse_chat_stream_event(
+            state: &mut ChatStreamState,
+            data: &str,
+        ) -> Result<Option<ChatStreamEvent>> {
+            let payload = data.trim();
+            if payload.is_empty() || payload == "[DONE]" {
+                return Ok(None);
+            }
+
+            let value: Value = serde_json::from_str(payload)?;
+            if let Some(error) = value
+                .get("error")
+                .and_then(|err| err.get("message"))
+                .and_then(Value::as_str)
+            {
+                return Err(anyhow!("anthropic stream error: {}", error));
+            }
+
+            let event_type = value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+
+            match event_type {
+                "content_block_start" => {
+                    if let Some(block) = value.get("content_block") {
+                        let block_type = block
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        state.current_block_type = Some(block_type.clone());
+                        if block_type == "tool_use" {
+                            state.current_tool_id = block
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .map(String::from);
+                            state.current_tool_name = block
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map(String::from);
+                            state.current_tool_input_json.clear();
+                        }
+                    }
+                    Ok(None)
+                }
+                "content_block_delta" => {
+                    if let Some(delta) = value.get("delta") {
+                        let delta_type = delta
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        match delta_type {
+                            "text_delta" => {
+                                if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                                    return Ok(Some(ChatStreamEvent::TextDelta(
+                                        text.to_string(),
+                                    )));
+                                }
+                            }
+                            "thinking_delta" => {
+                                if let Some(thinking) = delta.get("thinking").and_then(Value::as_str) {
+                                    return Ok(Some(ChatStreamEvent::ThinkingDelta(
+                                        thinking.to_string(),
+                                    )));
+                                }
+                            }
+                            "input_json_delta" => {
+                                if let Some(json_part) =
+                                    delta.get("partial_json").and_then(Value::as_str)
+                                {
+                                    state.current_tool_input_json.push_str(json_part);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(None)
+                }
+                "content_block_stop" => {
+                    if state.current_block_type.as_deref() == Some("tool_use") {
+                        let id = state.current_tool_id.take().unwrap_or_default();
+                        let name = state.current_tool_name.take().unwrap_or_default();
+                        let input: Value =
+                            serde_json::from_str(&state.current_tool_input_json)
+                                .unwrap_or(Value::Object(Default::default()));
+                        state.current_tool_input_json.clear();
+                        state.current_block_type = None;
+                        return Ok(Some(ChatStreamEvent::ToolUse { id, name, input }));
+                    }
+                    state.current_block_type = None;
+                    Ok(None)
+                }
+                "message_delta" => {
+                    // Extract stop_reason and usage
+                    if let Some(usage) =
+                        AnthropicBackend::extract_usage_value(&value)
+                    {
+                        return Ok(Some(ChatStreamEvent::Usage(usage)));
+                    }
+                    let stop_reason = value
+                        .get("delta")
+                        .and_then(|d| d.get("stop_reason"))
+                        .and_then(Value::as_str);
+                    match stop_reason {
+                        Some("tool_use") => {
+                            Ok(Some(ChatStreamEvent::Done(StopReason::ToolUse)))
+                        }
+                        Some("max_tokens") => {
+                            Ok(Some(ChatStreamEvent::Done(StopReason::MaxTokens)))
+                        }
+                        Some("end_turn") => {
+                            Ok(Some(ChatStreamEvent::Done(StopReason::EndTurn)))
+                        }
+                        _ => Ok(None),
+                    }
+                }
+                "message_start" => {
+                    // Extract initial usage from message_start
+                    if let Some(usage) = value
+                        .get("message")
+                        .and_then(|m| m.get("usage"))
+                    {
+                        if let Ok(u) = serde_json::from_value::<MessageUsage>(usage.clone()) {
+                            return Ok(Some(ChatStreamEvent::Usage(
+                                AnthropicBackend::normalize_usage(u, Some(usage.clone())),
+                            )));
+                        }
+                    }
+                    Ok(None)
+                }
+                "message_stop" => {
+                    state.finished = true;
+                    Ok(None)
+                }
+                _ => Ok(None),
+            }
+        }
+
+        fn take_chat_event(
+            state: &mut ChatStreamState,
+        ) -> Result<Option<ChatStreamEvent>> {
+            while let Some(idx) = state.buffer.find('\n') {
+                let mut line = state.buffer[..idx].to_string();
+                state.buffer = state.buffer[idx + 1..].to_string();
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+
+                if line.is_empty() {
+                    if !state.pending_data.is_empty() {
+                        let data = state.pending_data.join("\n");
+                        state.pending_data.clear();
+                        return parse_chat_stream_event(state, &data);
+                    }
+                    continue;
+                }
+
+                if line.starts_with("event:") {
+                    continue;
+                }
+
+                if let Some(data) = line.strip_prefix("data:") {
+                    state.pending_data.push(data.trim_start().to_string());
+                }
+            }
+            Ok(None)
+        }
+
+        let state = ChatStreamState {
+            stream: Box::pin(response.bytes_stream()),
+            buffer: String::new(),
+            pending_data: Vec::new(),
+            finished: false,
+            current_block_type: None,
+            current_tool_id: None,
+            current_tool_name: None,
+            current_tool_input_json: String::new(),
+        };
+
+        let output = stream::unfold(state, |mut state| async move {
+            if state.finished {
+                return None;
+            }
+
+            loop {
+                match take_chat_event(&mut state) {
+                    Ok(Some(event)) => return Some((Ok(event), state)),
+                    Ok(None) => {}
+                    Err(err) => {
+                        state.finished = true;
+                        return Some((Err(err), state));
+                    }
+                }
+
+                match state.stream.next().await {
+                    Some(Ok(chunk)) => {
+                        state.buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    }
+                    Some(Err(err)) => {
+                        state.finished = true;
+                        return Some((Err(anyhow::Error::new(err)), state));
+                    }
+                    None => {
+                        state.finished = true;
+                        if !state.pending_data.is_empty() {
+                            let data = state.pending_data.join("\n");
+                            match parse_chat_stream_event(&mut state, &data) {
+                                Ok(Some(event)) => return Some((Ok(event), state)),
+                                Ok(None) => return None,
+                                Err(err) => return Some((Err(err), state)),
+                            }
+                        }
+                        return None;
+                    }
+                }
+            }
+        });
+
+        Ok(Box::pin(output))
+    }
 }
 
 #[cfg(test)]
@@ -370,5 +774,33 @@ mod tests {
                     && usage.cache_creation_input_tokens == Some(2)
                     && usage.cache_read_input_tokens == Some(1)
         ));
+    }
+
+    #[test]
+    fn parses_tool_use_from_response() {
+        let response = MessageResponse {
+            content: vec![
+                ResponseContentBlock {
+                    kind: "text".to_string(),
+                    text: Some("Let me read the file.".to_string()),
+                    id: None,
+                    name: None,
+                    input: None,
+                },
+                ResponseContentBlock {
+                    kind: "tool_use".to_string(),
+                    text: None,
+                    id: Some("toolu_123".to_string()),
+                    name: Some("Read".to_string()),
+                    input: Some(serde_json::json!({"path": "src/main.rs"})),
+                },
+            ],
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        };
+        let chat = AnthropicBackend::parse_chat_response(response);
+        assert_eq!(chat.stop_reason, StopReason::ToolUse);
+        assert_eq!(chat.content.len(), 2);
+        assert!(matches!(&chat.content[1], ContentBlock::ToolUse { name, .. } if name == "Read"));
     }
 }

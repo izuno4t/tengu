@@ -26,6 +26,65 @@ struct JsonRpcNotification<'a> {
     params: Option<Value>,
 }
 
+/// Call a tool on an MCP server via HTTP transport.
+pub async fn call_tool_http(
+    server: &McpServerConfig,
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<Value> {
+    let url = server
+        .url
+        .as_ref()
+        .ok_or_else(|| anyhow!("mcp server url is required for http"))?;
+    let client = build_client(server)?;
+    let mut headers = build_headers(server)?;
+    let mut next_id = 1u64;
+
+    // Initialize
+    let init_request = JsonRpcRequest {
+        jsonrpc: "2.0",
+        id: next_id,
+        method: "initialize",
+        params: Some(serde_json::json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {
+                "name": "tengu",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        })),
+    };
+    let (_, session_id) =
+        send_request(&client, url, &headers, &init_request, next_id).await?;
+    if let Some(session_id) = session_id {
+        headers.insert(
+            HeaderName::from_static("mcp-session-id"),
+            HeaderValue::from_str(&session_id)?,
+        );
+    }
+    next_id += 1;
+
+    let init_notification = JsonRpcNotification {
+        jsonrpc: "2.0",
+        method: "notifications/initialized",
+        params: None,
+    };
+    let _ = send_notification(&client, url, &headers, &init_notification).await;
+
+    // Call tool
+    let call_request = JsonRpcRequest {
+        jsonrpc: "2.0",
+        id: next_id,
+        method: "tools/call",
+        params: Some(serde_json::json!({
+            "name": tool_name,
+            "arguments": arguments,
+        })),
+    };
+    let (result, _) = send_request(&client, url, &headers, &call_request, next_id).await?;
+    Ok(result)
+}
+
 pub async fn list_tools_http(server: &McpServerConfig) -> Result<Vec<McpTool>> {
     let url = server
         .url

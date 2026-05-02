@@ -168,3 +168,192 @@ fn expand_env_vars_in_string(input: &str) -> String {
 fn is_env_var_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn default_model_config_values() {
+        let mc = ModelConfig::default();
+        assert_eq!(mc.provider, "anthropic");
+        assert_eq!(mc.default, "claude-sonnet-4-20250514");
+        assert_eq!(mc.max_tokens, Some(8192));
+        assert!(mc.backend.is_none());
+        assert!(mc.name.is_none());
+        assert!(mc.backend_url.is_none());
+    }
+
+    #[test]
+    fn default_config_has_default_model() {
+        let cfg = Config::default();
+        assert_eq!(cfg.model.provider, "anthropic");
+        assert!(cfg.permissions.is_none());
+        assert!(cfg.sandbox.is_none());
+    }
+
+    #[test]
+    fn loads_config_from_toml_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tengu.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"
+[model]
+provider = "openai"
+default = "gpt-4o"
+max_tokens = 4096
+"#
+        )
+        .unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.model.provider, "openai");
+        assert_eq!(cfg.model.default, "gpt-4o");
+        assert_eq!(cfg.model.max_tokens, Some(4096));
+    }
+
+    #[test]
+    fn loads_config_with_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tengu.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"
+[model]
+provider = "anthropic"
+default = "claude-sonnet-4-20250514"
+
+[permissions]
+approval_policy = "auto"
+allowed_tools = ["Read", "Write"]
+deny = ["Bash"]
+"#
+        )
+        .unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        let perms = cfg.permissions.unwrap();
+        assert_eq!(perms.approval_policy.unwrap(), "auto");
+        assert_eq!(perms.allowed_tools.unwrap(), vec!["Read", "Write"]);
+        assert_eq!(perms.deny.unwrap(), vec!["Bash"]);
+    }
+
+    #[test]
+    fn loads_config_with_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tengu.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"
+[model]
+provider = "anthropic"
+default = "claude-sonnet-4-20250514"
+
+[sandbox]
+mode = "strict"
+allowed_paths = ["/tmp", "/home"]
+blocked_paths = ["/etc"]
+"#
+        )
+        .unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        let sb = cfg.sandbox.unwrap();
+        assert_eq!(sb.mode.unwrap(), "strict");
+        assert_eq!(sb.allowed_paths.unwrap(), vec!["/tmp", "/home"]);
+        assert_eq!(sb.blocked_paths.unwrap(), vec!["/etc"]);
+    }
+
+    #[test]
+    fn load_nonexistent_file_returns_error() {
+        let result = Config::load(&PathBuf::from("/nonexistent/tengu.toml"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_invalid_toml_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "not a [valid toml {{{").unwrap();
+        let result = Config::load(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn expands_env_vars_in_provider() {
+        std::env::set_var("TENGU_TEST_PROVIDER", "google");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tengu.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"
+[model]
+provider = "$TENGU_TEST_PROVIDER"
+default = "gemini-pro"
+"#
+        )
+        .unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.model.provider, "google");
+        std::env::remove_var("TENGU_TEST_PROVIDER");
+    }
+
+    #[test]
+    fn expands_env_vars_braces_syntax() {
+        std::env::set_var("TENGU_TEST_MODEL", "my-model");
+        let result = expand_env_vars_in_string("${TENGU_TEST_MODEL}");
+        assert_eq!(result, "my-model");
+        std::env::remove_var("TENGU_TEST_MODEL");
+    }
+
+    #[test]
+    fn preserves_unset_env_vars() {
+        let result = expand_env_vars_in_string("$NONEXISTENT_TENGU_VAR_XYZ");
+        assert_eq!(result, "$NONEXISTENT_TENGU_VAR_XYZ");
+    }
+
+    #[test]
+    fn preserves_unset_braces_env_vars() {
+        let result = expand_env_vars_in_string("${NONEXISTENT_TENGU_VAR_XYZ}");
+        assert_eq!(result, "${NONEXISTENT_TENGU_VAR_XYZ}");
+    }
+
+    #[test]
+    fn expand_empty_braces() {
+        let result = expand_env_vars_in_string("${}");
+        assert_eq!(result, "${}");
+    }
+
+    #[test]
+    fn expand_dollar_at_end() {
+        let result = expand_env_vars_in_string("hello$");
+        assert_eq!(result, "hello$");
+    }
+
+    #[test]
+    fn is_env_var_char_accepts_alphanumeric_and_underscore() {
+        assert!(is_env_var_char('A'));
+        assert!(is_env_var_char('z'));
+        assert!(is_env_var_char('0'));
+        assert!(is_env_var_char('_'));
+        assert!(!is_env_var_char('-'));
+        assert!(!is_env_var_char('.'));
+    }
+
+    #[test]
+    fn minimal_config_uses_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tengu.toml");
+        std::fs::write(&path, "").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.model.provider, "anthropic");
+        assert_eq!(cfg.model.default, "claude-sonnet-4-20250514");
+    }
+}

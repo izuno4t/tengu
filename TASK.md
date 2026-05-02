@@ -1,80 +1,85 @@
-# Alt Claude Code Product Task List
+# 実行計画: Tengu コーディングエージェント実用化
 
-まず製品版実装では、この文書を優先して参照する。
+## 概要
 
-## Decision
+Tengu を参考実装 (co-vibe) と同等の実用コーディングエージェントに仕上げる。
+Phase A-E は基盤構築、Phase F は実用化のための追加修正。
+Phase G は `docs/REQUIREMENTS.md` に対する不足を埋める。
 
-- 判断: 作り直しではなく `継続実装 + 乖離是正`
-- 理由:
-  - 既存の中核（TUI、ワンショット、LLMバックエンド、ローカルツール、承認、MCP、セッション）は再利用価値が高い
-  - Claude Code 基準から外れているのは主に一部導線の不足と、誤って足した機能の方向性
-  - 全面作り直しより、主要導線ごとの差分を埋める方が正確かつ速い
+## Phase A: メッセージモデルの刷新（G-002, G-003） ✅
 
-## Product Definition
+| ID | Status | Task | Details |
+|----|--------|------|---------|
+| T-001 | ✅ | Message 型の定義 | role(user/assistant), content blocks (Text/ToolUse/ToolResult) を定義 |
+| T-002 | ✅ | ChatRequest/ChatResponse の導入 | messages: Vec<Message> + tools: Vec<ToolDefinition> + system prompt |
+| T-003 | ✅ | Anthropic バックエンドに chat メソッド追加 | tool definitions 送信、tool_use レスポンス解析 |
+| T-004 | ✅ | OpenAI バックエンドに chat メソッド追加 | tool→function calling 変換 |
+| T-005 | ✅ | Google バックエンドに chat メソッド追加 | tool→functionDeclarations 変換 |
 
-実施に使える `alt Claude Code` の最小製品相当は、次の導線が成立していることとする。
+## Phase B: エージェントループの再構築（G-001, G-007） ✅
 
-1. 対話導線
-   - TUI で会話、ストリーミング、承認付きツール実行ができる
-2. ワンショット導線
-   - `-p` で単発実行でき、`stream-json` が逐次出力される
-3. 安全な編集導線
-   - Read / Write / Shell / Grep / Glob が動き、差分提示と承認がある
-4. レビュー導線
-   - Git 差分を LLM に渡し、専用コマンドでレビューできる
-5. 拡張導線
-   - MCP、カスタムコマンド、カスタムエージェントの基本が成立する
-6. 製品ハードニング
-   - ドキュメント、テスト、実例が実装と整合する
+| ID | Status | Task | Details |
+|----|--------|------|---------|
+| T-006 | ✅ | AgentRunner に run_agent_loop 実装 | LLM→ToolUse→Result→LLM... を end_turn まで繰り返す（最大50ターン） |
+| T-007 | ✅ | ToolResult を ContentBlock::ToolResult として会話に追加 | execute_from_json → (result_text, is_error) |
+| T-008 | ✅ | Write/Edit ツールで実際にファイル書き込み | execute_from_json が直接ファイルを操作する |
+| T-009 | ✅ | ToolEventHandler でUIにツール実行を通知 | Text/ToolCall/ToolResult イベント |
 
-## Gap Summary
+## Phase C: ツールの強化（G-004, G-005, G-006） ✅
 
-| Flow | Current Status | Main Gap |
-| ---- | ---- | ---- |
-| 対話導線 | 成立 | 補助スラッシュコマンドの拡張余地は残る |
-| ワンショット導線 | 成立 | 追加のE2E拡張は任意 |
-| 安全な編集導線 | 成立 | 実運用向けプリセット整備は任意 |
-| レビュー導線 | 成立 | プリセット強化は将来改善 |
-| 拡張導線 | 成立 | TUI画像貼り付けは将来改善 |
-| 製品ハードニング | 成立 | 実API疎通確認は運用時に実施 |
+| ID | Status | Task | Details |
+|----|--------|------|---------|
+| T-010 | ✅ | Edit ツールの追加 | old_string→new_string の部分置換。一意性チェック付き |
+| T-011 | ✅ | Bash ツールの強化 | sh -c 実行、stdout+stderr統合、タイムアウト、exit code返却 |
+| T-012 | ✅ | Grep の正規表現対応 | regex crate を使用。hidden/target/node_modules 自動除外 |
+| T-013 | ✅ | ツール定義(JSON Schema)の生成 | builtin_tool_definitions() で全7ツールの定義を提供 |
 
-## Phases
+## Phase D: TUI/CLIの統合（G-008） ✅
 
-### Phase A: Core Product
+| ID | Status | Task | Details |
+|----|--------|------|---------|
+| T-014 | ✅ | TUI でのエージェントループ統合 | ToolEventHandler経由でToolCall/ToolResult表示 |
+| T-015 | ✅ | CLI ヘッドレスモードでのループ統合 | run_prompt で tool_use 対応、system_prompt 反映 |
+| T-016 | ✅ | セッション履歴にメッセージ配列を保存 | Session に messages: Vec<Value> フィールド追加 |
+
+## Phase E: 品質向上 ✅
+
+| ID | Status | Task | Details |
+|----|--------|------|---------|
+| T-017 | ✅ | ビルド確認・テスト | cargo build 警告ゼロ、cargo test 45テスト全通過 |
+| T-018 | ✅ | ドキュメント最終更新 | ARCHITECTURE.md 刷新、GAP_ANALYSIS.md 新規作成、README.md 更新 |
+| T-019 | ✅ | clippy / 警告解消 | 全 warning 解消済み |
+
+## Phase F: 実用化修正 ✅
+
+20件の critical issues を修正し、co-vibe と同等の実用レベルに引き上げる。
+
+| ID | Status | Task | Details |
+|----|--------|------|---------|
+| T-020 | ✅ | TUI システムプロンプト設定 | execute_tui() で resolve_system_prompt → runner.set_system_prompt() |
+| T-021 | ✅ | デフォルトシステムプロンプト | ツール一覧・ガイドラインを含む包括的なシステムプロンプト |
+| T-022 | ✅ | ToolEventHandler 競合修正 | async タスク spawn 前に handler を設定 |
+| T-023 | ✅ | 会話コンテキスト修正 | フラット文字列 → 構造化 Message[] による会話履歴 |
+| T-024 | ✅ | 永続会話履歴 | AgentRunner に conversation_messages を保持、ターン間で tool_use/result を保持 |
+| T-025 | ✅ | stream-json モード修正 | レガシー API → agent loop に切り替え、ToolEvent を JSON 出力 |
+| T-026 | ✅ | Bash タイムアウト修正 | 二重 spawn 排除、polling ベースのタイムアウト実装 |
+| T-027 | ✅ | Read ツール offset/limit | 大きなファイルの部分読み取り対応 |
+| T-028 | ✅ | ListFiles ツール追加 | ディレクトリ内容一覧（7番目のビルトインツール） |
+| T-029 | ✅ | Usage 情報の伝播 | agent loop → ToolEvent::Usage → TUI/CLI に伝播 |
+| T-030 | ✅ | API リトライ | 429/500/502/503 エラーでの指数バックオフリトライ（最大3回） |
+| T-031 | ✅ | コンテキストウィンドウ管理 | MAX_CONTEXT_MESSAGES (100) でメッセージ数を制限 |
+| T-032 | ✅ | Anthropic プロンプトキャッシュ | anthropic-beta ヘッダー + cache_control ephemeral |
+| T-033 | ✅ | max_tokens 増加 | 8192 → 16384 |
+| T-034 | ✅ | CLI ヘッドレス tool event 出力 | verbose モードでツール実行を stderr に表示 |
+| T-035 | ✅ | ビルド・テスト・clippy 確認 | 警告ゼロ、45テスト全通過 |
+
+## Phase G: Requirements Gap Closure
 
 | ID | Status | Summary | DependsOn |
-| ---- | ------ | ------- | --------- |
-| ALT-001 | ✅ | 継続実装で進める判断と主要導線の定義を確定する | - |
-| ALT-002 | ✅ | Claude Code 基準から外れた cloud 導線を除去する | ALT-001 |
-| ALT-003 | ✅ | レビュー導線（CLI `review` / TUI `/review`）を製品相当に仕上げる | ALT-001 |
-
-### Phase B: Feature Completion
-
-| ID | Status | Summary | DependsOn |
-| ---- | ------ | ------- | --------- |
-| ALT-004 | ✅ | 画像入力導線を実装する | ALT-003 |
-| ALT-005 | ✅ | エージェント管理コマンドを実体化する | ALT-003 |
-| ALT-006 | ✅ | Auth コマンドを実体化する | ALT-003 |
-
-### Phase C: Hardening
-
-| ID | Status | Summary | DependsOn |
-| ---- | ------ | ------- | --------- |
-| ALT-007 | ✅ | 主要導線の統合テストを追加する | ALT-003,ALT-004,ALT-005,ALT-006 |
-| ALT-008 | ✅ | README / REQUIREMENTS / TASK の整合を最終化する | ALT-007 |
-| ALT-009 | ✅ | `/config` を実用コマンド化し、ローカル設定の確認・更新を TUI から行えるようにする | ALT-008 |
-| ALT-010 | ✅ | プロバイダ別 usage を取得・記録し、`/usage` と `stream-json` に反映する | ALT-009 |
-| ALT-011 | ✅ | `usage` イベント仕様と解析テストを追加し、文書と実装を整合させる | ALT-010 |
-| ALT-012 | ✅ | `json` / `stream-json` の usage 出力契約を文書化し、補助テストを追加する | ALT-011 |
-| ALT-013 | ✅ | `/usage export <path>` を追加し、usage 集計を JSON で書き出せるようにする | ALT-012 |
-
-### Phase D: Requirements Gap Closure
-
-| ID | Status | Summary | DependsOn |
-| ---- | ------ | ------- | --------- |
+|----|--------|---------|-----------|
 | ALT-014 | ✅ | 要求差分マトリクスを現行コード基準で更新する | ALT-013 |
 | ALT-015 | ✅ | CLI引数の未接続項目を実行経路へ反映する | ALT-014 |
-| ALT-016 | ⏳ | WebFetchとWebSearchツールを追加する | ALT-014 |
+| ALT-016 | 🚧 | WebFetchとWebSearchツールを追加する | ALT-014 |
 | ALT-017 | ⏳ | パーミッション仕様をregexと否定対応に拡張する | ALT-015 |
 | ALT-018 | ⏳ | フック設定とpre/post実行基盤を実装する | ALT-017 |
 | ALT-019 | ⏳ | 設定スキーマを要求項目まで拡張する | ALT-014 |
@@ -87,16 +92,14 @@
 | ALT-026 | ⏳ | カバレッジ計測と不足テストを追加する | ALT-022,ALT-024 |
 | ALT-027 | ⏳ | REQUIREMENTS/TASK/READMEの完了判定を再整合する | ALT-025,ALT-026 |
 
-## Residual Backlog
+## 変更サマリ
 
-- 実APIキーを使ったプロバイダごとの運用疎通確認
-- 実行中だった LLM ストリームそのものの再開
-- Claude Code の本格的な vim モード（挿入/コマンドの完全切替）
-- プロバイダ別の価格テーブル管理と、usage から料金への best-effort 変換
-- 課金 API や請求ダッシュボードとの最終照合導線
+### Phase F 変更ファイル
 
-## TUI Image Input Design
-
-- まずはファイルパス入力を TUI で収集して既存の `LlmRequest.images` に流す（実装済み）
-- ツール実行やワークスペース編集は従来どおりローカルのまま維持する
-- ドラッグ&ドロップは端末差異が大きいため、その後段で OS ごとの入力正規化を追加する
+| ファイル | 変更内容 |
+|---------|---------|
+| `src/cli.rs` | TUI system prompt設定、default_system_prompt()、stream-json agent loop化、headless tool event |
+| `src/agent/agent.rs` | conversation_messages保持、Usage event、リトライ、コンテキスト制限、max_tokens増加 |
+| `src/tools/tools.rs` | Read offset/limit、ListFiles追加、ToolInput更新 |
+| `src/tui/controller.rs` | ToolEventHandler競合修正、Message[]会話履歴、Usage event |
+| `src/llm/anthropic.rs` | prompt caching (beta header + cache_control) |
