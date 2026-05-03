@@ -95,9 +95,10 @@ run_tarpaulin() {
 
 if cargo llvm-cov --version >/dev/null 2>&1; then
   resolve_rustup_llvm_tools
+  log_file="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/cargo-llvm-cov.log"
   set +e
-  run_llvm_cov
-  status=$?
+  run_llvm_cov 2>&1 | tee "$log_file"
+  status=${PIPESTATUS[0]}
   set -e
   if [ "$status" -eq 0 ]; then
     exit 0
@@ -111,6 +112,11 @@ If the error mentions llvm-tools-preview, install matching LLVM tools:
 If rustc comes from Homebrew or another distribution, set LLVM_COV and LLVM_PROFDATA
 to the matching tool binaries before running this script.
 HINT
+  if [ -f "$log_file" ]; then
+    echo >&2
+    echo "Last cargo-llvm-cov output lines:" >&2
+    tail -n 120 "$log_file" >&2
+  fi
   exit "$status"
 fi
 
