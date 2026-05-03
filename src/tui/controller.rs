@@ -133,20 +133,18 @@ impl App {
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         if self.state.status_state == "running" {
-                            if let Some(handle) = self.current_task.take() {
-                                handle.abort();
-                            }
-                            self.cancel_pending_approval();
-                            self.state.set_idle();
-                            self.state.append_message("interrupted");
+                            self.interrupt_running_task();
                         } else {
                             self.state.should_quit = true;
                         }
+                        continue;
                     }
-                    if (self.state.approval_pending.is_some()
-                        || self.pending_local_action.is_some())
-                        && self.handle_approval_key(&key.code)
-                    {
+                    if key.code == KeyCode::Esc && self.state.status_state == "running" {
+                        self.interrupt_running_task();
+                        continue;
+                    }
+                    if self.is_waiting_for_approval() {
+                        self.handle_approval_key(&key.code);
                         continue;
                     }
                     match key.code {
@@ -181,6 +179,21 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn is_waiting_for_approval(&self) -> bool {
+        self.state.approval_pending.is_some()
+            || self.pending_local_action.is_some()
+            || self.restored_tool_approval.is_some()
+    }
+
+    fn interrupt_running_task(&mut self) {
+        if let Some(handle) = self.current_task.take() {
+            handle.abort();
+        }
+        self.cancel_pending_approval();
+        self.state.set_idle();
+        self.state.append_message("interrupted");
     }
 
     fn ensure_layout_space(&mut self, stdout: &mut Stdout) -> Result<()> {
@@ -822,25 +835,20 @@ impl App {
                     self.state.append_message(&format!("error: {}", err));
                     self.state.set_idle();
                     self.current_task = None;
+                    self.cancel_pending_approval();
                 }
             }
         }
     }
 
-    fn handle_approval_key(&mut self, key: &KeyCode) -> bool {
-        let decision = match key {
-            KeyCode::Char('y') => Some(ToolApprovalDecision::AllowOnce),
-            KeyCode::Char('n') => Some(ToolApprovalDecision::DenyOnce),
-            KeyCode::Char('a') => Some(ToolApprovalDecision::AllowAll),
-            KeyCode::Char('d') => Some(ToolApprovalDecision::DenyAll),
-            _ => None,
-        };
+    fn handle_approval_key(&mut self, key: &KeyCode) {
+        let decision = approval_decision_for_key(key);
         if let Some(decision) = decision {
             if let Some(pending) = self.state.approval_pending.take() {
                 let _ = pending.respond_to.send(decision);
                 self.pending_tool_approval = None;
                 self.state.status_detail = "waiting LLM".to_string();
-                return true;
+                return;
             }
             if let Some(action) = self.pending_local_action.take() {
                 let approved = matches!(
@@ -855,7 +863,7 @@ impl App {
                 self.state.append_message(&message);
                 self.state.append_blank_line();
                 self.state.set_idle();
-                return true;
+                return;
             }
             if let Some(restored) = self.restored_tool_approval.take() {
                 let approved = matches!(
@@ -873,11 +881,9 @@ impl App {
                 self.state.append_message(&message);
                 self.state.append_blank_line();
                 self.state.set_idle();
-                return true;
+                return;
             }
-            return true;
         }
-        true
     }
 
     fn cancel_pending_approval(&mut self) {
@@ -2308,6 +2314,16 @@ fn format_approval_prompt(request: &ToolApprovalRequest) -> String {
     )
 }
 
+fn approval_decision_for_key(key: &KeyCode) -> Option<ToolApprovalDecision> {
+    match key {
+        KeyCode::Char('y') => Some(ToolApprovalDecision::AllowOnce),
+        KeyCode::Char('n') => Some(ToolApprovalDecision::DenyOnce),
+        KeyCode::Char('a') => Some(ToolApprovalDecision::AllowAll),
+        KeyCode::Char('d') => Some(ToolApprovalDecision::DenyAll),
+        _ => None,
+    }
+}
+
 fn tool_name_label(tool: Tool) -> &'static str {
     match tool {
         Tool::Read => "Read",
@@ -3571,6 +3587,28 @@ mod tests {
             handle_slash_command("/model claude-sonnet-4"),
             Some(SlashCommandOutcome::SetModel(Some(model))) if model == "claude-sonnet-4"
         ));
+    }
+
+    #[test]
+    fn approval_keys_only_accept_explicit_decisions() {
+        let decision = approval_decision_for_key(&KeyCode::Char('x'));
+        assert!(decision.is_none());
+        assert_eq!(
+            approval_decision_for_key(&KeyCode::Char('y')),
+            Some(ToolApprovalDecision::AllowOnce)
+        );
+        assert_eq!(
+            approval_decision_for_key(&KeyCode::Char('n')),
+            Some(ToolApprovalDecision::DenyOnce)
+        );
+        assert_eq!(
+            approval_decision_for_key(&KeyCode::Char('a')),
+            Some(ToolApprovalDecision::AllowAll)
+        );
+        assert_eq!(
+            approval_decision_for_key(&KeyCode::Char('d')),
+            Some(ToolApprovalDecision::DenyAll)
+        );
     }
 
     #[test]

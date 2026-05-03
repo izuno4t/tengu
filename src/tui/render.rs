@@ -92,6 +92,7 @@ pub fn draw(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
     }
 
     let origin = state.origin_y;
+    clear_render_region(stdout, state, origin, total_height)?;
     for (idx, line) in lines.iter().enumerate() {
         let row = origin.saturating_add(idx as u16);
         let row_ansi = row.saturating_add(1);
@@ -156,6 +157,8 @@ pub fn draw(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
     state.inline.footer_row = Some(footer_row);
     state.inline.input_rows = input_rows;
     state.inline.status_rows = 0;
+    state.inline.rendered_origin_y = Some(origin);
+    state.inline.rendered_rows = total_height;
     state.inline.dirty = false;
 
     write!(
@@ -165,6 +168,30 @@ pub fn draw(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
         ansi::show_cursor()
     )?;
     stdout.flush()?;
+
+    Ok(())
+}
+
+fn clear_render_region<W: Write>(
+    stdout: &mut W,
+    state: &AppState,
+    origin: u16,
+    total_height: u16,
+) -> io::Result<()> {
+    let previous_origin = state.inline.rendered_origin_y.unwrap_or(origin);
+    let previous_end = previous_origin.saturating_add(state.inline.rendered_rows);
+    let current_end = origin.saturating_add(total_height);
+    let clear_origin = previous_origin.min(origin);
+    let clear_end = previous_end.max(current_end);
+
+    for row in clear_origin..clear_end {
+        write!(
+            stdout,
+            "{}{}",
+            ansi::move_to(row.saturating_add(1), 1),
+            ansi::clear_line()
+        )?;
+    }
 
     Ok(())
 }
@@ -670,4 +697,51 @@ fn style_task_line(line: &str, width: usize) -> Vec<String> {
         }
     }
     wrap_ansi_line(line, width)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn test_state() -> AppState {
+        let (tx, rx) = mpsc::channel();
+        AppState::new(
+            "banner".to_string(),
+            "model".to_string(),
+            "build".to_string(),
+            rx,
+            tx,
+        )
+    }
+
+    #[test]
+    fn clear_render_region_clears_previous_taller_frame() {
+        let mut state = test_state();
+        state.inline.rendered_origin_y = Some(2);
+        state.inline.rendered_rows = 5;
+
+        let mut output = Vec::new();
+        clear_render_region(&mut output, &state, 4, 2).unwrap();
+        let text = String::from_utf8(output).unwrap();
+
+        assert!(text.contains("\x1b[3;1H\x1b[K"));
+        assert!(text.contains("\x1b[7;1H\x1b[K"));
+        assert!(!text.contains("\x1b[8;1H\x1b[K"));
+    }
+
+    #[test]
+    fn clear_render_region_clears_current_taller_frame() {
+        let mut state = test_state();
+        state.inline.rendered_origin_y = Some(4);
+        state.inline.rendered_rows = 2;
+
+        let mut output = Vec::new();
+        clear_render_region(&mut output, &state, 2, 5).unwrap();
+        let text = String::from_utf8(output).unwrap();
+
+        assert!(text.contains("\x1b[3;1H\x1b[K"));
+        assert!(text.contains("\x1b[7;1H\x1b[K"));
+        assert!(!text.contains("\x1b[8;1H\x1b[K"));
+    }
 }

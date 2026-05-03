@@ -6,6 +6,8 @@ pub struct InlineRenderState {
     pub input_rows: u16,
     pub status_rows: u16,
     pub min_log_rows: u16,
+    pub rendered_origin_y: Option<u16>,
+    pub rendered_rows: u16,
     pub dirty: bool,
 }
 
@@ -18,6 +20,8 @@ impl Default for InlineRenderState {
             input_rows: 0,
             status_rows: 0,
             min_log_rows: 3,
+            rendered_origin_y: None,
+            rendered_rows: 0,
             dirty: true,
         }
     }
