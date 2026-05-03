@@ -8,7 +8,9 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use base64::Engine;
 use crossterm::cursor::position;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size, ScrollUp};
 use futures_util::StreamExt;
@@ -29,7 +31,7 @@ use crate::session::SessionPendingApproval;
 use crate::session::{Session, SessionStore};
 use crate::tools::{Tool, ToolApprovalDecision, ToolApprovalRequest};
 use crate::tui::file_completion::{
-    completion_context, extract_file_references, file_completions, replace_completion,
+    completion_context_at, extract_file_references, file_completions, replace_completion,
 };
 use crate::tui::render;
 use crate::tui::state::{AppState, ApprovalPending, PendingMode, TuiEvent};
@@ -110,70 +112,140 @@ impl App {
         writeln!(stdout)?;
         stdout.flush()?;
         enable_raw_mode()?;
+        if let Err(err) = execute!(stdout, EnableBracketedPaste) {
+            let _ = disable_raw_mode();
+            return Err(err.into());
+        }
         self.state.origin_y = position().map(|(_, y)| y).unwrap_or(0);
         let result = self.run_loop(&mut stdout);
+        let restore_result = restore_terminal_mode(&mut stdout);
 
-        disable_raw_mode()?;
-        execute!(stdout, crossterm::cursor::Show)?;
-
-        result
+        match (result, restore_result) {
+            (Err(err), _) => Err(err),
+            (Ok(()), Err(err)) => Err(err),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 
     fn run_loop(&mut self, stdout: &mut Stdout) -> Result<()> {
         while !self.state.should_quit {
+            self.drain_results();
+            self.maybe_start_next();
             self.ensure_layout_space(stdout)?;
             render::draw(stdout, &mut self.state)?;
 
             self.state.tick = self.state.tick.wrapping_add(1);
-            self.drain_results();
-            self.maybe_start_next();
             if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                match event::read()? {
+                    Event::Key(key)
+                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                     {
-                        if self.state.status_state == "running" {
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            if self.state.status_state == "running" {
+                                self.interrupt_running_task();
+                            } else {
+                                self.state.should_quit = true;
+                            }
+                            continue;
+                        }
+                        if key.code == KeyCode::Esc && self.state.status_state == "running" {
                             self.interrupt_running_task();
-                        } else {
-                            self.state.should_quit = true;
+                            continue;
                         }
-                        continue;
+                        if self.is_waiting_for_approval() {
+                            self.handle_approval_key(&key.code);
+                            continue;
+                        }
+                        match key.code {
+                            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                self.state.move_input_cursor_start();
+                                self.refresh_suggestions();
+                            }
+                            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                self.state.move_input_cursor_end();
+                                self.refresh_suggestions();
+                            }
+                            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                self.state.cancel_history_navigation();
+                                self.state.insert_input_char('\n');
+                                self.refresh_suggestions();
+                            }
+                            KeyCode::Char(ch) => {
+                                self.state.cancel_history_navigation();
+                                self.state.insert_input_char(ch);
+                                self.refresh_suggestions();
+                            }
+                            KeyCode::Left => {
+                                self.state.move_input_cursor_left();
+                                self.refresh_suggestions();
+                            }
+                            KeyCode::Right => {
+                                self.state.move_input_cursor_right();
+                                self.refresh_suggestions();
+                            }
+                            KeyCode::Home => {
+                                self.state.move_input_cursor_line_start();
+                                self.refresh_suggestions();
+                            }
+                            KeyCode::End => {
+                                self.state.move_input_cursor_line_end();
+                                self.refresh_suggestions();
+                            }
+                            KeyCode::Up => {
+                                if !self.state.input_has_multiple_lines()
+                                    || !self.state.move_input_cursor_previous_line()
+                                {
+                                    self.history_prev();
+                                } else {
+                                    self.refresh_suggestions();
+                                }
+                            }
+                            KeyCode::Down => {
+                                if !self.state.input_has_multiple_lines()
+                                    || !self.state.move_input_cursor_next_line()
+                                {
+                                    self.history_next();
+                                } else {
+                                    self.refresh_suggestions();
+                                }
+                            }
+                            KeyCode::Tab => {
+                                self.complete_file_reference();
+                            }
+                            KeyCode::Backspace => {
+                                self.state.cancel_history_navigation();
+                                self.state.backspace_input_char();
+                                self.refresh_suggestions();
+                            }
+                            KeyCode::Delete => {
+                                self.state.cancel_history_navigation();
+                                self.state.delete_input_char();
+                                self.refresh_suggestions();
+                            }
+                            KeyCode::Enter => {
+                                self.handle_input();
+                            }
+                            KeyCode::Esc => {
+                                self.state.cancel_history_navigation();
+                                self.state.clear_input();
+                                self.refresh_suggestions();
+                            }
+                            _ => {}
+                        }
                     }
-                    if key.code == KeyCode::Esc && self.state.status_state == "running" {
-                        self.interrupt_running_task();
-                        continue;
-                    }
-                    if self.is_waiting_for_approval() {
-                        self.handle_approval_key(&key.code);
-                        continue;
-                    }
-                    match key.code {
-                        KeyCode::Char(ch) => {
-                            self.state.input.push(ch);
+                    Event::Paste(text) => {
+                        if !self.is_waiting_for_approval() {
+                            self.state.cancel_history_navigation();
+                            self.state.insert_input_text(&text);
                             self.refresh_suggestions();
                         }
-                        KeyCode::Up => {
-                            self.history_prev();
-                        }
-                        KeyCode::Down => {
-                            self.history_next();
-                        }
-                        KeyCode::Tab => {
-                            self.complete_file_reference();
-                        }
-                        KeyCode::Backspace => {
-                            self.state.input.pop();
-                            self.refresh_suggestions();
-                        }
-                        KeyCode::Enter => {
-                            self.handle_input();
-                        }
-                        KeyCode::Esc => {
-                            self.state.input.clear();
-                            self.refresh_suggestions();
-                        }
-                        _ => {}
                     }
+                    Event::Resize(_, _) => {
+                        self.state.inline.dirty = true;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -197,8 +269,8 @@ impl App {
     }
 
     fn ensure_layout_space(&mut self, stdout: &mut Stdout) -> Result<()> {
-        let (_term_width, term_height) = size()?;
-        let required = self.required_height();
+        let (term_width, term_height) = size()?;
+        let required = self.required_height(term_width as usize);
         let needed = self
             .state
             .origin_y
@@ -211,8 +283,8 @@ impl App {
         Ok(())
     }
 
-    fn required_height(&mut self) -> u16 {
-        let input_height = self.state.input_row_count().saturating_add(1);
+    fn required_height(&mut self, width: usize) -> u16 {
+        let input_height = self.state.input_visual_row_count(width).saturating_add(1);
         let divider_height = 1u16;
         let spacer_height = 1u16;
         let status_height = 1u16;
@@ -223,11 +295,21 @@ impl App {
         } else {
             self.state.suggestions.lines().count() as u16
         };
+        let queue_height = if self.state.queue.is_empty() {
+            0
+        } else {
+            self.state
+                .queue
+                .len()
+                .saturating_add(1)
+                .min(u16::MAX as usize) as u16
+        };
         let mut desired_log = (self.state.log_lines.len() as u16).max(3);
         if desired_log >= 5 {
             self.state.inline.min_log_rows = 5;
         }
         desired_log = desired_log.max(self.state.inline.min_log_rows);
+        desired_log = desired_log.saturating_add(queue_height);
         desired_log
             .saturating_add(spacer_height)
             .saturating_add(status_height)
@@ -239,7 +321,7 @@ impl App {
     }
 
     fn refresh_suggestions(&mut self) {
-        if let Some(context) = completion_context(&self.state.input) {
+        if let Some(context) = completion_context_at(&self.state.input, self.state.input_cursor) {
             let candidates =
                 file_completions(Path::new("."), &context.query, &self.state.recent_files, 5);
             self.state.suggestions = if candidates.is_empty() {
@@ -259,7 +341,8 @@ impl App {
     }
 
     fn complete_file_reference(&mut self) {
-        let Some(context) = completion_context(&self.state.input) else {
+        let Some(context) = completion_context_at(&self.state.input, self.state.input_cursor)
+        else {
             return;
         };
         let Some(candidate) =
@@ -269,13 +352,21 @@ impl App {
         else {
             return;
         };
-        self.state.input = replace_completion(&self.state.input, &context, &candidate);
+        let next = replace_completion(&self.state.input, &context, &candidate);
+        let next_cursor = context.start
+            + 1
+            + candidate.replacement.chars().count()
+            + usize::from(!candidate.replacement.ends_with('/'));
+        self.state.cancel_history_navigation();
+        self.state.set_input(next);
+        self.state.input_cursor = next_cursor;
         self.refresh_suggestions();
     }
 
     fn handle_input(&mut self) {
         let input = self.state.input.trim().to_string();
-        self.state.input.clear();
+        self.state.cancel_history_navigation();
+        self.state.clear_input();
         self.refresh_suggestions();
         if input.is_empty() {
             return;
@@ -529,9 +620,11 @@ impl App {
         if self.state.status_state == "running" {
             self.record_recent_file_references(&input);
             let images = self.state.take_pending_images();
+            self.state
+                .append_user_message(&format!("queued > {}", input));
             self.state.queue.push_back(crate::tui::state::PendingInput {
                 text: input,
-                logged: false,
+                logged: true,
                 images,
                 mode: if self.state.plan_mode {
                     PendingMode::Plan
@@ -597,7 +690,7 @@ impl App {
             Some(idx) => idx.saturating_sub(1),
         };
         self.state.history_index = Some(next_index);
-        self.state.input = self.state.history[next_index].clone();
+        self.state.set_input(self.state.history[next_index].clone());
         self.refresh_suggestions();
     }
 
@@ -608,11 +701,11 @@ impl App {
         let next = idx.saturating_add(1);
         if next >= self.state.history.len() {
             self.state.history_index = None;
-            self.state.input = self.state.draft_input.clone();
+            self.state.set_input(self.state.draft_input.clone());
             self.state.draft_input.clear();
         } else {
             self.state.history_index = Some(next);
-            self.state.input = self.state.history[next].clone();
+            self.state.set_input(self.state.history[next].clone());
         }
         self.refresh_suggestions();
     }
@@ -881,7 +974,6 @@ impl App {
                 self.state.append_message(&message);
                 self.state.append_blank_line();
                 self.state.set_idle();
-                return;
             }
         }
     }
@@ -1903,6 +1995,25 @@ impl App {
             ),
             Err(err) => format!("failed to launch editor: {}", err),
         }
+    }
+}
+
+fn restore_terminal_mode(stdout: &mut Stdout) -> Result<()> {
+    let mut first_error: Option<anyhow::Error> = None;
+
+    if let Err(err) = execute!(stdout, DisableBracketedPaste) {
+        first_error.get_or_insert_with(|| err.into());
+    }
+    if let Err(err) = disable_raw_mode() {
+        first_error.get_or_insert_with(|| err.into());
+    }
+    if let Err(err) = execute!(stdout, crossterm::cursor::Show) {
+        first_error.get_or_insert_with(|| err.into());
+    }
+
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
     }
 }
 

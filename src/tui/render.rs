@@ -7,7 +7,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::as_24_bit_terminal_escaped;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 use crate::tui::ansi;
 use crate::tui::state::{AppState, LogRole};
@@ -26,13 +26,16 @@ static SYNTAX_THEME: Lazy<Theme> = Lazy::new(|| {
 
 pub fn draw(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
     let (term_width, _term_height) = size()?;
-    let width = term_width as usize;
+    draw_to_writer(stdout, state, term_width as usize)
+}
 
+fn draw_to_writer<W: Write>(stdout: &mut W, state: &mut AppState, width: usize) -> io::Result<()> {
     let spacer_height = 1u16;
     let status_height = 1u16;
     let status_gap = 1u16;
     let divider_height = 1u16;
-    let input_rows = state.input_row_count();
+    let input_display_lines = build_input_lines(&state.input, width);
+    let input_rows = (input_display_lines.len() as u16).max(1);
     let input_height = input_rows.saturating_add(1);
     let app_status_height = 1u16;
     let help_height = if state.suggestions.is_empty() {
@@ -40,11 +43,13 @@ pub fn draw(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
     } else {
         state.suggestions.lines().count() as u16
     };
-    let mut log_height = (state.log_lines.len() as u16).max(3);
-    if log_height >= 5 {
+    let queue_height = queue_line_count(state);
+    let mut base_log_height = (state.log_lines.len() as u16).max(3);
+    if base_log_height >= 5 {
         state.inline.min_log_rows = 5;
     }
-    log_height = log_height.max(state.inline.min_log_rows);
+    base_log_height = base_log_height.max(state.inline.min_log_rows);
+    let log_height = base_log_height.saturating_add(queue_height);
 
     let total_height = log_height
         .saturating_add(spacer_height)
@@ -69,11 +74,8 @@ pub fn draw(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
         ansi::set_fg(THEME.divider),
     ));
 
-    let input_lines: Vec<&str> = state.input.split('\n').collect();
-    for (idx, line) in input_lines.iter().enumerate() {
-        let prefix = if idx == 0 { "> " } else { "  " };
-        let input_line = format!("{}{}", prefix, line);
-        lines.push(fit_width(&input_line, width));
+    for line in &input_display_lines {
+        lines.push(fit_width(line, width));
     }
     while lines.len() < (log_height + spacer_height + divider_height + input_rows) as usize {
         lines.push(String::new());
@@ -139,16 +141,16 @@ pub fn draw(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
         )?;
     }
 
-    let input_row = origin
+    let input_start_row = origin
         .saturating_add(log_height)
         .saturating_add(spacer_height)
         .saturating_add(status_height)
         .saturating_add(status_gap)
-        .saturating_add(divider_height)
-        .saturating_add(input_rows.saturating_sub(1));
-    let last_line = input_lines.last().copied().unwrap_or("");
-    let cursor_offset = UnicodeWidthStr::width(last_line) as u16;
-    let cursor_col = 2u16.saturating_add(cursor_offset);
+        .saturating_add(divider_height);
+    let (cursor_line, cursor_offset) =
+        input_cursor_position(&state.input, state.input_cursor, width);
+    let input_row = input_start_row.saturating_add(cursor_line);
+    let cursor_col = if cursor_line == 0 { 2u16 } else { 1u16 }.saturating_add(cursor_offset);
     let cursor_row_ansi = input_row.saturating_add(1);
     let cursor_col_ansi = cursor_col.saturating_add(1);
 
@@ -170,6 +172,74 @@ pub fn draw(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
     stdout.flush()?;
 
     Ok(())
+}
+
+fn build_input_lines(input: &str, width: usize) -> Vec<String> {
+    let content_width = input_content_width(width);
+    let mut lines = Vec::new();
+    for (physical_idx, physical) in input.split('\n').enumerate() {
+        let wrapped = wrap_plain_input_line(physical, content_width);
+        for (segment_idx, segment) in wrapped.into_iter().enumerate() {
+            let prefix = if physical_idx == 0 && segment_idx == 0 {
+                "> "
+            } else {
+                "  "
+            };
+            lines.push(format!("{}{}", prefix, segment));
+        }
+    }
+    if lines.is_empty() {
+        lines.push("> ".to_string());
+    }
+    lines
+}
+
+fn input_cursor_position(input: &str, cursor: usize, width: usize) -> (u16, u16) {
+    let content_width = input_content_width(width);
+    let mut line = 0u16;
+    let mut line_width = 0usize;
+    for ch in input.chars().take(cursor) {
+        if ch == '\n' {
+            line = line.saturating_add(1);
+            line_width = 0;
+            continue;
+        }
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if line_width > 0 && line_width + ch_width > content_width {
+            line = line.saturating_add(1);
+            line_width = 0;
+        }
+        line_width = line_width.saturating_add(ch_width);
+    }
+    (line, line_width as u16)
+}
+
+fn input_content_width(width: usize) -> usize {
+    width.saturating_sub(3).max(1)
+}
+
+fn wrap_plain_input_line(line: &str, width: usize) -> Vec<String> {
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for ch in line.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width > 0 && current_width + ch_width > width {
+            lines.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width = current_width.saturating_add(ch_width);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn clear_render_region<W: Write>(
@@ -257,6 +327,14 @@ fn build_queue_lines(state: &AppState, width: usize) -> Vec<String> {
         lines.push(colorize_line(&entry, width, ansi::set_fg(THEME.queue)));
     }
     lines
+}
+
+fn queue_line_count(state: &AppState) -> u16 {
+    if state.queue.is_empty() {
+        0
+    } else {
+        state.queue.len().saturating_add(1).min(u16::MAX as usize) as u16
+    }
 }
 
 fn build_status_lines(state: &AppState, width: usize) -> Vec<String> {
@@ -743,5 +821,71 @@ mod tests {
         assert!(text.contains("\x1b[3;1H\x1b[K"));
         assert!(text.contains("\x1b[7;1H\x1b[K"));
         assert!(!text.contains("\x1b[8;1H\x1b[K"));
+    }
+
+    #[test]
+    fn input_cursor_position_tracks_lines_and_unicode_width() {
+        assert_eq!(input_cursor_position("abc", 2, 20), (0, 2));
+        assert_eq!(input_cursor_position("ab\ncd", 4, 20), (1, 1));
+        assert_eq!(input_cursor_position("aあb", 2, 20), (0, 3));
+        assert_eq!(input_cursor_position("abcdef", 6, 8), (1, 1));
+    }
+
+    #[test]
+    fn build_input_lines_wraps_long_input_with_continuation_prefix() {
+        assert_eq!(
+            build_input_lines("abcdef", 8),
+            vec!["> abcde".to_string(), "  f".to_string()]
+        );
+        assert_eq!(
+            build_input_lines("abc\ndef", 20),
+            vec!["> abc".to_string(), "  def".to_string()]
+        );
+    }
+
+    #[test]
+    fn queue_line_count_includes_header_and_items() {
+        let mut state = test_state();
+        assert_eq!(queue_line_count(&state), 0);
+
+        state.queue.push_back(crate::tui::state::PendingInput {
+            text: "first".to_string(),
+            logged: true,
+            images: Vec::new(),
+            mode: crate::tui::state::PendingMode::Execute,
+        });
+        state.queue.push_back(crate::tui::state::PendingInput {
+            text: "second".to_string(),
+            logged: true,
+            images: Vec::new(),
+            mode: crate::tui::state::PendingMode::Plan,
+        });
+
+        assert_eq!(queue_line_count(&state), 3);
+    }
+
+    #[test]
+    fn draw_to_writer_renders_input_suggestions_queue_and_footer() {
+        let mut state = test_state();
+        state.origin_y = 0;
+        state.set_input("review @src/main.rs".to_string());
+        state.suggestions = "TAB @src/main.rs".to_string();
+        state.queue.push_back(crate::tui::state::PendingInput {
+            text: "queued prompt".to_string(),
+            logged: true,
+            images: Vec::new(),
+            mode: crate::tui::state::PendingMode::Execute,
+        });
+
+        let mut output = Vec::new();
+        draw_to_writer(&mut output, &mut state, 80).unwrap();
+        let text = String::from_utf8(output).unwrap();
+
+        assert!(text.contains("> review @src/main.rs"));
+        assert!(text.contains("TAB @src/main.rs"));
+        assert!(text.contains("queued: 1"));
+        assert!(text.contains("queued prompt"));
+        assert!(text.contains("model: model"));
+        assert!(state.inline.rendered_rows > 0);
     }
 }

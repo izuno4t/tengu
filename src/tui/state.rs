@@ -105,6 +105,7 @@ pub struct AppState {
     pub log_lines: VecDeque<LogLine>,
     pub banner_lines: Vec<String>,
     pub input: String,
+    pub input_cursor: usize,
     pub suggestions: String,
     pub origin_y: u16,
     pub inline: InlineRenderState,
@@ -162,6 +163,7 @@ impl AppState {
             log_lines,
             banner_lines,
             input: String::new(),
+            input_cursor: 0,
             suggestions: String::new(),
             origin_y: 0,
             inline: InlineRenderState::default(),
@@ -268,9 +270,126 @@ impl AppState {
         parts.join("\n")
     }
 
-    pub fn input_row_count(&self) -> u16 {
-        let count = self.input.split('\n').count();
-        count.max(1) as u16
+    pub fn input_visual_row_count(&self, width: usize) -> u16 {
+        let content_width = input_content_width(width);
+        self.input
+            .split('\n')
+            .map(|line| wrapped_plain_line_count(line, content_width))
+            .sum::<usize>()
+            .max(1) as u16
+    }
+
+    pub fn set_input(&mut self, input: String) {
+        self.input = input;
+        self.input_cursor = self.input.chars().count();
+    }
+
+    pub fn clear_input(&mut self) {
+        self.input.clear();
+        self.input_cursor = 0;
+    }
+
+    pub fn cancel_history_navigation(&mut self) {
+        self.history_index = None;
+        self.draft_input.clear();
+    }
+
+    pub fn insert_input_char(&mut self, ch: char) {
+        let byte_index = input_byte_index(&self.input, self.input_cursor);
+        self.input.insert(byte_index, ch);
+        self.input_cursor = self.input_cursor.saturating_add(1);
+    }
+
+    pub fn insert_input_text(&mut self, text: &str) {
+        for ch in text.chars() {
+            self.insert_input_char(ch);
+        }
+    }
+
+    pub fn input_has_multiple_lines(&self) -> bool {
+        self.input.contains('\n')
+    }
+
+    pub fn backspace_input_char(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let start = input_byte_index(&self.input, self.input_cursor.saturating_sub(1));
+        let end = input_byte_index(&self.input, self.input_cursor);
+        self.input.replace_range(start..end, "");
+        self.input_cursor = self.input_cursor.saturating_sub(1);
+    }
+
+    pub fn delete_input_char(&mut self) {
+        let char_len = self.input.chars().count();
+        if self.input_cursor >= char_len {
+            return;
+        }
+        let start = input_byte_index(&self.input, self.input_cursor);
+        let end = input_byte_index(&self.input, self.input_cursor.saturating_add(1));
+        self.input.replace_range(start..end, "");
+    }
+
+    pub fn move_input_cursor_left(&mut self) {
+        self.input_cursor = self.input_cursor.saturating_sub(1);
+    }
+
+    pub fn move_input_cursor_right(&mut self) {
+        self.input_cursor = self
+            .input_cursor
+            .saturating_add(1)
+            .min(self.input.chars().count());
+    }
+
+    pub fn move_input_cursor_start(&mut self) {
+        self.input_cursor = 0;
+    }
+
+    pub fn move_input_cursor_end(&mut self) {
+        self.input_cursor = self.input.chars().count();
+    }
+
+    pub fn move_input_cursor_line_start(&mut self) {
+        self.input_cursor = input_line_start(&self.input, self.input_cursor);
+    }
+
+    pub fn move_input_cursor_line_end(&mut self) {
+        let line_start = input_line_start(&self.input, self.input_cursor);
+        self.input_cursor = input_line_end(&self.input, line_start);
+    }
+
+    pub fn move_input_cursor_previous_line(&mut self) -> bool {
+        let Some((line_start, column)) =
+            input_line_start_and_column(&self.input, self.input_cursor)
+        else {
+            return false;
+        };
+        if line_start == 0 {
+            return false;
+        }
+        let previous_end = line_start.saturating_sub(1);
+        let previous_start = input_line_start(&self.input, previous_end);
+        let previous_len = previous_end.saturating_sub(previous_start);
+        self.input_cursor = previous_start.saturating_add(column.min(previous_len));
+        true
+    }
+
+    pub fn move_input_cursor_next_line(&mut self) -> bool {
+        let Some((line_start, column)) =
+            input_line_start_and_column(&self.input, self.input_cursor)
+        else {
+            return false;
+        };
+        let line_end = input_line_end(&self.input, line_start);
+        let char_len = self.input.chars().count();
+        if line_end >= char_len {
+            return false;
+        }
+        let next_start = line_end.saturating_add(1);
+        let next_end = input_line_end(&self.input, next_start);
+        let next_len = next_end.saturating_sub(next_start);
+        self.input_cursor = next_start.saturating_add(column.min(next_len));
+        true
     }
 
     pub fn visible_log_lines(&self, height: u16) -> Vec<LogLine> {
@@ -595,6 +714,7 @@ impl AppState {
         self.conversation.clear();
         self.current_assistant.clear();
         self.input.clear();
+        self.input_cursor = 0;
         self.suggestions.clear();
         self.draft_input.clear();
         self.history_index = None;
@@ -642,4 +762,192 @@ fn extract_plan_items(plan: &str) -> Vec<String> {
         items.push(plan.trim().to_string());
     }
     items
+}
+
+fn input_byte_index(input: &str, char_index: usize) -> usize {
+    input
+        .char_indices()
+        .nth(char_index)
+        .map(|(idx, _)| idx)
+        .unwrap_or(input.len())
+}
+
+fn input_line_start_and_column(input: &str, cursor: usize) -> Option<(usize, usize)> {
+    if cursor > input.chars().count() {
+        return None;
+    }
+    let start = input_line_start(input, cursor);
+    Some((start, cursor.saturating_sub(start)))
+}
+
+fn input_line_start(input: &str, cursor: usize) -> usize {
+    let mut start = 0usize;
+    for (idx, ch) in input.chars().enumerate().take(cursor) {
+        if ch == '\n' {
+            start = idx.saturating_add(1);
+        }
+    }
+    start
+}
+
+fn input_line_end(input: &str, start: usize) -> usize {
+    input
+        .chars()
+        .enumerate()
+        .skip(start)
+        .find_map(|(idx, ch)| if ch == '\n' { Some(idx) } else { None })
+        .unwrap_or_else(|| input.chars().count())
+}
+
+fn input_content_width(width: usize) -> usize {
+    width.saturating_sub(3).max(1)
+}
+
+fn wrapped_plain_line_count(line: &str, width: usize) -> usize {
+    if line.is_empty() {
+        return 1;
+    }
+    let mut rows = 1usize;
+    let mut current_width = 0usize;
+    for ch in line.chars() {
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width > 0 && current_width + ch_width > width {
+            rows = rows.saturating_add(1);
+            current_width = 0;
+        }
+        current_width = current_width.saturating_add(ch_width);
+    }
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn test_state() -> AppState {
+        let (tx, rx) = mpsc::channel();
+        AppState::new(
+            "banner".to_string(),
+            "model".to_string(),
+            "build".to_string(),
+            rx,
+            tx,
+        )
+    }
+
+    #[test]
+    fn input_editing_inserts_and_deletes_at_cursor() {
+        let mut state = test_state();
+        state.set_input("ac".to_string());
+        state.move_input_cursor_left();
+        state.insert_input_char('b');
+        assert_eq!(state.input, "abc");
+        assert_eq!(state.input_cursor, 2);
+
+        state.backspace_input_char();
+        assert_eq!(state.input, "ac");
+        assert_eq!(state.input_cursor, 1);
+
+        state.delete_input_char();
+        assert_eq!(state.input, "a");
+        assert_eq!(state.input_cursor, 1);
+    }
+
+    #[test]
+    fn input_editing_handles_multibyte_characters() {
+        let mut state = test_state();
+        state.set_input("あう".to_string());
+        state.move_input_cursor_left();
+        state.insert_input_char('い');
+        assert_eq!(state.input, "あいう");
+        assert_eq!(state.input_cursor, 2);
+
+        state.backspace_input_char();
+        assert_eq!(state.input, "あう");
+        state.delete_input_char();
+        assert_eq!(state.input, "あ");
+    }
+
+    #[test]
+    fn input_editing_inserts_pasted_text_at_cursor() {
+        let mut state = test_state();
+        state.set_input("ac".to_string());
+        state.move_input_cursor_left();
+
+        state.insert_input_text("b\nあ");
+
+        assert_eq!(state.input, "ab\nあc");
+        assert_eq!(state.input_cursor, 4);
+    }
+
+    #[test]
+    fn input_visual_row_count_wraps_long_lines() {
+        let mut state = test_state();
+        state.set_input("abcdef".to_string());
+        assert_eq!(state.input_visual_row_count(8), 2);
+
+        state.set_input("abc\ndef".to_string());
+        assert_eq!(state.input_visual_row_count(20), 2);
+    }
+
+    #[test]
+    fn cancel_history_navigation_clears_selection_and_draft() {
+        let mut state = test_state();
+        state.history_index = Some(1);
+        state.draft_input = "draft".to_string();
+
+        state.cancel_history_navigation();
+
+        assert_eq!(state.history_index, None);
+        assert!(state.draft_input.is_empty());
+    }
+
+    #[test]
+    fn input_cursor_moves_between_physical_lines() {
+        let mut state = test_state();
+        state.set_input("abc\ndefg\nhi".to_string());
+        state.input_cursor = 6;
+
+        assert!(state.move_input_cursor_previous_line());
+        assert_eq!(state.input_cursor, 2);
+
+        assert!(state.move_input_cursor_next_line());
+        assert_eq!(state.input_cursor, 6);
+
+        assert!(state.move_input_cursor_next_line());
+        assert_eq!(state.input_cursor, 11);
+    }
+
+    #[test]
+    fn input_cursor_line_moves_report_edges() {
+        let mut state = test_state();
+        state.set_input("abc\ndef".to_string());
+        state.input_cursor = 1;
+        assert!(!state.move_input_cursor_previous_line());
+        assert_eq!(state.input_cursor, 1);
+
+        state.input_cursor = 5;
+        assert!(!state.move_input_cursor_next_line());
+        assert_eq!(state.input_cursor, 5);
+    }
+
+    #[test]
+    fn input_cursor_moves_to_current_line_boundaries() {
+        let mut state = test_state();
+        state.set_input("abc\ndefg\nhi".to_string());
+        state.input_cursor = 6;
+
+        state.move_input_cursor_line_start();
+        assert_eq!(state.input_cursor, 4);
+
+        state.move_input_cursor_line_end();
+        assert_eq!(state.input_cursor, 8);
+
+        state.move_input_cursor_start();
+        assert_eq!(state.input_cursor, 0);
+
+        state.move_input_cursor_end();
+        assert_eq!(state.input_cursor, 11);
+    }
 }

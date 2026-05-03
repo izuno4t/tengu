@@ -26,8 +26,8 @@ struct ScoredPath {
     score: i64,
 }
 
-pub fn completion_context(input: &str) -> Option<FileCompletionContext> {
-    let end = input.len();
+pub fn completion_context_at(input: &str, cursor: usize) -> Option<FileCompletionContext> {
+    let end = input_byte_index(input, cursor);
     let start = input[..end]
         .rfind(char::is_whitespace)
         .map(|idx| idx + 1)
@@ -50,10 +50,11 @@ pub fn replace_completion(
     next.push_str(&input[..context.start]);
     next.push('@');
     next.push_str(&candidate.replacement);
-    if !candidate.replacement.ends_with('/') {
+    let suffix = &input[context.end..];
+    if !candidate.replacement.ends_with('/') && !suffix.starts_with(char::is_whitespace) {
         next.push(' ');
     }
-    next.push_str(&input[context.end..]);
+    next.push_str(suffix);
     next
 }
 
@@ -73,6 +74,14 @@ pub fn extract_file_references(input: &str, root: &Path) -> Vec<String> {
         }
     }
     refs
+}
+
+fn input_byte_index(input: &str, char_index: usize) -> usize {
+    input
+        .char_indices()
+        .nth(char_index)
+        .map(|(idx, _)| idx)
+        .unwrap_or(input.len())
 }
 
 pub fn file_completions(
@@ -269,21 +278,44 @@ mod tests {
 
     #[test]
     fn detects_at_completion_context() {
+        let input = "review @src/ma";
         assert_eq!(
-            completion_context("review @src/ma").unwrap(),
+            completion_context_at(input, input.chars().count()).unwrap(),
             FileCompletionContext {
                 start: 7,
                 end: 14,
                 query: "src/ma".to_string()
             }
         );
-        assert!(completion_context("review src/ma").is_none());
+        let input = "review src/ma";
+        assert!(completion_context_at(input, input.chars().count()).is_none());
+    }
+
+    #[test]
+    fn detects_at_completion_context_at_cursor() {
+        let input = "review @src/ma and @docs/re";
+        assert_eq!(
+            completion_context_at(input, "review @src/ma".chars().count()).unwrap(),
+            FileCompletionContext {
+                start: 7,
+                end: 14,
+                query: "src/ma".to_string()
+            }
+        );
+        assert_eq!(
+            completion_context_at(input, input.chars().count()).unwrap(),
+            FileCompletionContext {
+                start: 19,
+                end: 27,
+                query: "docs/re".to_string()
+            }
+        );
     }
 
     #[test]
     fn replaces_current_file_reference() {
         let input = "review @src/ma";
-        let context = completion_context(input).unwrap();
+        let context = completion_context_at(input, input.chars().count()).unwrap();
         let candidate = FileCompletionCandidate {
             replacement: "src/main.rs".to_string(),
             display: "src/main.rs".to_string(),
@@ -291,6 +323,20 @@ mod tests {
         assert_eq!(
             replace_completion(input, &context, &candidate),
             "review @src/main.rs "
+        );
+    }
+
+    #[test]
+    fn replaces_completion_without_dropping_suffix() {
+        let input = "review @src/ma and keep";
+        let context = completion_context_at(input, "review @src/ma".chars().count()).unwrap();
+        let candidate = FileCompletionCandidate {
+            replacement: "src/main.rs".to_string(),
+            display: "src/main.rs".to_string(),
+        };
+        assert_eq!(
+            replace_completion(input, &context, &candidate),
+            "review @src/main.rs and keep"
         );
     }
 
