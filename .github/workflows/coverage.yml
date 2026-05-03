@@ -16,7 +16,7 @@ jobs:
       COVERAGE_IGNORE_REGEX: "src/(tui/.*|llm/(anthropic|google|openai|ollama)\\.rs|mcp/(http|stdio)\\.rs)"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

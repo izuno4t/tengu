@@ -38,7 +38,7 @@ run_llvm_cov() {
 
   case "$mode" in
     summary)
-      args+=(--summary-only)
+      args+=(--json --summary-only)
       ;;
     html)
       args+=(--html)
