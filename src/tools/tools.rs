@@ -3424,7 +3424,7 @@ mod tests {
                 post_tool_use: vec![HookConfig {
                     matcher: Some("Write(*.txt)".to_string()),
                     command: format!(
-                        "printf '%s|%s|%s' \"$tool\" \"$file\" \"$output\" > {}",
+                        "cat >/dev/null; printf '%s|%s|%s' \"$tool\" \"$file\" \"$output\" > {}",
                         marker.display()
                     ),
                     timeout_ms: Some(1000),

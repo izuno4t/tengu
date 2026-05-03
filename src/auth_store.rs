@@ -333,6 +333,41 @@ fn set_private_permissions(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    struct EnvGuard {
+        home: Option<String>,
+        passphrase: Option<String>,
+        token_var: &'static str,
+        token: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn capture(token_var: &'static str) -> Self {
+            Self {
+                home: std::env::var("HOME").ok(),
+                passphrase: std::env::var(AUTH_PASSPHRASE_ENV).ok(),
+                token_var,
+                token: std::env::var(token_var).ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.passphrase {
+                Some(value) => std::env::set_var(AUTH_PASSPHRASE_ENV, value),
+                None => std::env::remove_var(AUTH_PASSPHRASE_ENV),
+            }
+            match &self.token {
+                Some(value) => std::env::set_var(self.token_var, value),
+                None => std::env::remove_var(self.token_var),
+            }
+        }
+    }
+
     #[test]
     fn saves_and_loads_encrypted_token() {
         let dir = tempfile::tempdir().unwrap();
@@ -473,28 +508,27 @@ mod tests {
     #[test]
     fn env_backed_auth_flow_reports_status_and_hydrates_token() {
         let dir = tempfile::tempdir().unwrap();
-        let old_home = std::env::var("HOME").ok();
-        let old_passphrase = std::env::var(AUTH_PASSPHRASE_ENV).ok();
-        let old_token = std::env::var("OPENAI_API_KEY").ok();
+        let token_var = "TENGU_TEST_OPENAI_API_KEY";
+        let _env = EnvGuard::capture(token_var);
 
         std::env::set_var("HOME", dir.path());
         std::env::remove_var(AUTH_PASSPHRASE_ENV);
-        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var(token_var);
         assert_eq!(token_store_status("openai"), "token_store=missing");
-        assert!(save_login("openai", "OPENAI_API_KEY", "sk-secret")
+        assert!(save_login("openai", token_var, "sk-secret")
             .unwrap_err()
             .to_string()
             .contains(AUTH_PASSPHRASE_ENV));
 
         std::env::set_var(AUTH_PASSPHRASE_ENV, "test passphrase");
-        save_login("openai", "OPENAI_API_KEY", "sk-secret").unwrap();
+        save_login("openai", token_var, "sk-secret").unwrap();
         assert_eq!(token_store_status("anthropic"), "token_store=no-token");
         assert_eq!(
             load_token("openai").unwrap().unwrap(),
-            ("OPENAI_API_KEY".to_string(), "sk-secret".to_string())
+            (token_var.to_string(), "sk-secret".to_string())
         );
         assert!(hydrate_env_for_provider("openai").unwrap());
-        assert_eq!(std::env::var("OPENAI_API_KEY").unwrap(), "sk-secret");
+        assert_eq!(std::env::var(token_var).unwrap(), "sk-secret");
         assert!(!hydrate_env_for_provider("openai").unwrap());
         assert_eq!(
             token_store_status("openai"),
@@ -502,19 +536,6 @@ mod tests {
         );
         clear().unwrap();
         assert_eq!(token_store_status("openai"), "token_store=missing");
-
-        match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-        match old_passphrase {
-            Some(value) => std::env::set_var(AUTH_PASSPHRASE_ENV, value),
-            None => std::env::remove_var(AUTH_PASSPHRASE_ENV),
-        }
-        match old_token {
-            Some(value) => std::env::set_var("OPENAI_API_KEY", value),
-            None => std::env::remove_var("OPENAI_API_KEY"),
-        }
     }
 
     #[test]
