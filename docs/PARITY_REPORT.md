@@ -28,7 +28,7 @@ Tengu は、ローカルで動作するコーディングエージェント CLI 
 | Git / ホスティング補助 | 達成 | review、diff、commit、GitHub/GitLab issue / PR / label / comment / review の導線を実装済み |
 | 認証保護 | 達成 | API key 状態確認、暗号化 token store、login/logout/status を実装済み |
 | 状態復元 | 達成 | セッション永続化、fork、save/load、checkpoint、rollback を実装済み |
-| 回帰証跡 | 達成 | 主要 CLI E2E、long-session roundtrip、大規模 repo file tools、core coverage 80% 証跡を追加済み |
+| 回帰証跡 | 達成 | 主要 CLI E2E、long-session roundtrip、大規模 repo file tools、per-file core coverage 90% gate を追加済み |
 
 ## 残る差分
 
@@ -36,7 +36,7 @@ Tengu は、ローカルで動作するコーディングエージェント CLI 
 | ---- | ---- | ---- |
 | 完全な対話端末 E2E | 未完 | 擬似端末での TUI 入力・描画・中断まで含む証跡は今後の品質強化として残す |
 | 外部サービス実接続 E2E | 未完 | `gh` / `glab`、各 LLM API、MCP 実サーバーの live 検証は環境依存のため別手順で扱う |
-| full coverage 80% | 未完 | core coverage は 80% を達成済み。interactive TUI と network adapter を含む full coverage は継続改善対象 |
+| full coverage 80% | 未完 | core coverage は 90% per-file gate を導入済み。interactive TUI と network adapter を含む full coverage は継続改善対象 |
 | セマンティック KB | 部分 | project memory の永続保存と全文検索は実装済み。PDF indexing や embedding 検索は optional future work |
 | ベンダー固有 UI 完全再現 | 対象外 | Claude Code / Codex の私的実装や hosted workflow の完全再現は目標外 |
 
@@ -59,7 +59,7 @@ markdownlint-cli2 README.md TASK.md docs/TASK.md docs/REQUIREMENTS_MATRIX.md doc
 関連する追加証跡:
 
 - ALT-028: 主要 CLI 導線の binary-level E2E
-- ALT-029: 固定 toolchain / matching LLVM tools で core coverage 81.12%
+- ALT-029: CLI dispatcher、interactive TUI、network adapter を除く per-file core coverage 90% gate
 - ALT-030: TUI file reference completion と `.gitignore` 対応
 - ALT-031: GitHub/GitLab issue / PR / label / comment / review 導線
 - ALT-032: 暗号化 token store

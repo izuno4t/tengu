@@ -239,4 +239,75 @@ mod tests {
         assert_eq!(listed[0].id, second.id);
         assert_eq!(listed[1].id, first.id);
     }
+
+    #[test]
+    fn handles_empty_checkpoint_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(dir.path().join(".tengu/checkpoints"));
+
+        assert!(store.list().unwrap().is_empty());
+        assert!(store.latest().unwrap().is_none());
+        assert!(store.restore_latest().unwrap().is_none());
+        assert_eq!(format_checkpoint_list(&[]), "no checkpoints");
+    }
+
+    #[test]
+    fn skips_invalid_checkpoint_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".tengu/checkpoints");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("bad.json"), "{not-json").unwrap();
+        fs::write(root.join("ignored.txt"), "{}").unwrap();
+        let store = CheckpointStore::new(root);
+
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn formats_checkpoint_diff_for_empty_and_changed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.txt");
+        fs::write(&file, "after\n").unwrap();
+        let empty = Checkpoint {
+            id: "cp-empty".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            reason: "empty".to_string(),
+            files: Vec::new(),
+        };
+        assert_eq!(format_checkpoint_diff(&empty), "checkpoint has no files");
+
+        let checkpoint = Checkpoint {
+            id: "cp-1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            reason: "before edit".to_string(),
+            files: vec![CheckpointFile {
+                path: file.display().to_string(),
+                existed: true,
+                content: Some("before\n".to_string()),
+            }],
+        };
+
+        let diff = format_checkpoint_diff(&checkpoint);
+        assert!(diff.contains("-before"));
+        assert!(diff.contains("+after"));
+    }
+
+    #[test]
+    fn restore_recreates_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("nested/notes.txt");
+        let checkpoint = Checkpoint {
+            id: "cp-1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            reason: "restore nested".to_string(),
+            files: vec![CheckpointFile {
+                path: file.display().to_string(),
+                existed: true,
+                content: Some("restored".to_string()),
+            }],
+        };
+
+        restore_checkpoint(&checkpoint).unwrap();
+        assert_eq!(fs::read_to_string(file).unwrap(), "restored");
+    }
 }

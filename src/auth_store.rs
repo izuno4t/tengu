@@ -399,4 +399,136 @@ mod tests {
         assert!(!session.exists());
         assert!(!tokens.exists());
     }
+
+    #[test]
+    fn path_helpers_use_tengu_auth_directory() {
+        let home = Path::new("/tmp/tengu-home");
+
+        assert_eq!(passphrase_env_var(), "TENGU_AUTH_PASSPHRASE");
+        assert_eq!(auth_dir_from_home(home), home.join(".tengu/auth"));
+        assert_eq!(
+            session_path_from_home(home),
+            home.join(".tengu/auth/session.json")
+        );
+        assert_eq!(
+            token_store_path_from_home(home),
+            home.join(".tengu/auth/tokens.json")
+        );
+    }
+
+    #[test]
+    fn missing_or_invalid_auth_files_return_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("session.json");
+        let tokens = dir.path().join("tokens.json");
+        fs::write(&session, "not-json").unwrap();
+        fs::write(&tokens, "not-json").unwrap();
+
+        assert!(load_session_from_path(&dir.path().join("missing.json")).is_none());
+        assert!(load_session_from_path(&session).is_none());
+        assert!(load_token_at_with_passphrase(&tokens, "openai", b"pass")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn load_token_returns_none_for_missing_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("session.json");
+        let tokens = dir.path().join("tokens.json");
+        save_login_at_with_passphrase(
+            &session,
+            &tokens,
+            "openai",
+            "OPENAI_API_KEY",
+            "sk-secret",
+            b"test passphrase",
+        )
+        .unwrap();
+
+        assert!(
+            load_token_at_with_passphrase(&tokens, "anthropic", b"test passphrase")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn decrypt_rejects_tampered_payload() {
+        let encrypted = encrypt_token(b"secret", b"test passphrase").unwrap();
+        let token = EncryptedToken {
+            env_var: "OPENAI_API_KEY".to_string(),
+            salt: encrypted.salt,
+            nonce: encrypted.nonce,
+            ciphertext: encode(b"tampered"),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        assert!(decrypt_token(&token, b"test passphrase")
+            .unwrap_err()
+            .to_string()
+            .contains("decryption failed"));
+    }
+
+    #[test]
+    fn env_backed_auth_flow_reports_status_and_hydrates_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_home = std::env::var("HOME").ok();
+        let old_passphrase = std::env::var(AUTH_PASSPHRASE_ENV).ok();
+        let old_token = std::env::var("OPENAI_API_KEY").ok();
+
+        std::env::set_var("HOME", dir.path());
+        std::env::remove_var(AUTH_PASSPHRASE_ENV);
+        std::env::remove_var("OPENAI_API_KEY");
+        assert_eq!(token_store_status("openai"), "token_store=missing");
+        assert!(save_login("openai", "OPENAI_API_KEY", "sk-secret")
+            .unwrap_err()
+            .to_string()
+            .contains(AUTH_PASSPHRASE_ENV));
+
+        std::env::set_var(AUTH_PASSPHRASE_ENV, "test passphrase");
+        save_login("openai", "OPENAI_API_KEY", "sk-secret").unwrap();
+        assert_eq!(token_store_status("anthropic"), "token_store=no-token");
+        assert_eq!(
+            load_token("openai").unwrap().unwrap(),
+            ("OPENAI_API_KEY".to_string(), "sk-secret".to_string())
+        );
+        assert!(hydrate_env_for_provider("openai").unwrap());
+        assert_eq!(std::env::var("OPENAI_API_KEY").unwrap(), "sk-secret");
+        assert!(!hydrate_env_for_provider("openai").unwrap());
+        assert_eq!(
+            token_store_status("openai"),
+            "token_store=ready encrypted=true"
+        );
+        clear().unwrap();
+        assert_eq!(token_store_status("openai"), "token_store=missing");
+
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_passphrase {
+            Some(value) => std::env::set_var(AUTH_PASSPHRASE_ENV, value),
+            None => std::env::remove_var(AUTH_PASSPHRASE_ENV),
+        }
+        match old_token {
+            Some(value) => std::env::set_var("OPENAI_API_KEY", value),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn invalid_nonce_is_rejected() {
+        let token = EncryptedToken {
+            env_var: "OPENAI_API_KEY".to_string(),
+            salt: encode(b"1234567890123456"),
+            nonce: encode(b"short"),
+            ciphertext: encode(b"ciphertext"),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        assert!(decrypt_token(&token, b"pass")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid nonce length"));
+    }
 }

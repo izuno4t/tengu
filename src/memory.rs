@@ -195,4 +195,37 @@ mod tests {
         assert!(context.contains("Project memory:"));
         assert!(context.contains("Use cargo test"));
     }
+
+    #[test]
+    fn handles_empty_and_missing_memory_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new(dir.path().join(".tengu/memory.json"));
+
+        assert!(store.list().unwrap().is_empty());
+        assert!(store.search("anything").unwrap().is_empty());
+        assert!(store.add("   ").unwrap_err().to_string().contains("empty"));
+        assert_eq!(format_memory_entries(&[]), "no memory entries");
+        assert!(format_memory_context(&[], 3).is_none());
+        assert!(format_memory_context(
+            &[MemoryEntry {
+                id: "mem-1".to_string(),
+                content: "remember this".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            }],
+            0,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn empty_search_lists_existing_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new(dir.path().join(".tengu/memory.json"));
+        store.add("Alpha").unwrap();
+
+        let found = store.search("  ").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].content, "Alpha");
+    }
 }

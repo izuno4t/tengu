@@ -130,11 +130,11 @@ ALT-036 で [PARITY_REPORT.md](PARITY_REPORT.md) を追加し、Phase H の最�
 
 ユニットテストは存在し、`cargo test` は成功している。主要CLIは実バイナリを起動するE2Eハーネスで、auth、sessions、agent、MCP、tools、perf、大規模リポジトリ相当の file tools を検証している。
 
-性能計測は `tengu perf` で起動経路、軽量コマンド、1MBファイル読み込み、RSSメモリを測定し、要求基準値と比較できる。カバレッジ計測は `scripts/coverage.sh` で `cargo llvm-cov` を優先し、`cargo tarpaulin` にフォールバックする導線を追加した。固定toolchainまたはmatching LLVM toolsでは、対話TUI描画と外部network transport adapterを除いた core coverage が 81.12% である。
+性能計測は `tengu perf` で起動経路、軽量コマンド、1MBファイル読み込み、RSSメモリを測定し、要求基準値と比較できる。カバレッジ計測は `scripts/coverage.sh` で `cargo llvm-cov` を優先し、`cargo tarpaulin` にフォールバックする導線を追加した。CI-gated core coverage は CLI dispatcher、対話TUI描画、外部network transport adapterを除いた範囲で、対象ファイルごとに 90% 閾値を適用する。
 
 影響:
 
-- 主要CLIのE2E証跡、long-session regression、大規模リポジトリ regression、core coverage 80% 達成証跡は追加済みである。
+- 主要CLIのE2E証跡、long-session regression、大規模リポジトリ regression、per-file core coverage 90% gate は追加済みである。
 - full coverage 80% と完全な対話TUI E2E証跡は継続改善対象である。
 
 ### セキュリティと監査
@@ -167,8 +167,8 @@ markdownlint-cli2 README.md TASK.md docs/TASK.md docs/REQUIREMENTS_MATRIX.md doc
 0 errors
 
 scripts/coverage.sh
-core coverage: 81.12% lines with matching LLVM tools
-full coverage: 53.25% lines; interactive TUI and network adapters are the main remaining gaps
+core coverage: per-file 90% line threshold for CLI-dispatcher/TUI/network-adapter-excluded scope
+full coverage: lower than core scope; CLI dispatcher, interactive TUI, and network adapters are the main remaining gaps
 ```
 
 ## 判断記録

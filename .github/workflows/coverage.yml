@@ -9,11 +9,11 @@ on:
 
 jobs:
   core-coverage:
-    name: core coverage
+    name: per-file core coverage
     runs-on: ubuntu-latest
     env:
-      COVERAGE_MIN_LINES: "80"
-      COVERAGE_IGNORE_REGEX: "src/(tui/.*|llm/(anthropic|google|openai|ollama)\\.rs|mcp/(http|stdio)\\.rs)"
+      COVERAGE_MIN_LINES: "90"
+      COVERAGE_IGNORE_REGEX: "src/(cli\\.rs|tui/.*|llm/(anthropic|google|openai|ollama)\\.rs|mcp/(http|stdio)\\.rs)"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -38,5 +38,5 @@ jobs:
           "${tools_dir}/llvm-cov" --version
           "${tools_dir}/llvm-profdata" --version
 
-      - name: Check core coverage
+      - name: Check per-file core coverage
         run: scripts/coverage.sh summary

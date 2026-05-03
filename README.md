@@ -205,18 +205,19 @@ tengu memory remove <memory-id>
 ### Coverage
 
 ```bash
-# Line coverage summary with an 80% minimum
+# Line coverage summary with a 90% minimum
 scripts/coverage.sh
 
 # HTML report
-COVERAGE_MIN_LINES=80 scripts/coverage.sh html
+COVERAGE_MIN_LINES=90 scripts/coverage.sh html
 ```
 
 The coverage helper prefers `cargo llvm-cov` and falls back to
 `cargo tarpaulin` when available. If the active `rustc` does not match the
 available LLVM tools, set `LLVM_COV` and `LLVM_PROFDATA` to matching binaries.
-The CI coverage job measures core non-interactive code at an 80% line threshold
-and excludes interactive TUI rendering and network transport adapters.
+The CI coverage job requires every in-scope core file to have at least 90% line
+coverage. It excludes the CLI dispatcher, interactive TUI rendering, and network
+transport adapters. CLI behavior is covered by binary-level E2E tests.
 Regression coverage also includes long-session persistence roundtrips and
 large-repository file tool E2E checks with many generated source files.
 

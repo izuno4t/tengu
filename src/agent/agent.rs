@@ -847,8 +847,8 @@ type ApprovalHandler =
 mod tests {
     use super::*;
     use crate::llm::{
-        ChatRequest, ChatResponse, ContentBlock, LlmBackend, LlmClient, LlmProvider, LlmRequest,
-        LlmResponse, LlmStream, LlmUsage, StopReason,
+        ChatRequest, ChatResponse, ContentBlock, LlmBackend, LlmClient, LlmImage, LlmProvider,
+        LlmRequest, LlmResponse, LlmStream, LlmUsage, StopReason,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1053,6 +1053,176 @@ mod tests {
         // Should have context message + acknowledgment + user message = 3 input messages
         // + 1 assistant response
         assert!(output.messages.len() >= 4);
+    }
+
+    #[tokio::test]
+    async fn agent_runner_legacy_request_apis_use_context_and_images() {
+        let runner = make_runner(MockBackend::new("generated"));
+        let request = LlmRequest {
+            prompt: "describe".to_string(),
+            images: vec![LlmImage {
+                media_type: "image/png".to_string(),
+                data_base64: "AAAA".to_string(),
+            }],
+        };
+
+        let output = runner
+            .handle_request_with_context(request.clone(), "prior context")
+            .await
+            .unwrap();
+        assert_eq!(output.response.content, "generated");
+        assert!(output.messages.is_empty());
+
+        let (_stream, tool_result) = runner
+            .handle_request_stream_with_context(request, "prior context")
+            .await
+            .unwrap();
+        assert!(tool_result.is_none());
+
+        let (_stream, tool_result) = runner
+            .handle_prompt_stream_with_tool_context("hello", "prior context")
+            .await
+            .unwrap();
+        assert!(tool_result.is_none());
+
+        let plan = runner
+            .generate_plan_text_with_context("do work", "prior context")
+            .await
+            .unwrap();
+        assert_eq!(plan, "generated");
+    }
+
+    #[tokio::test]
+    async fn agent_runner_mcp_tool_errors_are_explicit() {
+        let runner = make_runner(MockBackend::new("unused"));
+
+        let (text, is_error) = runner
+            .execute_mcp_tool("not_mcp__tool", &serde_json::json!({}))
+            .await;
+        assert!(is_error);
+        assert!(text.contains("invalid MCP tool name"));
+
+        let (text, is_error) = runner
+            .execute_mcp_tool("mcp__servertool", &serde_json::json!({}))
+            .await;
+        assert!(is_error);
+        assert!(text.contains("invalid MCP tool name format"));
+
+        let (text, is_error) = runner
+            .execute_mcp_tool("mcp__missing_tool", &serde_json::json!({}))
+            .await;
+        assert!(is_error);
+        assert!(text.contains("not found"));
+
+        runner.set_mcp_servers(vec![(
+            "empty".to_string(),
+            McpServerConfig {
+                command: None,
+                args: None,
+                env: None,
+                url: None,
+                bearer_token_env_var: None,
+                http_headers: None,
+                timeout_sec: None,
+            },
+        )]);
+        let (text, is_error) = runner
+            .execute_mcp_tool("mcp__empty_tool", &serde_json::json!({}))
+            .await;
+        assert!(is_error);
+        assert!(text.contains("no transport configured"));
+    }
+
+    #[tokio::test]
+    async fn agent_runner_sub_agent_and_parallel_agent_validation() {
+        let runner = make_runner(MockBackend::new("sub result"));
+
+        let (text, is_error) = runner.execute_sub_agent(&serde_json::json!({})).await;
+        assert!(is_error);
+        assert!(text.contains("non-empty prompt"));
+
+        let (text, is_error) = runner
+            .execute_sub_agent(&serde_json::json!({"prompt": "summarize", "max_turns": 1}))
+            .await;
+        assert!(!is_error);
+        assert_eq!(text, "sub result");
+
+        let (text, is_error) = runner
+            .execute_parallel_agents(&serde_json::json!({"tasks": ["one"]}))
+            .await;
+        assert!(is_error);
+        assert!(text.contains("at least 2"));
+
+        let (text, is_error) = runner
+            .execute_parallel_agents(
+                &serde_json::json!({"tasks": ["1", "2", "3", "4", "5", "6", "7"]}),
+            )
+            .await;
+        assert!(is_error);
+        assert!(text.contains("at most 6"));
+
+        let (text, is_error) = runner
+            .execute_parallel_agents(&serde_json::json!({"tasks": ["one", "two"]}))
+            .await;
+        assert!(!is_error);
+        assert!(text.contains("--- Task 1 result"));
+        assert!(text.contains("sub result"));
+    }
+
+    #[tokio::test]
+    async fn agent_runner_covers_empty_context_and_short_circuit_paths() {
+        let runner = make_runner(MockBackend::new("short"));
+
+        runner.set_approval_handler(Arc::new(|_request| {
+            Box::pin(async { ToolApprovalDecision::AllowOnce })
+        }));
+        runner.set_mcp_servers(vec![(
+            "http".to_string(),
+            McpServerConfig {
+                command: None,
+                args: None,
+                env: None,
+                url: Some("http://127.0.0.1:9".to_string()),
+                bearer_token_env_var: None,
+                http_headers: None,
+                timeout_sec: Some(1),
+            },
+        )]);
+
+        let no_turns = runner
+            .run_agent_loop_with_max_turns(vec![Message::user_text("stop")], 0)
+            .await
+            .unwrap();
+        assert_eq!(no_turns.total_turns, 0);
+        assert!(no_turns.final_text.is_empty());
+
+        let continued = runner
+            .continue_conversation(vec![Message::user_text("first")], "second")
+            .await
+            .unwrap();
+        assert_eq!(continued.final_text, "short");
+
+        let output = runner
+            .handle_request_with_context(LlmRequest::text("plain"), "")
+            .await
+            .unwrap();
+        assert_eq!(output.response.content, "short");
+
+        let _stream = runner
+            .handle_prompt_stream_with_context("stream", "")
+            .await
+            .unwrap();
+        let (_stream, tool_result) = runner
+            .handle_request_stream_with_context(LlmRequest::text("stream"), "")
+            .await
+            .unwrap();
+        assert!(tool_result.is_none());
+
+        let plan = runner
+            .generate_plan_text_with_context("plan", "")
+            .await
+            .unwrap();
+        assert_eq!(plan, "short");
     }
 
     #[test]

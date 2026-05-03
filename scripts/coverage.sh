@@ -6,7 +6,7 @@ usage() {
 Usage: scripts/coverage.sh [summary|html|lcov]
 
 Environment:
-  COVERAGE_MIN_LINES  Minimum line coverage percentage. Default: 80.
+  COVERAGE_MIN_LINES  Minimum line coverage percentage. Default: 90.
   COVERAGE_IGNORE_REGEX
                       Optional cargo-llvm-cov filename regex to exclude files
                       from the measured scope.
@@ -16,7 +16,7 @@ USAGE
 }
 
 mode="${1:-summary}"
-min_lines="${COVERAGE_MIN_LINES:-80}"
+min_lines="${COVERAGE_MIN_LINES:-90}"
 
 case "$mode" in
   summary | html | lcov) ;;
@@ -31,25 +31,29 @@ case "$mode" in
 esac
 
 run_llvm_cov() {
-  local args=(llvm-cov --fail-under-lines "$min_lines")
+  local args=(llvm-cov)
   if [ -n "${COVERAGE_IGNORE_REGEX:-}" ]; then
     args+=(--ignore-filename-regex "$COVERAGE_IGNORE_REGEX")
   fi
 
   case "$mode" in
     summary)
-      args+=(--json --summary-only)
+      mkdir -p target/coverage
+      args+=(--json --summary-only --output-path target/coverage/summary.json)
       ;;
     html)
-      args+=(--html)
+      args+=(--html --fail-under-lines "$min_lines")
       ;;
     lcov)
       mkdir -p target/coverage
-      args+=(--lcov --output-path target/coverage/lcov.info)
+      args+=(--lcov --output-path target/coverage/lcov.info --fail-under-lines "$min_lines")
       ;;
   esac
 
-  cargo "${args[@]}"
+  cargo "${args[@]}" || return $?
+  if [ "$mode" = "summary" ]; then
+    scripts/check_coverage_json.py target/coverage/summary.json "$min_lines"
+  fi
 }
 
 resolve_rustup_llvm_tools() {

@@ -507,4 +507,181 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn builds_issue_view_comment_and_label_commands() {
+        assert_eq!(
+            issue_view(ForgeProvider::Github, "7", true, Some("owner/repo")).args,
+            vec!["issue", "view", "7", "--comments", "--repo", "owner/repo"]
+        );
+        assert_eq!(
+            issue_comment(ForgeProvider::Gitlab, "7", "fixed", Some("group/project")).args,
+            vec![
+                "issue",
+                "note",
+                "7",
+                "--message",
+                "fixed",
+                "--repo",
+                "group/project"
+            ]
+        );
+        assert_eq!(
+            issue_labels(
+                ForgeProvider::Github,
+                "7",
+                &["bug".to_string()],
+                &["wip".to_string()],
+                Some("owner/repo"),
+            )
+            .args,
+            vec![
+                "issue",
+                "edit",
+                "7",
+                "--add-label",
+                "bug",
+                "--remove-label",
+                "wip",
+                "--repo",
+                "owner/repo"
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_pr_create_and_comment_listing_commands() {
+        assert_eq!(
+            pr_create(
+                ForgeProvider::Github,
+                &["--title".to_string(), "ready".to_string()],
+                Some("owner/repo"),
+            )
+            .args,
+            vec!["pr", "create", "--title", "ready", "--repo", "owner/repo"]
+        );
+        assert_eq!(
+            pr_create(ForgeProvider::Gitlab, &["--fill".to_string()], None).args,
+            vec!["mr", "create", "--fill"]
+        );
+        assert_eq!(
+            pr_comments(ForgeProvider::Github, None, None).args,
+            vec!["pr", "view", "--comments"]
+        );
+        assert_eq!(
+            pr_comments(ForgeProvider::Gitlab, Some("8"), Some("group/project")).args,
+            vec!["mr", "note", "list", "8", "--repo", "group/project"]
+        );
+    }
+
+    #[test]
+    fn builds_remaining_review_and_label_commands() {
+        assert_eq!(
+            pr_review(
+                ForgeProvider::Github,
+                Some("12"),
+                ReviewAction::Comment,
+                Some("note"),
+                None,
+            )
+            .args,
+            vec!["pr", "review", "12", "--comment", "--body", "note"]
+        );
+        assert_eq!(
+            pr_review(
+                ForgeProvider::Github,
+                Some("12"),
+                ReviewAction::Approve,
+                None,
+                None,
+            )
+            .args,
+            vec!["pr", "review", "12", "--approve"]
+        );
+        assert_eq!(
+            pr_review(
+                ForgeProvider::Gitlab,
+                Some("12"),
+                ReviewAction::RequestChanges,
+                Some("needs work"),
+                None,
+            )
+            .args,
+            vec![
+                "mr",
+                "note",
+                "12",
+                "--message",
+                "Request changes: needs work"
+            ]
+        );
+        assert_eq!(
+            pr_review(
+                ForgeProvider::Gitlab,
+                Some("12"),
+                ReviewAction::Comment,
+                None,
+                None,
+            )
+            .args,
+            vec!["mr", "note", "12"]
+        );
+        assert_eq!(
+            label_list(ForgeProvider::Gitlab, Some("group/project")).args,
+            vec!["label", "list", "--repo", "group/project"]
+        );
+        assert_eq!(
+            label_edit(
+                ForgeProvider::Github,
+                "bug",
+                Some("defect"),
+                Some("00ff00"),
+                None,
+                None,
+            )
+            .args,
+            vec!["label", "edit", "bug", "--name", "defect", "--color", "00ff00"]
+        );
+        assert_eq!(
+            label_edit(
+                ForgeProvider::Gitlab,
+                "bug",
+                Some("defect"),
+                None,
+                Some("Broken behavior"),
+                None,
+            )
+            .args,
+            vec![
+                "label",
+                "edit",
+                "--label-id",
+                "bug",
+                "--new-name",
+                "defect",
+                "--description",
+                "Broken behavior"
+            ]
+        );
+        assert_eq!(
+            label_delete(ForgeProvider::Github, "bug", None).args,
+            vec!["label", "delete", "bug", "--yes"]
+        );
+        assert_eq!(
+            label_delete(ForgeProvider::Gitlab, "bug", Some("group/project")).args,
+            vec!["label", "delete", "bug", "--repo", "group/project"]
+        );
+    }
+
+    #[test]
+    fn command_label_and_run_failure_are_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = ForgeCommand {
+            program: "definitely-not-a-forge-binary".to_string(),
+            args: vec!["issue".to_string(), "list".to_string()],
+        };
+
+        assert_eq!(cmd.label(), "definitely-not-a-forge-binary issue list");
+        assert!(cmd.run_in_dir(dir.path()).contains("failed"));
+    }
 }

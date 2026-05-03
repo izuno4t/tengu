@@ -4182,4 +4182,107 @@ mod tests {
         });
         assert!(result.is_ok());
     }
+
+    #[test]
+    fn tool_result_and_constructor_cover_simple_variants() {
+        assert_eq!(ToolResult::Status(7).to_string_lossy(), "exit code: 7");
+        assert_eq!(
+            ToolResult::PreviewWrite {
+                path: PathBuf::from("file.txt"),
+                diff: "diff text".to_string(),
+                content: "after".to_string(),
+            }
+            .to_string_lossy(),
+            "diff text"
+        );
+
+        let executor = ToolExecutor::new();
+        let result = executor
+            .preview_write(PathBuf::from("preview-only.txt"), "after".to_string())
+            .unwrap();
+        assert!(result.to_string_lossy().contains("after"));
+    }
+
+    #[test]
+    fn approval_override_paths_are_enforced() {
+        let policy = ToolPolicy {
+            permissions: Some(PermissionsConfig {
+                approval_policy: Some("always".to_string()),
+                allowed_tools: None,
+                deny: None,
+            }),
+            ..ToolPolicy::default()
+        };
+        let input = ToolInput::Read {
+            path: PathBuf::from("Cargo.toml"),
+            offset: None,
+            limit: None,
+        };
+
+        assert!(policy
+            .check(&input)
+            .unwrap_err()
+            .to_string()
+            .contains("approval"));
+        policy.set_approval_override(ApprovalOverride::DenyAll);
+        assert!(policy
+            .check(&input)
+            .unwrap_err()
+            .to_string()
+            .contains("denied"));
+        policy.set_approval_override(ApprovalOverride::AllowOnce(Tool::Read));
+        assert!(policy.check(&input).is_ok());
+        assert!(policy
+            .check(&input)
+            .unwrap_err()
+            .to_string()
+            .contains("approval"));
+        policy.set_approval_override(ApprovalOverride::AllowAll);
+        assert!(policy.check(&input).is_ok());
+    }
+
+    #[test]
+    fn workspace_write_sandbox_limits_write_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = ToolPolicy {
+            sandbox: Some(SandboxConfig {
+                mode: Some("workspace-write".to_string()),
+                allowed_paths: None,
+                blocked_paths: Some(vec!["./blocked.txt".to_string()]),
+            }),
+            workspace_root: dir.path().to_path_buf(),
+            ..ToolPolicy::default()
+        };
+
+        assert!(policy
+            .check(&ToolInput::Bash {
+                command: "echo hi".to_string(),
+                timeout: None,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("denies shell"));
+        assert!(policy
+            .check(&ToolInput::Write {
+                path: dir.path().join("blocked.txt"),
+                content: "blocked".to_string(),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("blocked path"));
+        assert!(policy
+            .check(&ToolInput::Write {
+                path: dir.path().join("ok.txt"),
+                content: "ok".to_string(),
+            })
+            .is_ok());
+        assert!(policy
+            .check(&ToolInput::Write {
+                path: PathBuf::from("/tmp/tengu-outside-sandbox-test.txt"),
+                content: "outside".to_string(),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("outside workspace"));
+    }
 }
