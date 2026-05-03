@@ -209,7 +209,7 @@ fn input_cursor_position(input: &str, cursor: usize, width: usize) -> (u16, u16)
             line = line.saturating_add(1);
             line_width = 0;
         }
-        line_width = line_width.saturating_add(ch_width);
+        line_width = line_width.saturating_add(ch_width).min(content_width);
     }
     (line, line_width as u16)
 }
@@ -234,7 +234,7 @@ fn wrap_plain_input_line(line: &str, width: usize) -> Vec<String> {
             current_width = 0;
         }
         current.push(ch);
-        current_width = current_width.saturating_add(ch_width);
+        current_width = current_width.saturating_add(ch_width).min(width);
     }
     if !current.is_empty() {
         lines.push(current);
@@ -829,6 +829,8 @@ mod tests {
         assert_eq!(input_cursor_position("ab\ncd", 4, 20), (1, 1));
         assert_eq!(input_cursor_position("aあb", 2, 20), (0, 3));
         assert_eq!(input_cursor_position("abcdef", 6, 8), (1, 1));
+        assert_eq!(input_cursor_position("あ", 1, 4), (0, 1));
+        assert_eq!(input_cursor_position("あa", 2, 4), (1, 1));
     }
 
     #[test]

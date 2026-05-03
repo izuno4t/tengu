@@ -815,7 +815,7 @@ fn wrapped_plain_line_count(line: &str, width: usize) -> usize {
             rows = rows.saturating_add(1);
             current_width = 0;
         }
-        current_width = current_width.saturating_add(ch_width);
+        current_width = current_width.saturating_add(ch_width).min(width);
     }
     rows
 }
@@ -889,6 +889,9 @@ mod tests {
 
         state.set_input("abc\ndef".to_string());
         assert_eq!(state.input_visual_row_count(20), 2);
+
+        state.set_input("あa".to_string());
+        assert_eq!(state.input_visual_row_count(4), 2);
     }
 
     #[test]
