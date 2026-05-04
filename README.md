@@ -1,5 +1,7 @@
 # 👺 Tengu
 
+[![build](https://github.com/izuno4t/tengu/actions/workflows/build.yml/badge.svg)](https://github.com/izuno4t/tengu/actions/workflows/build.yml)
+
 A powerful AI coding agent CLI that unifies multiple LLMs.
 
 Tengu is a flexible, multi-LLM coding agent that integrates with MCP servers, supports custom agents, and provides fine-grained permission control for your development workflow.
@@ -18,9 +20,16 @@ Tengu is a flexible, multi-LLM coding agent that integrates with MCP servers, su
 - **Permission Control**: Per-tool permissions, sandboxing, and glob pattern
   matching.
 - **Interactive TUI**: Streaming output, Markdown rendering, and tool
-  execution logs.
+  execution logs with prompt queuing, cancellation, slash-command suggestions,
+  file reference completion, and visible tool approvals.
 - **Project Configuration**: Manage project context with hierarchical
   `.tengu/AGENT.md` files, with legacy `.tengu/TENGU.md` compatibility.
+- **Session and Recovery Tools**: Resume sessions, save/load conversations,
+  create checkpoints, inspect diffs, and roll back local file changes.
+- **Review and Forge Workflows**: Review local diffs and wrap GitHub/GitLab
+  issue, PR/MR, comment, review, and label operations through `gh` / `glab`.
+- **Quality Gates**: Run local performance checks and a CI coverage gate for
+  in-scope core files.
 
 ## Project Status
 
@@ -29,6 +38,9 @@ hooks, session resume, Git/review workflows, checkpoints, project memory,
 security defaults, performance checks, encrypted token storage, long-session and
 large-repository regression checks, and required user documentation are
 implemented.
+The GitHub Actions build workflow runs `cargo build --all-targets` and
+`cargo test`. A separate core coverage gate enforces at least 90% line coverage
+for in-scope core files using `scripts/coverage.sh`.
 Remaining tracked gaps are full interactive terminal E2E coverage and advanced
 optional features.
 The final parity assessment is recorded in
@@ -39,11 +51,11 @@ The final parity assessment is recorded in
 ### Installation
 
 ```bash
-# Via Cargo (recommended)
-cargo install tengu
+# Install directly from GitHub
+cargo install --git https://github.com/izuno4t/tengu.git
 
-# From source
-git clone https://github.com/yourusername/tengu.git
+# Or build from source
+git clone https://github.com/izuno4t/tengu.git
 cd tengu
 cargo build --release
 ```
@@ -69,7 +81,7 @@ tengu -p "Analyze this codebase"
 tengu --model claude-sonnet-4 -p "Write tests"
 
 # Allow file editing
-tengu -p "Fix bugs" --allowed-tools "Read,Write,Shell"
+tengu -p "Fix bugs" --allowed-tools "Read,Write,Bash"
 ```
 
 ### Connectivity Checks
@@ -129,7 +141,7 @@ see [CONFIGURATION.md](CONFIGURATION.md). For MCP server setup, see
 tengu -p "Create utils.rs with helper functions" --allowed-tools "Write"
 
 # Edit existing files
-tengu -p "Fix lint errors in all .rs files" --allowed-tools "Read,Write,Shell(cargo *)"
+tengu -p "Fix lint errors in all .rs files" --allowed-tools "Read,Write,Bash(cargo *)"
 ```
 
 ### Review
@@ -280,7 +292,7 @@ tengu agent generate
 - name: Auto-fix lint
   run: |
     tengu -p "Run lint and fix errors" \
-      --allowed-tools "Read,Write,Shell(cargo *)"
+      --allowed-tools "Read,Write,Bash(cargo *)"
 ```
 
 ## ⚙️ Configuration

@@ -1,4 +1,4 @@
-name: coverage
+name: core coverage gate
 
 on:
   pull_request:
@@ -9,7 +9,7 @@ on:
 
 jobs:
   core-coverage:
-    name: per-file core coverage
+    name: enforce per-file core coverage threshold
     runs-on: ubuntu-latest
     env:
       COVERAGE_MIN_LINES: "90"
