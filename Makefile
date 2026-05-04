@@ -3,6 +3,7 @@
 .DEFAULT_GOAL := help
 
 COVERAGE_REPORT ?= target/coverage/lcov.info
+COVERAGE_REPORT_IGNORE_REGEX ?= (/rustc-.*/library/|src/(cli\.rs|tui/.*|llm/(anthropic|google|openai|ollama)\.rs|mcp/(http|stdio)\.rs))
 COVERAGE_REPORT_MIN_LINES ?= 0
 COVERAGE_VIEWER ?= crv
 
@@ -58,9 +59,10 @@ coverage:
 	scripts/coverage.sh
 
 coverage-report:
-	COVERAGE_MIN_LINES=$(COVERAGE_REPORT_MIN_LINES) scripts/coverage.sh lcov
+	COVERAGE_IGNORE_REGEX='$(COVERAGE_REPORT_IGNORE_REGEX)' COVERAGE_MIN_LINES=$(COVERAGE_REPORT_MIN_LINES) scripts/coverage.sh lcov
 	@test -f "$(COVERAGE_REPORT)"
 	@echo "LCOV report generated: $(COVERAGE_REPORT)"
+	@echo "Scope excludes: $(COVERAGE_REPORT_IGNORE_REGEX)"
 	@echo "Open with: $(COVERAGE_VIEWER) --format lcov $(COVERAGE_REPORT)"
 
 coverage-view: coverage-report

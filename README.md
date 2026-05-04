@@ -233,12 +233,14 @@ COVERAGE_MIN_LINES=90 scripts/coverage.sh html
 The coverage helper prefers `cargo llvm-cov` and falls back to
 `cargo tarpaulin` when available. If the active `rustc` does not match the
 available LLVM tools, set `LLVM_COV` and `LLVM_PROFDATA` to matching binaries.
-`make coverage-report` writes LCOV output to `target/coverage/lcov.info`, which
-can be opened by
+`make coverage-report` writes a core-scope LCOV report to
+`target/coverage/lcov.info`, which can be opened by
 [Coverage Report Viewer](https://github.com/izuno4t/coverage-report-viewer-cli)
-with `crv --format lcov target/coverage/lcov.info`. This report target disables
-the coverage threshold by default so the report is generated even when the CI
-coverage gate would fail.
+with `crv --format lcov target/coverage/lcov.info`. The LCOV report uses the
+same core source scope as the CI coverage gate, excluding the CLI dispatcher,
+interactive TUI rendering, network transport adapters, and rustc standard
+library entries. This report target disables the coverage threshold by default
+so the report is generated even when the CI coverage gate would fail.
 The CI coverage job requires every in-scope core file to have at least 90% line
 coverage. It excludes the CLI dispatcher, interactive TUI rendering, and network
 transport adapters. CLI behavior is covered by binary-level E2E tests.
