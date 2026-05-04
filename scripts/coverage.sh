@@ -60,6 +60,10 @@ resolve_rustup_llvm_tools() {
   local host
   local sysroot
   local tools_dir
+  local llvm_version
+  local llvm_major
+  local candidate_dir
+  local brew_prefix
 
   host="$(rustc -vV | sed -n 's/^host: //p')"
   sysroot="$(rustc --print sysroot)"
@@ -75,6 +79,39 @@ resolve_rustup_llvm_tools() {
     export PATH="${tools_dir}:${PATH}"
     echo "Using LLVM_COV=${LLVM_COV}" >&2
     echo "Using LLVM_PROFDATA=${LLVM_PROFDATA}" >&2
+    return
+  fi
+
+  llvm_version="$(rustc -vV | sed -n 's/^LLVM version: //p')"
+  llvm_major="${llvm_version%%.*}"
+  if [ -n "$llvm_major" ]; then
+    for candidate_dir in \
+      "/opt/homebrew/opt/llvm@${llvm_major}/bin" \
+      "/usr/local/opt/llvm@${llvm_major}/bin" \
+      "/opt/homebrew/opt/llvm/bin" \
+      "/usr/local/opt/llvm/bin"; do
+      if [ -x "${candidate_dir}/llvm-cov" ] && [ -x "${candidate_dir}/llvm-profdata" ]; then
+        export LLVM_COV="${LLVM_COV:-${candidate_dir}/llvm-cov}"
+        export LLVM_PROFDATA="${LLVM_PROFDATA:-${candidate_dir}/llvm-profdata}"
+        export PATH="${candidate_dir}:${PATH}"
+        echo "Using LLVM_COV=${LLVM_COV}" >&2
+        echo "Using LLVM_PROFDATA=${LLVM_PROFDATA}" >&2
+        return
+      fi
+    done
+
+    if command -v brew >/dev/null 2>&1; then
+      brew_prefix="$(brew --prefix "llvm@${llvm_major}" 2>/dev/null || true)"
+      if [ -n "$brew_prefix" ] \
+        && [ -x "${brew_prefix}/bin/llvm-cov" ] \
+        && [ -x "${brew_prefix}/bin/llvm-profdata" ]; then
+        export LLVM_COV="${LLVM_COV:-${brew_prefix}/bin/llvm-cov}"
+        export LLVM_PROFDATA="${LLVM_PROFDATA:-${brew_prefix}/bin/llvm-profdata}"
+        export PATH="${brew_prefix}/bin:${PATH}"
+        echo "Using LLVM_COV=${LLVM_COV}" >&2
+        echo "Using LLVM_PROFDATA=${LLVM_PROFDATA}" >&2
+      fi
+    fi
   fi
 }
 

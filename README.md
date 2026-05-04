@@ -220,6 +220,12 @@ tengu memory remove <memory-id>
 # Line coverage summary with a 90% minimum
 scripts/coverage.sh
 
+# LCOV report for coverage-report-viewer-cli
+make coverage-report
+
+# Generate and open the LCOV report with crv
+make coverage-view
+
 # HTML report
 COVERAGE_MIN_LINES=90 scripts/coverage.sh html
 ```
@@ -227,6 +233,12 @@ COVERAGE_MIN_LINES=90 scripts/coverage.sh html
 The coverage helper prefers `cargo llvm-cov` and falls back to
 `cargo tarpaulin` when available. If the active `rustc` does not match the
 available LLVM tools, set `LLVM_COV` and `LLVM_PROFDATA` to matching binaries.
+`make coverage-report` writes LCOV output to `target/coverage/lcov.info`, which
+can be opened by
+[Coverage Report Viewer](https://github.com/izuno4t/coverage-report-viewer-cli)
+with `crv --format lcov target/coverage/lcov.info`. This report target disables
+the coverage threshold by default so the report is generated even when the CI
+coverage gate would fail.
 The CI coverage job requires every in-scope core file to have at least 90% line
 coverage. It excludes the CLI dispatcher, interactive TUI rendering, and network
 transport adapters. CLI behavior is covered by binary-level E2E tests.
