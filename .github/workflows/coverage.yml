@@ -9,17 +9,18 @@ on:
 
 jobs:
   core-coverage:
-    name: enforce per-file core coverage threshold
+    name: enforce per-file core C2 coverage threshold
     runs-on: ubuntu-latest
     env:
-      COVERAGE_MIN_LINES: "90"
+      COVERAGE_MIN_BRANCHES: "90"
+      COVERAGE_TOOLCHAIN: "nightly"
       COVERAGE_IGNORE_REGEX: "src/(cli\\.rs|tui/.*|llm/(anthropic|google|openai|ollama)\\.rs|mcp/(http|stdio)\\.rs)"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
 
@@ -38,5 +39,5 @@ jobs:
           "${tools_dir}/llvm-cov" --version
           "${tools_dir}/llvm-profdata" --version
 
-      - name: Check per-file core coverage
-        run: scripts/coverage.sh summary
+      - name: Check per-file core C2 coverage
+        run: scripts/coverage.sh branch-lcov

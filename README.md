@@ -39,8 +39,8 @@ security defaults, performance checks, encrypted token storage, long-session and
 large-repository regression checks, and required user documentation are
 implemented.
 The GitHub Actions build workflow runs `cargo build --all-targets` and
-`cargo test`. A separate core coverage gate enforces at least 90% line coverage
-for in-scope core files using `scripts/coverage.sh`.
+`cargo test`. A separate core coverage gate enforces at least 90% C2 / branch
+coverage for in-scope core files using `scripts/coverage.sh`.
 Remaining tracked gaps are full interactive terminal E2E coverage and advanced
 optional features.
 The final parity assessment is recorded in
@@ -217,33 +217,34 @@ tengu memory remove <memory-id>
 ### Coverage
 
 ```bash
-# Line coverage summary with a 90% minimum
+# C2 / branch coverage summary with a 90% minimum
 scripts/coverage.sh
 
-# LCOV report for coverage-report-viewer-cli
+# Branch LCOV report for coverage-report-viewer-cli
 make coverage-report
 
 # Generate and open the LCOV report with crv
 make coverage-view
 
-# HTML report
-COVERAGE_MIN_LINES=90 scripts/coverage.sh html
+# Line coverage HTML report
+scripts/coverage.sh html
 ```
 
 The coverage helper prefers `cargo llvm-cov` and falls back to
 `cargo tarpaulin` when available. If the active `rustc` does not match the
 available LLVM tools, set `LLVM_COV` and `LLVM_PROFDATA` to matching binaries.
-`make coverage-report` writes a core-scope LCOV report to
+`make coverage-report` writes a core-scope branch LCOV report to
 `target/coverage/lcov.info`, which can be opened by
 [Coverage Report Viewer](https://github.com/izuno4t/coverage-report-viewer-cli)
 with `crv --format lcov target/coverage/lcov.info`. The LCOV report uses the
 same core source scope as the CI coverage gate, excluding the CLI dispatcher,
 interactive TUI rendering, network transport adapters, and rustc standard
-library entries. This report target disables the coverage threshold by default
-so the report is generated even when the CI coverage gate would fail.
-The CI coverage job requires every in-scope core file to have at least 90% line
-coverage. It excludes the CLI dispatcher, interactive TUI rendering, and network
-transport adapters. CLI behavior is covered by binary-level E2E tests.
+library entries. Branch coverage uses `cargo llvm-cov --branch`, which requires
+the nightly Rust toolchain and `llvm-tools-preview`.
+The CI coverage job requires every in-scope core file to have at least 90%
+C2 / branch coverage. It excludes the CLI dispatcher, interactive TUI
+rendering, and network transport adapters. CLI behavior is covered by
+binary-level E2E tests.
 Regression coverage also includes long-session persistence roundtrips and
 large-repository file tool E2E checks with many generated source files.
 

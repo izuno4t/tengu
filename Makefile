@@ -4,7 +4,8 @@
 
 COVERAGE_REPORT ?= target/coverage/lcov.info
 COVERAGE_REPORT_IGNORE_REGEX ?= (/rustc-.*/library/|src/(cli\.rs|tui/.*|llm/(anthropic|google|openai|ollama)\.rs|mcp/(http|stdio)\.rs))
-COVERAGE_REPORT_MIN_LINES ?= 0
+COVERAGE_REPORT_MIN_BRANCHES ?= 90
+COVERAGE_REPORT_TOOLCHAIN ?= nightly
 COVERAGE_VIEWER ?= crv
 
 help:
@@ -23,7 +24,7 @@ help:
 	@echo "  make check      Run fmt-check, lint, spell-check, and tests"
 	@echo "  make coverage   Run the coverage helper"
 	@echo "  make coverage-report"
-	@echo "                 Generate LCOV at $(COVERAGE_REPORT) for crv"
+	@echo "                 Generate C2/branch LCOV at $(COVERAGE_REPORT) for crv"
 	@echo "  make coverage-view"
 	@echo "                 Generate LCOV and open it with coverage-report-viewer-cli"
 	@echo "  make doc        Build API documentation"
@@ -59,9 +60,10 @@ coverage:
 	scripts/coverage.sh
 
 coverage-report:
-	COVERAGE_IGNORE_REGEX='$(COVERAGE_REPORT_IGNORE_REGEX)' COVERAGE_MIN_LINES=$(COVERAGE_REPORT_MIN_LINES) scripts/coverage.sh lcov
+	COVERAGE_IGNORE_REGEX='$(COVERAGE_REPORT_IGNORE_REGEX)' COVERAGE_MIN_BRANCHES=$(COVERAGE_REPORT_MIN_BRANCHES) COVERAGE_TOOLCHAIN=$(COVERAGE_REPORT_TOOLCHAIN) scripts/coverage.sh branch-lcov
 	@test -f "$(COVERAGE_REPORT)"
 	@echo "LCOV report generated: $(COVERAGE_REPORT)"
+	@echo "C2/branch threshold: $(COVERAGE_REPORT_MIN_BRANCHES)%"
 	@echo "Scope excludes: $(COVERAGE_REPORT_IGNORE_REGEX)"
 	@echo "Open with: $(COVERAGE_VIEWER) --format lcov $(COVERAGE_REPORT)"
 

@@ -3,13 +3,16 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'USAGE'
-Usage: scripts/coverage.sh [summary|html|lcov]
+Usage: scripts/coverage.sh [summary|html|lcov|branch-lcov]
 
 Environment:
   COVERAGE_MIN_LINES  Minimum line coverage percentage. Default: 90.
+  COVERAGE_MIN_BRANCHES
+                      Minimum branch coverage percentage. Default: 90.
   COVERAGE_IGNORE_REGEX
                       Optional cargo-llvm-cov filename regex to exclude files
                       from the measured scope.
+  COVERAGE_TOOLCHAIN  Optional rustup toolchain. Use nightly for branch coverage.
   LLVM_COV            Path to llvm-cov matching the active rustc, if needed.
   LLVM_PROFDATA       Path to llvm-profdata matching the active rustc, if needed.
 USAGE
@@ -17,9 +20,11 @@ USAGE
 
 mode="${1:-summary}"
 min_lines="${COVERAGE_MIN_LINES:-90}"
+min_branches="${COVERAGE_MIN_BRANCHES:-90}"
+coverage_toolchain="${COVERAGE_TOOLCHAIN:-}"
 
 case "$mode" in
-  summary | html | lcov) ;;
+  summary | html | lcov | branch-lcov) ;;
   -h | --help)
     usage
     exit 0
@@ -32,6 +37,13 @@ esac
 
 run_llvm_cov() {
   local args=(llvm-cov)
+  local cargo_cmd=(cargo)
+
+  if [ -n "$coverage_toolchain" ]; then
+    cargo_cmd=(rustup run "$coverage_toolchain" cargo)
+    export RUSTC="${RUSTC:-$(rustup which rustc --toolchain "$coverage_toolchain")}"
+  fi
+
   if [ -n "${COVERAGE_IGNORE_REGEX:-}" ]; then
     args+=(--ignore-filename-regex "$COVERAGE_IGNORE_REGEX")
   fi
@@ -48,11 +60,17 @@ run_llvm_cov() {
       mkdir -p target/coverage
       args+=(--lcov --output-path target/coverage/lcov.info --fail-under-lines "$min_lines")
       ;;
+    branch-lcov)
+      mkdir -p target/coverage
+      args+=(--branch --lcov --output-path target/coverage/lcov.info)
+      ;;
   esac
 
-  cargo "${args[@]}" || return $?
+  "${cargo_cmd[@]}" "${args[@]}" || return $?
   if [ "$mode" = "summary" ]; then
     scripts/check_coverage_json.py target/coverage/summary.json "$min_lines"
+  elif [ "$mode" = "branch-lcov" ]; then
+    scripts/check_lcov_branch.py target/coverage/lcov.info "$min_branches"
   fi
 }
 
@@ -65,8 +83,10 @@ resolve_rustup_llvm_tools() {
   local candidate_dir
   local brew_prefix
 
-  host="$(rustc -vV | sed -n 's/^host: //p')"
-  sysroot="$(rustc --print sysroot)"
+  local rustc_cmd="${RUSTC:-rustc}"
+
+  host="$("$rustc_cmd" -vV | sed -n 's/^host: //p')"
+  sysroot="$("$rustc_cmd" --print sysroot)"
   tools_dir="${sysroot}/lib/rustlib/${host}/bin"
 
   if [ -z "${LLVM_COV:-}" ] && [ -x "${tools_dir}/llvm-cov" ]; then
@@ -82,7 +102,7 @@ resolve_rustup_llvm_tools() {
     return
   fi
 
-  llvm_version="$(rustc -vV | sed -n 's/^LLVM version: //p')"
+  llvm_version="$("$rustc_cmd" -vV | sed -n 's/^LLVM version: //p')"
   llvm_major="${llvm_version%%.*}"
   if [ -n "$llvm_major" ]; then
     for candidate_dir in \
@@ -133,6 +153,10 @@ run_tarpaulin() {
 
   cargo "${args[@]}"
 }
+
+if [ -n "$coverage_toolchain" ]; then
+  export RUSTC="${RUSTC:-$(rustup which rustc --toolchain "$coverage_toolchain")}"
+fi
 
 if cargo llvm-cov --version >/dev/null 2>&1; then
   resolve_rustup_llvm_tools
