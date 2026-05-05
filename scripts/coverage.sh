@@ -62,15 +62,20 @@ run_llvm_cov() {
       ;;
     branch-lcov)
       mkdir -p target/coverage
-      args+=(--branch --lcov --output-path target/coverage/lcov.info)
+      args+=(--branch --text --output-path target/coverage/branch.txt)
       ;;
   esac
 
   "${cargo_cmd[@]}" "${args[@]}" || return $?
   if [ "$mode" = "summary" ]; then
-    scripts/check_coverage_json.py target/coverage/summary.json "$min_lines"
+    if ! scripts/check_coverage_json.py target/coverage/summary.json "$min_lines"; then
+      return 10
+    fi
   elif [ "$mode" = "branch-lcov" ]; then
-    scripts/check_lcov_branch.py target/coverage/lcov.info "$min_branches"
+    scripts/llvm_text_to_lcov.py target/coverage/branch.txt target/coverage/lcov.info
+    if ! scripts/check_lcov_branch.py target/coverage/lcov.info "$min_branches"; then
+      return 10
+    fi
   fi
 }
 
@@ -167,6 +172,14 @@ if cargo llvm-cov --version >/dev/null 2>&1; then
   set -e
   if [ "$status" -eq 0 ]; then
     exit 0
+  fi
+  if [ "$status" -eq 10 ]; then
+    cat >&2 <<'HINT'
+
+Coverage threshold was not met. The generated report is still available under
+target/coverage/ for inspection.
+HINT
+    exit 1
   fi
   cat >&2 <<'HINT'
 

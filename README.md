@@ -217,14 +217,14 @@ tengu memory remove <memory-id>
 ### Coverage
 
 ```bash
-# C2 / branch coverage summary with a 90% minimum
-scripts/coverage.sh
-
-# Branch LCOV report for coverage-report-viewer-cli
+# C2 / branch LCOV report for coverage-report-viewer-cli with a 90% minimum
 make coverage-report
 
 # Generate and open the LCOV report with crv
 make coverage-view
+
+# Line coverage summary with a 90% minimum
+scripts/coverage.sh
 
 # Line coverage HTML report
 scripts/coverage.sh html
@@ -239,8 +239,11 @@ available LLVM tools, set `LLVM_COV` and `LLVM_PROFDATA` to matching binaries.
 with `crv --format lcov target/coverage/lcov.info`. The LCOV report uses the
 same core source scope as the CI coverage gate, excluding the CLI dispatcher,
 interactive TUI rendering, network transport adapters, and rustc standard
-library entries. Branch coverage uses `cargo llvm-cov --branch`, which requires
-the nightly Rust toolchain and `llvm-tools-preview`.
+library entries. The report file is still written when the 90% gate fails, so
+it can be inspected with `crv`. Branch coverage uses
+`cargo llvm-cov --branch --text` and converts that LLVM report into LCOV because
+LLVM branch LCOV export is unstable on the current Rust nightly. It requires the
+nightly Rust toolchain and `llvm-tools-preview`.
 The CI coverage job requires every in-scope core file to have at least 90%
 C2 / branch coverage. It excludes the CLI dispatcher, interactive TUI
 rendering, and network transport adapters. CLI behavior is covered by
