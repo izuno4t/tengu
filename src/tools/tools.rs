@@ -2208,6 +2208,7 @@ fn tool_input_json(input: &ToolInput) -> Value {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::TempDir;
 
     fn make_executor(dir: &Path) -> ToolExecutor {
@@ -2216,6 +2217,25 @@ mod tests {
             ..ToolPolicy::default()
         };
         ToolExecutor::with_policy(policy)
+    }
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    fn install_fake_curl(dir: &TempDir, script: &str) -> String {
+        let bin = dir.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let curl = bin.join("curl");
+        fs::write(&curl, script).unwrap();
+        let mut perms = fs::metadata(&curl).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        fs::set_permissions(&curl, perms).unwrap();
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin.display(), old_path));
+        old_path
     }
 
     #[test]
@@ -2477,6 +2497,44 @@ mod tests {
     }
 
     #[test]
+    fn bash_appends_exit_code_when_output_is_present() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::Bash {
+                command: "echo output; exit 7".to_string(),
+                timeout: None,
+            })
+            .unwrap();
+        let text = result.to_string_lossy();
+        assert!(text.contains("output"));
+        assert!(text.contains("exit code: 7"));
+    }
+
+    #[test]
+    fn shell_delegates_with_empty_and_joined_args() {
+        let dir = TempDir::new().unwrap();
+        let exec = make_executor(dir.path());
+        let empty_args = exec
+            .execute(ToolInput::Shell {
+                command: "echo shell_empty".to_string(),
+                args: vec![],
+            })
+            .unwrap()
+            .to_string_lossy();
+        assert!(empty_args.contains("shell_empty"));
+
+        let joined_args = exec
+            .execute(ToolInput::Shell {
+                command: "echo".to_string(),
+                args: vec!["shell".to_string(), "joined".to_string()],
+            })
+            .unwrap()
+            .to_string_lossy();
+        assert!(joined_args.contains("shell joined"));
+    }
+
+    #[test]
     fn bash_combined_stdout_stderr() {
         let dir = TempDir::new().unwrap();
         let exec = make_executor(dir.path());
@@ -2594,6 +2652,20 @@ mod tests {
         let text = result.to_string_lossy();
         assert!(text.contains("findme here"));
         assert!(text.contains("findme nested"));
+    }
+
+    #[test]
+    fn grep_defaults_to_current_directory_when_paths_are_empty() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("default-search.txt"), "needle\n").unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .execute(ToolInput::Grep {
+                pattern: "needle".to_string(),
+                paths: vec![],
+            })
+            .unwrap();
+        let _ = result.to_string_lossy();
     }
 
     #[test]
@@ -3056,6 +3128,17 @@ mod tests {
         assert_eq!(tokens, 3);
     }
 
+    #[test]
+    fn estimate_tokens_covers_cjk_boundary_ranges() {
+        assert_eq!(estimate_tokens("\u{3400}"), 1);
+        assert_eq!(estimate_tokens("\u{31f0}"), 1);
+        assert_eq!(estimate_tokens("\u{3000}"), 1);
+        assert_eq!(estimate_tokens("\u{ff01}"), 1);
+        assert_eq!(estimate_tokens("\u{ac00}"), 1);
+        assert_eq!(estimate_tokens("\u{1100}"), 1);
+        assert_eq!(estimate_tokens("abcde"), 2);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Helper Function Tests
     // ═══════════════════════════════════════════════════════════════════════
@@ -3148,6 +3231,31 @@ mod tests {
     }
 
     #[test]
+    fn policy_security_no_paths_and_empty_block_list_are_allowed() {
+        let policy = ToolPolicy {
+            security: Some(SecurityConfig {
+                allow_env_files: Some(true),
+                blocked_paths: Some(vec![]),
+                ..SecurityConfig::default()
+            }),
+            ..ToolPolicy::default()
+        };
+
+        assert!(policy
+            .check(&ToolInput::WebSearch {
+                query: "rust".to_string()
+            })
+            .is_ok());
+        assert!(policy
+            .check(&ToolInput::Read {
+                path: PathBuf::from(".env"),
+                offset: None,
+                limit: None,
+            })
+            .is_ok());
+    }
+
+    #[test]
     fn policy_security_blocks_custom_sensitive_paths() {
         let policy = ToolPolicy {
             security: Some(SecurityConfig {
@@ -3224,6 +3332,75 @@ mod tests {
         let audit = fs::read_to_string(&audit_path).unwrap();
         assert!(audit.contains("\"status\":\"denied\""));
         assert!(audit.contains("sensitive path"));
+    }
+
+    #[test]
+    fn audit_log_path_respects_disabled_empty_and_relative_config() {
+        let dir = TempDir::new().unwrap();
+        let disabled = ToolPolicy {
+            workspace_root: dir.path().to_path_buf(),
+            security: Some(SecurityConfig {
+                audit_log: Some("audit.jsonl".to_string()),
+                audit_enabled: Some(false),
+                ..SecurityConfig::default()
+            }),
+            ..ToolPolicy::default()
+        };
+        assert!(disabled.audit_log_path().is_none());
+
+        let empty = ToolPolicy {
+            workspace_root: dir.path().to_path_buf(),
+            security: Some(SecurityConfig {
+                audit_log: Some("   ".to_string()),
+                audit_enabled: Some(true),
+                ..SecurityConfig::default()
+            }),
+            ..ToolPolicy::default()
+        };
+        assert!(empty.audit_log_path().is_none());
+
+        let relative = ToolPolicy {
+            workspace_root: dir.path().to_path_buf(),
+            security: Some(SecurityConfig {
+                audit_log: Some("logs/audit.jsonl".to_string()),
+                audit_enabled: Some(true),
+                ..SecurityConfig::default()
+            }),
+            ..ToolPolicy::default()
+        };
+        assert_eq!(
+            relative.audit_log_path().unwrap(),
+            dir.path().join("logs/audit.jsonl")
+        );
+    }
+
+    #[test]
+    fn audit_log_returns_when_parent_cannot_be_created() {
+        let dir = TempDir::new().unwrap();
+        let parent_file = dir.path().join("not-a-dir");
+        fs::write(&parent_file, "file").unwrap();
+        let exec = ToolExecutor::with_policy(ToolPolicy {
+            workspace_root: dir.path().to_path_buf(),
+            security: Some(SecurityConfig {
+                audit_log: Some(
+                    parent_file
+                        .join("audit.jsonl")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                audit_enabled: Some(true),
+                ..SecurityConfig::default()
+            }),
+            ..ToolPolicy::default()
+        });
+
+        let result = exec.execute(ToolInput::Read {
+            path: dir.path().join("missing.txt"),
+            offset: None,
+            limit: None,
+        });
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -3501,6 +3678,51 @@ mod tests {
     }
 
     #[test]
+    fn hooks_skip_mismatches_empty_commands_and_timeout_when_ignored() {
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("marker.txt");
+        let policy = ToolPolicy {
+            hooks: Some(HooksConfig {
+                pre_tool_use: vec![
+                    HookConfig {
+                        matcher: Some("Read(*)".to_string()),
+                        command: format!("touch {}", marker.display()),
+                        timeout_ms: Some(1000),
+                        cache_ttl_seconds: None,
+                        on_error: Some("fail".to_string()),
+                    },
+                    HookConfig {
+                        matcher: Some("Write(*)".to_string()),
+                        command: "   ".to_string(),
+                        timeout_ms: Some(1000),
+                        cache_ttl_seconds: None,
+                        on_error: Some("fail".to_string()),
+                    },
+                    HookConfig {
+                        matcher: Some("Write(*)".to_string()),
+                        command: "sleep 1".to_string(),
+                        timeout_ms: Some(1),
+                        cache_ttl_seconds: None,
+                        on_error: Some("ignore".to_string()),
+                    },
+                ],
+                ..HooksConfig::default()
+            }),
+            workspace_root: dir.path().to_path_buf(),
+            ..ToolPolicy::default()
+        };
+        let exec = ToolExecutor::with_policy(policy);
+
+        exec.execute(ToolInput::Write {
+            path: dir.path().join("out.txt"),
+            content: "ok".to_string(),
+        })
+        .unwrap();
+
+        assert!(!marker.exists());
+    }
+
+    #[test]
     fn policy_sandbox_read_only_blocks_bash() {
         let policy = ToolPolicy {
             sandbox: Some(SandboxConfig {
@@ -3708,6 +3930,15 @@ mod tests {
     }
 
     #[test]
+    fn ssrf_allows_public_ipv4_and_ipv6_hosts() {
+        assert!(!is_private_url("http://192.0.2.1/path"));
+        assert!(!is_private_url("http://169.255.0.1/path"));
+        assert!(!is_private_url("http://[2001:4860:4860::8888]/path"));
+        assert!(is_private_url("http://[fe80::1]/path"));
+        assert!(is_private_url("http://[::]/path"));
+    }
+
+    #[test]
     fn ssrf_blocks_non_http_schemes() {
         assert!(is_private_url("ftp://example.com/file"));
         assert!(is_private_url("file:///etc/passwd"));
@@ -3870,6 +4101,55 @@ mod tests {
         assert!(result.contains("unsupported HTTP method"));
     }
 
+    #[test]
+    fn webfetch_uses_curl_for_supported_methods_body_and_failure_output() {
+        let _lock = env_lock();
+        let dir = TempDir::new().unwrap();
+        let old_path = install_fake_curl(
+            &dir,
+            "#!/bin/sh\nprintf 'fake response with args: %s\\n' \"$*\"\n",
+        );
+        let exec = make_executor(dir.path());
+
+        let result = exec
+            .execute(ToolInput::WebFetch {
+                url: "https://example.com/api".to_string(),
+                method: "POST".to_string(),
+                headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                body: Some("{\"ok\":true}".to_string()),
+            })
+            .unwrap()
+            .to_string_lossy();
+
+        assert!(result.contains("fake response"));
+        assert!(result.contains("POST"));
+        assert!(result.contains("{\"ok\":true}"));
+
+        std::env::set_var("PATH", old_path);
+    }
+
+    #[test]
+    fn webfetch_reports_curl_failure_with_stderr() {
+        let _lock = env_lock();
+        let dir = TempDir::new().unwrap();
+        let old_path =
+            install_fake_curl(&dir, "#!/bin/sh\necho 'curl failed detail' >&2\nexit 22\n");
+        let exec = make_executor(dir.path());
+
+        let result = exec.execute(ToolInput::WebFetch {
+            url: "https://example.com/api".to_string(),
+            method: "GET".to_string(),
+            headers: vec![],
+            body: None,
+        });
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("HTTP request failed"));
+        assert!(err.contains("curl failed detail"));
+
+        std::env::set_var("PATH", old_path);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // WebSearch Tool Tests
     // ═══════════════════════════════════════════════════════════════════════
@@ -3916,6 +4196,61 @@ mod tests {
         let (result, is_error) = exec.execute_from_json("WebSearch", &input);
         assert!(is_error);
         assert!(result.contains("empty"));
+    }
+
+    #[test]
+    fn websearch_uses_curl_and_handles_results_and_empty_results() {
+        let _lock = env_lock();
+        let dir = TempDir::new().unwrap();
+        let old_path = install_fake_curl(
+            &dir,
+            r#"#!/bin/sh
+if echo "$*" | grep -q 'rust+lang'; then
+  printf '<a rel="nofollow" href="https://example.com/rust" class="result-link">Rust Lang</a>\n<td class="result-snippet">A result snippet with enough detail.</td>\n'
+else
+  printf '<html>No useful results</html>\n'
+fi
+"#,
+        );
+        let exec = make_executor(dir.path());
+
+        let found = exec
+            .execute(ToolInput::WebSearch {
+                query: "rust lang".to_string(),
+            })
+            .unwrap()
+            .to_string_lossy();
+        assert!(found.contains("Rust Lang"));
+        assert!(found.contains("https://example.com/rust"));
+
+        let empty = exec
+            .execute(ToolInput::WebSearch {
+                query: "no-results".to_string(),
+            })
+            .unwrap()
+            .to_string_lossy();
+        assert!(empty.contains("No results found"));
+
+        std::env::set_var("PATH", old_path);
+    }
+
+    #[test]
+    fn websearch_reports_curl_failure() {
+        let _lock = env_lock();
+        let dir = TempDir::new().unwrap();
+        let old_path =
+            install_fake_curl(&dir, "#!/bin/sh\necho 'search failed detail' >&2\nexit 7\n");
+        let exec = make_executor(dir.path());
+
+        let result = exec.execute(ToolInput::WebSearch {
+            query: "rust".to_string(),
+        });
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("web search failed"));
+        assert!(err.contains("search failed detail"));
+
+        std::env::set_var("PATH", old_path);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -4204,6 +4539,33 @@ mod tests {
     }
 
     #[test]
+    fn preview_write_covers_existing_file_and_policy_denial() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preview.txt");
+        fs::write(&path, "before").unwrap();
+        let exec = make_executor(dir.path());
+        let result = exec
+            .preview_write(path.clone(), "after".to_string())
+            .unwrap()
+            .to_string_lossy();
+        assert!(result.contains("-before"));
+        assert!(result.contains("+after"));
+
+        let denied = ToolExecutor::with_policy(ToolPolicy {
+            permissions: Some(PermissionsConfig {
+                approval_policy: Some("read-only".to_string()),
+                allowed_tools: None,
+                deny: None,
+            }),
+            workspace_root: dir.path().to_path_buf(),
+            ..ToolPolicy::default()
+        });
+        assert!(denied
+            .preview_write(path, "after denied".to_string())
+            .is_err());
+    }
+
+    #[test]
     fn approval_override_paths_are_enforced() {
         let policy = ToolPolicy {
             permissions: Some(PermissionsConfig {
@@ -4239,6 +4601,52 @@ mod tests {
             .contains("approval"));
         policy.set_approval_override(ApprovalOverride::AllowAll);
         assert!(policy.check(&input).is_ok());
+    }
+
+    #[test]
+    fn approval_override_allow_once_requires_matching_tool() {
+        let policy = ToolPolicy {
+            permissions: Some(PermissionsConfig {
+                approval_policy: Some("always".to_string()),
+                allowed_tools: None,
+                deny: None,
+            }),
+            ..ToolPolicy::default()
+        };
+        policy.set_approval_override(ApprovalOverride::AllowOnce(Tool::Write));
+
+        let result = policy.check(&ToolInput::Read {
+            path: PathBuf::from("Cargo.toml"),
+            offset: None,
+            limit: None,
+        });
+
+        assert!(result.unwrap_err().to_string().contains("approval"));
+    }
+
+    #[test]
+    fn approval_override_poisoned_lock_requires_approval() {
+        let policy = ToolPolicy {
+            permissions: Some(PermissionsConfig {
+                approval_policy: Some("always".to_string()),
+                allowed_tools: None,
+                deny: None,
+            }),
+            ..ToolPolicy::default()
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = policy.approval_override.lock().unwrap();
+            panic!("poison approval override");
+        }));
+        policy.set_approval_override(ApprovalOverride::AllowAll);
+
+        let result = policy.check(&ToolInput::Read {
+            path: PathBuf::from("Cargo.toml"),
+            offset: None,
+            limit: None,
+        });
+
+        assert!(result.unwrap_err().to_string().contains("approval"));
     }
 
     #[test]
@@ -4284,5 +4692,247 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("outside workspace"));
+    }
+
+    #[test]
+    fn sandbox_allowed_and_blocked_lists_cover_matching_and_non_matching_paths() {
+        let dir = TempDir::new().unwrap();
+        let policy = ToolPolicy {
+            sandbox: Some(SandboxConfig {
+                mode: Some("workspace-write".to_string()),
+                allowed_paths: Some(vec![dir
+                    .path()
+                    .join("allowed/**")
+                    .to_string_lossy()
+                    .to_string()]),
+                blocked_paths: Some(vec!["./blocked/**".to_string()]),
+            }),
+            workspace_root: dir.path().to_path_buf(),
+            ..ToolPolicy::default()
+        };
+
+        assert!(policy
+            .check(&ToolInput::Read {
+                path: dir.path().join("allowed/file.txt"),
+                offset: None,
+                limit: None,
+            })
+            .is_ok());
+        assert!(policy
+            .check(&ToolInput::Read {
+                path: dir.path().join("other/file.txt"),
+                offset: None,
+                limit: None,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("not allowed"));
+        assert!(policy
+            .check(&ToolInput::Write {
+                path: dir.path().join("blocked/file.txt"),
+                content: "x".to_string(),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("blocked"));
+    }
+
+    #[test]
+    fn permission_rules_cover_empty_alias_and_malformed_patterns() {
+        let shell = ToolInput::Shell {
+            command: "git".to_string(),
+            args: vec!["status".to_string()],
+        };
+        let bash = ToolInput::Bash {
+            command: "git status".to_string(),
+            timeout: None,
+        };
+        let read = ToolInput::Read {
+            path: PathBuf::from("src/main.rs"),
+            offset: None,
+            limit: None,
+        };
+
+        assert_eq!(permission_rule_matches_tool("   ", &read, None), None);
+        assert!(!rule_matches_tool("Bash(git status", &bash, None));
+        assert!(rule_matches_tool("Bash(git status)", &shell, None));
+        assert!(rule_matches_tool("Shell(git status)", &bash, None));
+        assert!(!rule_matches_tool("Write", &read, None));
+        assert!(permission_rules_match(
+            &["Read".to_string(), "!Read(src/main.rs)".to_string()],
+            &read,
+            None
+        )
+        .is_some_and(|decision| decision == PermissionRuleDecision::Exclude));
+    }
+
+    #[test]
+    fn shell_grep_glob_targets_cover_optional_arguments() {
+        assert_eq!(
+            tool_match_targets(
+                &ToolInput::Shell {
+                    command: "echo".to_string(),
+                    args: vec![],
+                },
+                None,
+            ),
+            vec!["echo"]
+        );
+        assert_eq!(
+            tool_match_targets(
+                &ToolInput::Shell {
+                    command: "echo".to_string(),
+                    args: vec!["hello".to_string()],
+                },
+                None,
+            ),
+            vec!["echo hello"]
+        );
+        assert_eq!(
+            tool_match_targets(
+                &ToolInput::Grep {
+                    pattern: "needle".to_string(),
+                    paths: vec![PathBuf::from("src")],
+                },
+                None,
+            ),
+            vec!["needle", "src"]
+        );
+        assert_eq!(
+            tool_match_targets(
+                &ToolInput::Glob {
+                    pattern: "*.rs".to_string(),
+                    root: None,
+                },
+                None,
+            ),
+            vec!["*.rs"]
+        );
+    }
+
+    #[test]
+    fn path_and_tool_match_targets_cover_relative_and_optional_paths() {
+        let dir = TempDir::new().unwrap();
+        let absolute = dir.path().join("src/main.rs");
+        let rules = vec![
+            "./src/main.rs".to_string(),
+            "no-match".to_string(),
+            "   ".to_string(),
+        ];
+        assert!(path_matches_any(
+            &absolute.to_string_lossy(),
+            Some("./src/main.rs"),
+            &rules
+        ));
+
+        let grep = ToolInput::Grep {
+            pattern: "needle".to_string(),
+            paths: vec![PathBuf::from("src"), PathBuf::from("tests")],
+        };
+        let grep_targets = tool_match_targets(&grep, Some(dir.path()));
+        assert!(grep_targets.contains(&"needle".to_string()));
+        assert!(grep_targets.iter().any(|target| target.ends_with("src")));
+
+        let glob = ToolInput::Glob {
+            pattern: "*.rs".to_string(),
+            root: Some(PathBuf::from("src")),
+        };
+        assert_eq!(tool_match_targets(&glob, None), vec!["*.rs", "src"]);
+    }
+
+    #[test]
+    fn grep_and_glob_skip_excluded_and_non_file_paths() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("node_modules")).unwrap();
+        fs::create_dir(dir.path().join("target")).unwrap();
+        fs::write(dir.path().join("node_modules").join("hidden.txt"), "needle").unwrap();
+        fs::write(dir.path().join("target").join("hidden.txt"), "needle").unwrap();
+        fs::write(dir.path().join("visible.txt"), "needle").unwrap();
+        let mut matches = Vec::new();
+        collect_grep_matches_regex(
+            &regex::Regex::new("needle").unwrap(),
+            dir.path(),
+            &mut matches,
+        )
+        .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].contains("visible.txt"));
+
+        let mut paths = Vec::new();
+        collect_glob_matches(dir.path(), "*.txt", &mut paths).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("visible.txt"));
+
+        let mut missing_matches = Vec::new();
+        collect_grep_matches_regex(
+            &regex::Regex::new("needle").unwrap(),
+            &dir.path().join("missing"),
+            &mut missing_matches,
+        )
+        .unwrap();
+        assert!(missing_matches.is_empty());
+
+        let mut non_matching_paths = Vec::new();
+        collect_glob_matches(
+            &dir.path().join("visible.txt"),
+            "*.rs",
+            &mut non_matching_paths,
+        )
+        .unwrap();
+        assert!(non_matching_paths.is_empty());
+    }
+
+    #[test]
+    fn glob_and_search_parsing_cover_edge_cases() {
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        let path = nested.join("main.rs");
+        fs::write(&path, "").unwrap();
+        assert!(matches_glob("nested/*.rs", Path::new("nested/main.rs")));
+        assert!(matches_glob("*.rs", &path));
+        assert!(!matches_glob("*.toml", &path));
+
+        let html = r#"
+<a rel="nofollow" href="https://example.com/empty"></a>
+<td class="result-snippet">short</td>
+<a rel="nofollow" href="https://duckduckgo.com/ignored">Ignored</a>
+<a class="result-link" href="https://example.org/page">Example Org</a>
+<td class="result-snippet">This snippet is long enough to be attached.</td>
+"#;
+        let results = parse_duckduckgo_lite(html);
+        assert!(results
+            .iter()
+            .any(|item| item == "URL: https://example.com/empty"));
+        assert!(results
+            .iter()
+            .any(|item| item.contains("This snippet is long enough")));
+        assert!(!results
+            .iter()
+            .any(|item| item.contains("duckduckgo.com/ignored")));
+
+        let edge_html = r#"
+<a rel="nofollow" href="/relative/path">Relative</a>
+<a class="result-link">Missing Href</a>
+<td class="result-snippet">Snippet without a current result is ignored.</td>
+"#;
+        assert!(parse_duckduckgo_lite(edge_html).is_empty());
+    }
+
+    #[test]
+    fn build_diff_covers_same_added_and_removed_lines() {
+        let same = build_diff(Path::new("same.txt"), "same\n", "same\n");
+        assert!(same.contains(" same"));
+
+        let added = build_diff(Path::new("added.txt"), "", "new\n");
+        assert!(added.contains("+new"));
+
+        let removed = build_diff(Path::new("removed.txt"), "old\n", "");
+        assert!(removed.contains("-old"));
+    }
+
+    #[test]
+    fn create_auto_checkpoint_noops_for_empty_path_list() {
+        create_auto_checkpoint(&[], "nothing to checkpoint").unwrap();
     }
 }

@@ -228,4 +228,19 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].content, "Alpha");
     }
+
+    #[test]
+    fn formats_entries_and_scores_empty_token_query() {
+        let entry = MemoryEntry {
+            id: "mem-1".to_string(),
+            content: "Remember cargo fmt".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+        };
+
+        let formatted = format_memory_entries(&[entry.clone()]);
+        assert!(formatted.contains("mem-1"));
+        assert!(formatted.contains("Remember cargo fmt"));
+        assert_eq!(memory_score(&entry.content, &[]), 1);
+    }
 }

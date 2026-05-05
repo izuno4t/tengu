@@ -47,6 +47,27 @@ Example: add new tool logic under `src/tools/` and wire it in `src/cli.rs`.
 - Apply routine updates (e.g., task status) without asking.
 - Review updates before responding.
 
+## Continuation Policy
+
+- When the user explicitly says to continue until the task is complete, minimize
+  stops caused by confirmation requests.
+- Proceed without asking for confirmation when the decision can be made from
+  existing code, documentation, or repository conventions.
+- Proceed without asking for confirmation when the impact is limited, the change
+  is easy to revise, and the decision does not conflict with the user's stated
+  goal.
+- Continue through sequential implementation, verification, and routine task
+  status updates when those steps are necessary to complete the requested work.
+- Stop and ask for confirmation only when a destructive operation is required,
+  externally visible behavior may change, or the task affects public APIs,
+  database schemas, security behavior, CI/CD, build processes, default
+  configuration values, or environment assumptions.
+- Stop and ask for confirmation when requirements conflict, execution is blocked
+  by permissions or environment constraints, or different choices would
+  materially change the deliverable or impact scope.
+- When proceeding without confirmation, briefly record assumptions, decision
+  reasons, and verification results in the final response.
+
 ## Commit & Pull Request Guidelines
 
 - Git history is currently short and uses descriptive sentences (e.g., “Add

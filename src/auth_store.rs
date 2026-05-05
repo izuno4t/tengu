@@ -332,6 +332,12 @@ fn set_private_permissions(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     struct EnvGuard {
         home: Option<String>,
@@ -509,6 +515,7 @@ mod tests {
     fn env_backed_auth_flow_reports_status_and_hydrates_token() {
         let dir = tempfile::tempdir().unwrap();
         let token_var = "TENGU_TEST_OPENAI_API_KEY";
+        let _lock = env_lock();
         let _env = EnvGuard::capture(token_var);
 
         std::env::set_var("HOME", dir.path());
@@ -536,6 +543,51 @@ mod tests {
         );
         clear().unwrap();
         assert_eq!(token_store_status("openai"), "token_store=missing");
+    }
+
+    #[test]
+    fn token_status_reports_invalid_locked_and_decrypt_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_var = "TENGU_TEST_STATUS_API_KEY";
+        let _lock = env_lock();
+        let _env = EnvGuard::capture(token_var);
+
+        std::env::set_var("HOME", dir.path());
+        std::env::remove_var(AUTH_PASSPHRASE_ENV);
+        let token_path = default_token_store_path().unwrap();
+        fs::create_dir_all(token_path.parent().unwrap()).unwrap();
+        fs::write(&token_path, "not-json").unwrap();
+        assert_eq!(token_store_status("openai"), "token_store=invalid");
+
+        std::env::set_var(AUTH_PASSPHRASE_ENV, "correct passphrase");
+        save_login("openai", token_var, "sk-secret").unwrap();
+        std::env::remove_var(AUTH_PASSPHRASE_ENV);
+        assert_eq!(
+            token_store_status("openai"),
+            "token_store=locked passphrase_env=TENGU_AUTH_PASSPHRASE"
+        );
+
+        std::env::set_var(AUTH_PASSPHRASE_ENV, "wrong passphrase");
+        assert_eq!(token_store_status("openai"), "token_store=locked");
+    }
+
+    #[test]
+    fn clear_at_and_hydrate_are_noops_when_files_or_token_are_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_var = "TENGU_TEST_MISSING_API_KEY";
+        let _lock = env_lock();
+        let _env = EnvGuard::capture(token_var);
+
+        std::env::set_var("HOME", dir.path());
+        std::env::set_var(AUTH_PASSPHRASE_ENV, "test passphrase");
+        std::env::remove_var(token_var);
+
+        clear_at(
+            &dir.path().join("missing-session.json"),
+            &dir.path().join("missing-tokens.json"),
+        )
+        .unwrap();
+        assert!(!hydrate_env_for_provider("openai").unwrap());
     }
 
     #[test]

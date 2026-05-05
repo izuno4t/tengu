@@ -847,9 +847,11 @@ type ApprovalHandler =
 mod tests {
     use super::*;
     use crate::llm::{
-        ChatRequest, ChatResponse, ContentBlock, LlmBackend, LlmClient, LlmImage, LlmProvider,
-        LlmRequest, LlmResponse, LlmStream, LlmUsage, StopReason,
+        ChatRequest, ChatResponse, ChatStream, ChatStreamEvent, ContentBlock, LlmBackend,
+        LlmClient, LlmImage, LlmProvider, LlmRequest, LlmResponse, LlmStream, LlmUsage, StopReason,
     };
+    use anyhow::anyhow;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Mock backend that returns a fixed text response.
@@ -955,6 +957,60 @@ mod tests {
         }
     }
 
+    struct ScriptedStreamBackend {
+        responses: Mutex<VecDeque<Result<Vec<ChatStreamEvent>>>>,
+    }
+
+    impl ScriptedStreamBackend {
+        fn new(responses: Vec<Result<Vec<ChatStreamEvent>>>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmBackend for ScriptedStreamBackend {
+        fn provider(&self) -> LlmProvider {
+            LlmProvider::Anthropic
+        }
+
+        async fn generate(&self, _model: &str, _request: &LlmRequest) -> Result<LlmResponse> {
+            Ok(LlmResponse {
+                content: "generated".to_string(),
+                usage: None,
+            })
+        }
+
+        async fn generate_stream(&self, _model: &str, _request: &LlmRequest) -> Result<LlmStream> {
+            Ok(Box::pin(futures_util::stream::iter(vec![Ok(
+                crate::llm::LlmStreamEvent::Text("generated".to_string()),
+            )])))
+        }
+
+        async fn chat(&self, _model: &str, _request: &ChatRequest) -> Result<ChatResponse> {
+            Ok(ChatResponse {
+                content: vec![ContentBlock::Text {
+                    text: "fallback".to_string(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            })
+        }
+
+        async fn chat_stream(&self, _model: &str, _request: &ChatRequest) -> Result<ChatStream> {
+            let response = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(vec![ChatStreamEvent::Done(StopReason::EndTurn)]))?;
+            Ok(Box::pin(futures_util::stream::iter(
+                response.into_iter().map(Ok),
+            )))
+        }
+    }
+
     fn make_runner(backend: impl LlmBackend + Send + Sync + 'static) -> AgentRunner {
         let client = LlmClient::new(Box::new(backend));
         AgentRunner::new(client, "test-model".to_string(), ToolPolicy::default())
@@ -1006,6 +1062,144 @@ mod tests {
         // Should have made 2 turns: tool_use + end_turn
         assert_eq!(result.total_turns, 2);
         assert_eq!(result.final_text, "File not found, as expected.");
+    }
+
+    #[tokio::test]
+    async fn agent_runner_streaming_loop_flushes_thinking_text_and_tool_results() {
+        let runner = make_runner(ScriptedStreamBackend::new(vec![
+            Ok(vec![
+                ChatStreamEvent::ThinkingDelta("considering".to_string()),
+                ChatStreamEvent::TextDelta("need tool".to_string()),
+                ChatStreamEvent::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "UnknownTool".to_string(),
+                    input: serde_json::json!({"value": 1}),
+                },
+                ChatStreamEvent::Done(StopReason::ToolUse),
+            ]),
+            Ok(vec![
+                ChatStreamEvent::TextDelta("final answer".to_string()),
+                ChatStreamEvent::Done(StopReason::EndTurn),
+            ]),
+        ]));
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        runner.set_tool_event_handler(Arc::new(move |event| {
+            let events = events_clone.clone();
+            Box::pin(async move {
+                let label = match event {
+                    ToolEvent::Text(text) => format!("text:{text}"),
+                    ToolEvent::Thinking(text) => format!("thinking:{text}"),
+                    ToolEvent::ToolCall { name, .. } => format!("call:{name}"),
+                    ToolEvent::ToolResult { name, is_error, .. } => {
+                        format!("result:{name}:{is_error}")
+                    }
+                    ToolEvent::Usage(_) => "usage".to_string(),
+                };
+                events.lock().unwrap().push(label);
+            })
+        }));
+
+        let result = runner.run_prompt("use a tool").await.unwrap();
+
+        assert_eq!(result.total_turns, 2);
+        assert_eq!(result.final_text, "final answer");
+        assert!(result.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Thinking { thinking } if thinking == "considering"))
+        }));
+        assert!(result.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. }))
+        }));
+        let collected = events.lock().unwrap();
+        assert!(collected.contains(&"thinking:considering".to_string()));
+        assert!(collected.contains(&"text:need tool".to_string()));
+        assert!(collected.contains(&"call:UnknownTool".to_string()));
+        assert!(collected.contains(&"result:UnknownTool:true".to_string()));
+    }
+
+    #[tokio::test]
+    async fn agent_runner_streaming_loop_flushes_final_thinking_and_handles_empty_tool_use() {
+        let thinking_only = make_runner(ScriptedStreamBackend::new(vec![Ok(vec![
+            ChatStreamEvent::ThinkingDelta("final thought".to_string()),
+            ChatStreamEvent::Done(StopReason::EndTurn),
+        ])]));
+        let result = thinking_only.run_prompt("think").await.unwrap();
+        assert!(result.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Thinking { thinking } if thinking == "final thought"))
+        }));
+
+        let no_tool_blocks = make_runner(ScriptedStreamBackend::new(vec![Ok(vec![
+            ChatStreamEvent::TextDelta("no tools actually".to_string()),
+            ChatStreamEvent::Done(StopReason::ToolUse),
+        ])]));
+        let result = no_tool_blocks
+            .run_prompt("tool use without tool")
+            .await
+            .unwrap();
+        assert_eq!(result.total_turns, 1);
+        assert_eq!(result.final_text, "no tools actually");
+    }
+
+    #[tokio::test]
+    async fn agent_runner_chat_stream_errors_cover_retry_decisions() {
+        let non_retry = make_runner(ScriptedStreamBackend::new(vec![Err(anyhow!(
+            "bad request"
+        ))]));
+        let err = non_retry
+            .run_agent_loop_with_max_turns(vec![Message::user_text("fail")], 1)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("bad request"));
+
+        let retry_then_success = make_runner(ScriptedStreamBackend::new(vec![
+            Err(anyhow!("429 rate limited")),
+            Ok(vec![
+                ChatStreamEvent::TextDelta("recovered".to_string()),
+                ChatStreamEvent::Done(StopReason::EndTurn),
+            ]),
+        ]));
+        let result = retry_then_success
+            .run_agent_loop_with_max_turns(vec![Message::user_text("retry")], 1)
+            .await
+            .unwrap();
+        assert_eq!(result.final_text, "recovered");
+
+        for marker in ["529", "rate", "overloaded", "500", "502", "503"] {
+            let runner = make_runner(ScriptedStreamBackend::new(vec![
+                Err(anyhow!("transient {marker}")),
+                Ok(vec![
+                    ChatStreamEvent::TextDelta(marker.to_string()),
+                    ChatStreamEvent::Done(StopReason::EndTurn),
+                ]),
+            ]));
+            let result = runner
+                .run_agent_loop_with_max_turns(vec![Message::user_text("retry")], 1)
+                .await
+                .unwrap();
+            assert_eq!(result.final_text, marker);
+        }
+
+        let exhausted = make_runner(ScriptedStreamBackend::new(vec![
+            Err(anyhow!("429 again")),
+            Err(anyhow!("429 again")),
+            Err(anyhow!("429 again")),
+        ]));
+        let err = exhausted
+            .run_agent_loop_with_max_turns(vec![Message::user_text("retry")], 1)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("429"));
     }
 
     #[tokio::test]
@@ -1134,8 +1328,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_runner_mcp_transport_errors_are_explicit() {
+        let runner = make_runner(MockBackend::new("unused"));
+        runner.set_mcp_servers(vec![(
+            "stdio".to_string(),
+            McpServerConfig {
+                command: Some("tengu-test-command-that-does-not-exist".to_string()),
+                args: None,
+                env: None,
+                url: None,
+                bearer_token_env_var: None,
+                http_headers: None,
+                timeout_sec: Some(1),
+            },
+        )]);
+
+        let (text, is_error) = runner
+            .execute_mcp_tool("mcp__stdio_list", &serde_json::json!({}))
+            .await;
+        assert!(is_error);
+        assert!(text.contains("MCP error"));
+    }
+
+    #[tokio::test]
     async fn agent_runner_sub_agent_and_parallel_agent_validation() {
         let runner = make_runner(MockBackend::new("sub result"));
+        runner.set_system_prompt("shared system".to_string());
 
         let (text, is_error) = runner.execute_sub_agent(&serde_json::json!({})).await;
         assert!(is_error);
@@ -1167,6 +1385,61 @@ mod tests {
         assert!(!is_error);
         assert!(text.contains("--- Task 1 result"));
         assert!(text.contains("sub result"));
+    }
+
+    #[tokio::test]
+    async fn agent_runner_parallel_agents_reports_subtask_errors() {
+        let runner = make_runner(ScriptedStreamBackend::new(vec![
+            Err(anyhow!("bad request")),
+            Ok(vec![
+                ChatStreamEvent::TextDelta("ok task".to_string()),
+                ChatStreamEvent::Done(StopReason::EndTurn),
+            ]),
+        ]));
+        runner.set_system_prompt("parallel system".to_string());
+
+        let (text, is_error) = runner
+            .execute_parallel_agents(&serde_json::json!({"tasks": ["fails", "passes"]}))
+            .await;
+
+        assert!(is_error);
+        assert!(text.contains("[ERROR]"));
+        assert!(text.contains("bad request"));
+        assert!(text.contains("ok task"));
+    }
+
+    #[tokio::test]
+    async fn agent_runner_agent_loop_dispatches_mcp_tool_names() {
+        let runner = make_runner(ScriptedStreamBackend::new(vec![
+            Ok(vec![
+                ChatStreamEvent::ToolUse {
+                    id: "mcp-1".to_string(),
+                    name: "mcp__missing_tool".to_string(),
+                    input: serde_json::json!({}),
+                },
+                ChatStreamEvent::Done(StopReason::ToolUse),
+            ]),
+            Ok(vec![
+                ChatStreamEvent::TextDelta("done".to_string()),
+                ChatStreamEvent::Done(StopReason::EndTurn),
+            ]),
+        ]));
+
+        let result = runner.run_prompt("call mcp").await.unwrap();
+
+        assert_eq!(result.final_text, "done");
+        assert!(result.messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult {
+                        is_error: true,
+                        content,
+                        ..
+                    } if content.contains("not found")
+                )
+            })
+        }));
     }
 
     #[tokio::test]
@@ -1223,6 +1496,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(plan, "short");
+    }
+
+    #[tokio::test]
+    async fn agent_runner_compacts_large_message_sets_during_loop() {
+        let runner = make_runner(MockBackend::new("compacted"));
+        let mut force_messages = Vec::new();
+        for idx in 0..=FORCE_COMPACT_THRESHOLD {
+            force_messages.push(Message::user_text(format!("message {idx}")));
+        }
+        let result = runner
+            .run_agent_loop_with_max_turns(force_messages, 1)
+            .await
+            .unwrap();
+        assert_eq!(result.final_text, "compacted");
+
+        let runner = make_runner(MockBackend::new("max compacted"));
+        let mut max_messages = Vec::new();
+        for idx in 0..=MAX_CONTEXT_MESSAGES {
+            max_messages.push(Message::user_text(format!("message {idx}")));
+        }
+        let result = runner
+            .run_agent_loop_with_max_turns(max_messages, 1)
+            .await
+            .unwrap();
+        assert_eq!(result.final_text, "max compacted");
+    }
+
+    #[tokio::test]
+    async fn agent_runner_legacy_image_requests_cover_empty_context_prompts() {
+        let runner = make_runner(MockBackend::new("generated"));
+        let request = LlmRequest {
+            prompt: "describe image".to_string(),
+            images: vec![LlmImage {
+                media_type: "image/png".to_string(),
+                data_base64: "AAAA".to_string(),
+            }],
+        };
+
+        let output = runner
+            .handle_request_with_context(request.clone(), "")
+            .await
+            .unwrap();
+        assert_eq!(output.response.content, "generated");
+
+        let (_stream, tool_result) = runner
+            .handle_request_stream_with_context(request, "")
+            .await
+            .unwrap();
+        assert!(tool_result.is_none());
+    }
+
+    #[test]
+    fn agent_runner_poisoned_mutexes_fall_back_without_panicking() {
+        let runner = make_runner(MockBackend::new("unused"));
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = runner.mcp_servers.lock().unwrap();
+            panic!("poison mcp servers");
+        }));
+        runner.set_mcp_servers(Vec::new());
+        assert!(runner.get_mcp_tool_definitions().is_empty());
+
+        let runner = make_runner(MockBackend::new("unused"));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = runner.approval_handler.lock().unwrap();
+            panic!("poison approval handler");
+        }));
+        runner.set_approval_handler(Arc::new(|_request| {
+            Box::pin(async { ToolApprovalDecision::AllowOnce })
+        }));
+
+        let runner = make_runner(MockBackend::new("unused"));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = runner.tool_event_handler.lock().unwrap();
+            panic!("poison tool event handler");
+        }));
+        runner.set_tool_event_handler(Arc::new(|_event| Box::pin(async {})));
+
+        let runner = make_runner(MockBackend::new("unused"));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = runner.system_prompt.lock().unwrap();
+            panic!("poison system prompt");
+        }));
+        runner.set_system_prompt("ignored".to_string());
+        assert!(runner.get_system_prompt().is_none());
+
+        let runner = make_runner(MockBackend::new("unused"));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = runner.conversation_messages.lock().unwrap();
+            panic!("poison conversation messages");
+        }));
+        assert!(runner.get_conversation_messages().is_empty());
+        runner.clear_conversation();
+        runner.save_conversation_messages(&[Message::user_text("ignored")]);
     }
 
     #[test]
@@ -1310,6 +1677,65 @@ mod tests {
         let messages = vec![Message::assistant_text("only assistant")];
         let compacted = AgentRunner::compact_messages(&messages);
         assert!(!compacted.is_empty());
+    }
+
+    #[test]
+    fn compact_messages_handles_all_assistant_and_tool_result_prefixes() {
+        let mut assistant_only = Vec::new();
+        for idx in 0..=COMPACT_PRESERVE_MESSAGES {
+            assistant_only.push(Message::assistant_text(format!("assistant {idx}")));
+        }
+        let compacted = AgentRunner::compact_messages(&assistant_only);
+        assert_eq!(compacted.len(), 1);
+        assert_eq!(compacted[0].text_content(), "assistant 30");
+
+        let mut with_tool_prefix = Vec::new();
+        with_tool_prefix.push(Message::assistant_text("dropped before compact window"));
+        with_tool_prefix.push(Message::tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "tool".to_string(),
+            content: "result".to_string(),
+            is_error: false,
+        }]));
+        with_tool_prefix.push(Message::user_text("first surviving user"));
+        for idx in 0..(COMPACT_PRESERVE_MESSAGES - 2) {
+            with_tool_prefix.push(Message::assistant_text(format!("assistant {idx}")));
+        }
+        let compacted = AgentRunner::compact_messages(&with_tool_prefix);
+        assert_eq!(compacted[0].role, crate::llm::MessageRole::User);
+        assert_eq!(compacted[0].text_content(), "first surviving user");
+    }
+
+    #[test]
+    fn mcp_tool_definitions_skip_http_and_failed_stdio_listing() {
+        let runner = make_runner(MockBackend::new("unused"));
+        runner.set_mcp_servers(vec![
+            (
+                "http".to_string(),
+                McpServerConfig {
+                    command: None,
+                    args: None,
+                    env: None,
+                    url: Some("https://example.com/mcp".to_string()),
+                    bearer_token_env_var: None,
+                    http_headers: None,
+                    timeout_sec: None,
+                },
+            ),
+            (
+                "stdio".to_string(),
+                McpServerConfig {
+                    command: Some("tengu-test-command-that-does-not-exist".to_string()),
+                    args: None,
+                    env: None,
+                    url: None,
+                    bearer_token_env_var: None,
+                    http_headers: None,
+                    timeout_sec: Some(1),
+                },
+            ),
+        ]);
+
+        assert!(runner.get_mcp_tool_definitions().is_empty());
     }
 
     #[test]

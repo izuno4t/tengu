@@ -339,6 +339,7 @@ pub trait LlmBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
 
     // ═══════════════════════════════════════════════════════════════════════
     // Message Model Tests
@@ -596,6 +597,90 @@ mod tests {
         assert_eq!(req.max_tokens, 8192);
         assert!(req.messages.is_empty());
         assert!(req.tools.is_empty());
+    }
+
+    struct FallbackStreamBackend;
+
+    #[async_trait::async_trait]
+    impl LlmBackend for FallbackStreamBackend {
+        fn provider(&self) -> LlmProvider {
+            LlmProvider::Local
+        }
+
+        async fn generate(&self, _model: &str, _request: &LlmRequest) -> Result<LlmResponse> {
+            Ok(LlmResponse {
+                content: String::new(),
+                usage: None,
+            })
+        }
+
+        async fn generate_stream(&self, _model: &str, _request: &LlmRequest) -> Result<LlmStream> {
+            Ok(Box::pin(futures_util::stream::empty()))
+        }
+
+        async fn chat(&self, _model: &str, _request: &ChatRequest) -> Result<ChatResponse> {
+            Ok(ChatResponse {
+                content: vec![
+                    ContentBlock::Text {
+                        text: "hello".to_string(),
+                    },
+                    ContentBlock::Thinking {
+                        thinking: "hidden".to_string(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "Read".to_string(),
+                        input: serde_json::json!({"path": "Cargo.toml"}),
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "tool-1".to_string(),
+                        content: "ignored".to_string(),
+                        is_error: false,
+                    },
+                ],
+                stop_reason: StopReason::ToolUse,
+                usage: Some(LlmUsage {
+                    provider: "local".to_string(),
+                    input_tokens: Some(3),
+                    output_tokens: Some(5),
+                    total_tokens: Some(8),
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                    reasoning_tokens: None,
+                    raw: None,
+                }),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn default_chat_stream_emits_usage_text_tool_use_and_done() {
+        let backend = FallbackStreamBackend;
+        let request = ChatRequest::new(vec![], vec![]);
+        let mut stream = backend.chat_stream("local", &request).await.unwrap();
+
+        match stream.next().await.unwrap().unwrap() {
+            ChatStreamEvent::Usage(usage) => {
+                assert_eq!(usage.input_tokens, Some(3));
+                assert_eq!(usage.output_tokens, Some(5));
+            }
+            event => panic!("expected usage event, got {event:?}"),
+        }
+
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            ChatStreamEvent::TextDelta(text) if text == "hello"
+        ));
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            ChatStreamEvent::ToolUse { id, name, input }
+                if id == "tool-1" && name == "Read" && input["path"] == "Cargo.toml"
+        ));
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            ChatStreamEvent::Done(StopReason::ToolUse)
+        ));
+        assert!(stream.next().await.is_none());
     }
 
     // ═══════════════════════════════════════════════════════════════════════

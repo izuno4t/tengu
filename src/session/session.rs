@@ -377,6 +377,22 @@ mod tests {
     }
 
     #[test]
+    fn session_store_list_skips_non_session_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let session = Session::with_id("valid".to_string());
+        store.save(&session).unwrap();
+        fs::write(dir.path().join("bad.json"), "not-json").unwrap();
+        fs::write(dir.path().join("sessions.db"), "{}").unwrap();
+        fs::write(dir.path().join("notes.txt"), "{}").unwrap();
+        fs::create_dir(dir.path().join("nested.json")).unwrap();
+
+        let sessions = store.list().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "valid");
+    }
+
+    #[test]
     fn session_store_list_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
@@ -423,6 +439,39 @@ mod tests {
 
         store.clear().unwrap();
         assert_eq!(store.list().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn session_store_clear_missing_root_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().join("missing"));
+
+        store.clear().unwrap();
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_store_save_to_empty_path_reports_write_error() {
+        let session = Session::new();
+
+        let result = SessionStore::save_to_path(Path::new(""), &session);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn session_store_clear_skips_directories_and_errors_on_index_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        store.ensure().unwrap();
+        fs::create_dir(dir.path().join("nested")).unwrap();
+        fs::create_dir(dir.path().join("sessions.db")).unwrap();
+
+        let result = store.clear();
+
+        assert!(result.is_err());
+        assert!(dir.path().join("nested").is_dir());
+        assert!(dir.path().join("sessions.db").is_dir());
     }
 
     #[test]

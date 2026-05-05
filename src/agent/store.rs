@@ -150,4 +150,61 @@ mod tests {
         assert!(store.remove("writer").unwrap());
         assert!(store.list().unwrap().is_empty());
     }
+
+    #[test]
+    fn list_merges_roots_skips_non_json_and_deduplicates_by_name() {
+        let root = unique_temp_dir("agent-store-merge");
+        let global = root.join("global");
+        let local = root.join("local");
+        fs::create_dir_all(&global).unwrap();
+        fs::create_dir_all(&local).unwrap();
+
+        let global_agent = StoredAgent::scaffold("shared");
+        fs::write(
+            global.join("shared.json"),
+            serde_json::to_string_pretty(&global_agent).unwrap(),
+        )
+        .unwrap();
+        fs::write(global.join("notes.txt"), "ignored").unwrap();
+
+        let local_agent = StoredAgent {
+            description: "local wins".to_string(),
+            ..StoredAgent::scaffold("shared")
+        };
+        fs::write(
+            local.join("shared.json"),
+            serde_json::to_string_pretty(&local_agent).unwrap(),
+        )
+        .unwrap();
+
+        let store = AgentStore::with_roots(global, local);
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "shared");
+        assert_eq!(listed[0].description, "Custom agent: shared");
+    }
+
+    #[test]
+    fn load_and_remove_cover_global_and_missing_agents() {
+        let root = unique_temp_dir("agent-store-global");
+        let global = root.join("global");
+        let local = root.join("local");
+        fs::create_dir_all(&global).unwrap();
+        let agent = StoredAgent::scaffold("global-only");
+        fs::write(
+            global.join("global-only.json"),
+            serde_json::to_string_pretty(&agent).unwrap(),
+        )
+        .unwrap();
+
+        let store = AgentStore::with_roots(global, local);
+        assert_eq!(store.load("global-only").unwrap().name, "global-only");
+        assert!(store
+            .load("missing")
+            .unwrap_err()
+            .to_string()
+            .contains("missing"));
+        assert!(store.remove("global-only").unwrap());
+        assert!(!store.remove("global-only").unwrap());
+    }
 }

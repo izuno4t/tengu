@@ -310,4 +310,59 @@ mod tests {
         restore_checkpoint(&checkpoint).unwrap();
         assert_eq!(fs::read_to_string(file).unwrap(), "restored");
     }
+
+    #[test]
+    fn restore_latest_and_format_list_cover_present_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(dir.path().join(".tengu/checkpoints"));
+        let file = dir.path().join("notes.txt");
+        fs::write(&file, "before").unwrap();
+        let checkpoint = store.create_for_paths(&[file.clone()], "latest").unwrap();
+        fs::write(&file, "after").unwrap();
+
+        let restored = store.restore_latest().unwrap().unwrap();
+        assert_eq!(restored.id, checkpoint.id);
+        assert_eq!(fs::read_to_string(file).unwrap(), "before");
+        let formatted = format_checkpoint_list(&[checkpoint]);
+        assert!(formatted.contains("files=1"));
+        assert!(formatted.contains("reason=latest"));
+    }
+
+    #[test]
+    fn restore_missing_file_snapshot_when_file_is_still_absent_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("never-created.txt");
+        let checkpoint = Checkpoint {
+            id: "cp-absent".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            reason: "absent".to_string(),
+            files: vec![CheckpointFile {
+                path: file.display().to_string(),
+                existed: false,
+                content: None,
+            }],
+        };
+
+        restore_checkpoint(&checkpoint).unwrap();
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn restore_existing_snapshot_requires_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("missing-content.txt");
+        let checkpoint = Checkpoint {
+            id: "cp-invalid".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            reason: "invalid".to_string(),
+            files: vec![CheckpointFile {
+                path: file.display().to_string(),
+                existed: true,
+                content: None,
+            }],
+        };
+
+        let error = restore_checkpoint(&checkpoint).unwrap_err().to_string();
+        assert!(error.contains("missing content"));
+    }
 }

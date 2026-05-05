@@ -422,6 +422,42 @@ mod tests {
     }
 
     #[test]
+    fn builds_optional_forge_arguments_when_absent() {
+        assert_eq!(
+            ForgeCommand {
+                program: "gh".to_string(),
+                args: vec![]
+            }
+            .label(),
+            "gh"
+        );
+        assert_eq!(
+            issue_view(ForgeProvider::Github, "7", false, Some("   ")).args,
+            vec!["issue", "view", "7"]
+        );
+        assert_eq!(
+            issue_create(ForgeProvider::Github, "bug", None, &[], None).args,
+            vec!["issue", "create", "--title", "bug"]
+        );
+        assert_eq!(
+            issue_create(ForgeProvider::Gitlab, "bug", None, &[], None).args,
+            vec!["issue", "create", "--title", "bug"]
+        );
+        assert_eq!(
+            pr_comment(ForgeProvider::Github, None, "body", None).args,
+            vec!["pr", "comment", "--body", "body"]
+        );
+        assert_eq!(
+            label_create(ForgeProvider::Gitlab, "bug", None, None, None).args,
+            vec!["label", "create", "--name", "bug"]
+        );
+        assert_eq!(
+            label_edit(ForgeProvider::Github, "bug", None, None, None, None).args,
+            vec!["label", "edit", "bug"]
+        );
+    }
+
+    #[test]
     fn builds_pr_comment_for_both_providers() {
         assert_eq!(
             pr_comment(ForgeProvider::Github, Some("12"), "looks good", None).args,
@@ -671,6 +707,21 @@ mod tests {
             label_delete(ForgeProvider::Gitlab, "bug", Some("group/project")).args,
             vec!["label", "delete", "bug", "--repo", "group/project"]
         );
+        assert_eq!(
+            pr_review(
+                ForgeProvider::Gitlab,
+                None,
+                ReviewAction::RequestChanges,
+                None,
+                None,
+            )
+            .args,
+            vec!["mr", "note", "--message", "Request changes"]
+        );
+        assert_eq!(
+            label_delete(ForgeProvider::Github, "bug", Some("owner/repo")).args,
+            vec!["label", "delete", "bug", "--yes", "--repo", "owner/repo"]
+        );
     }
 
     #[test]
@@ -683,5 +734,33 @@ mod tests {
 
         assert_eq!(cmd.label(), "definitely-not-a-forge-binary issue list");
         assert!(cmd.run_in_dir(dir.path()).contains("failed"));
+    }
+
+    #[test]
+    fn command_run_formats_success_and_failure_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let echo = ForgeCommand {
+            program: "printf".to_string(),
+            args: vec!["ok".to_string()],
+        };
+        assert_eq!(echo.run_in_dir(dir.path()), "ok");
+
+        let success_without_stdout = ForgeCommand {
+            program: "true".to_string(),
+            args: vec![],
+        };
+        assert_eq!(
+            success_without_stdout.run_in_dir(dir.path()),
+            "true succeeded"
+        );
+
+        let failure_without_stderr = ForgeCommand {
+            program: "false".to_string(),
+            args: vec![],
+        };
+        assert_eq!(
+            failure_without_stderr.run_in_dir(dir.path()),
+            "false failed"
+        );
     }
 }

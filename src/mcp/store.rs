@@ -98,6 +98,12 @@ mod tests {
     }
 
     #[test]
+    fn save_without_parent_reports_write_error() {
+        let config = McpConfig::default();
+        assert!(McpStore::save(Path::new(""), &config).is_err());
+    }
+
+    #[test]
     fn server_config_with_http_fields() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.toml");

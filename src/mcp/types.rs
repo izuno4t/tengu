@@ -168,4 +168,26 @@ mod tests {
         assert!(text.contains("status"));
         assert!(text.contains("ok"));
     }
+
+    #[test]
+    fn mcp_result_to_text_ignores_non_text_items_and_missing_text() {
+        let result = serde_json::json!({
+            "content": [
+                {"type": "image", "data": "base64"},
+                {"type": "text"},
+                {"type": "text", "text": "Only text"}
+            ]
+        });
+
+        assert_eq!(mcp_result_to_text(&result), "Only text");
+    }
+
+    #[test]
+    fn mcp_result_to_text_falls_back_for_empty_or_non_array_content() {
+        let empty = serde_json::json!({"content": []});
+        let non_array = serde_json::json!({"content": "plain"});
+
+        assert!(mcp_result_to_text(&empty).contains("content"));
+        assert!(mcp_result_to_text(&non_array).contains("plain"));
+    }
 }
